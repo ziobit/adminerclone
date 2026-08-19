@@ -11,10 +11,15 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.7.0';
+const MS_VERSION = '1.8.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
+
+// Automatic self-update from the public GitHub repository.
+const MS_UPDATE_URL = 'https://raw.githubusercontent.com/ziobit/adminerclone/main/index.php';
+const MS_UPDATE_CHECK_SECONDS = 21600; // 6 hours, server-wide.
+const MS_UPDATE_MAX_BYTES = 5242880; // Refuse unexpectedly large downloads (5 MB).
 
 ini_set('session.use_strict_mode', '1');
 ini_set('session.use_only_cookies', '1');
@@ -104,6 +109,354 @@ function flash(): string {
   unset($_SESSION['ms_flash']);
   return '<div class="alert alert-' . h($type) . ' alert-dismissible fade show" role="alert">' . h($message) . '<button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>';
 }
+
+/**
+ * Return a private runtime filename for the updater.
+ *
+ * Cache, lock and backup files are deliberately stored in the system temporary
+ * directory instead of next to index.php so they are not normally web-accessible.
+ */
+function ms_update_runtime_file(string $suffix): string {
+  $identity = realpath(__FILE__);
+  if ($identity === false) {
+    $identity = __FILE__;
+  }
+  $directory = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR);
+  return $directory . DIRECTORY_SEPARATOR . 'mysql-studio-' . sha1($identity) . '-' . $suffix;
+}
+
+function ms_update_cache_read(): array {
+  $raw = @file_get_contents(ms_update_runtime_file('update.json'));
+  if (!is_string($raw) || $raw === '') {
+    return [];
+  }
+  $decoded = json_decode($raw, true);
+  return is_array($decoded) ? $decoded : [];
+}
+
+function ms_update_cache_write(array $cache): void {
+  $json = json_encode($cache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+  if (!is_string($json)) {
+    return;
+  }
+  @file_put_contents(ms_update_runtime_file('update.json'), $json, LOCK_EX);
+}
+
+function ms_update_set_notice(string $key, string $message, string $type = 'info'): void {
+  if (!isset($_SESSION['ms_update_notice_seen']) || !is_array($_SESSION['ms_update_notice_seen'])) {
+    $_SESSION['ms_update_notice_seen'] = [];
+  }
+  if (!empty($_SESSION['ms_update_notice_seen'][$key])) {
+    return;
+  }
+  $_SESSION['ms_update_notice_seen'][$key] = true;
+  $_SESSION['ms_update_notice'] = [$type, $message];
+}
+
+function ms_update_notice(): string {
+  if (empty($_SESSION['ms_update_notice']) || !is_array($_SESSION['ms_update_notice'])) {
+    return '';
+  }
+  $notice = $_SESSION['ms_update_notice'];
+  unset($_SESSION['ms_update_notice']);
+  $type = (string)($notice[0] ?? 'info');
+  if (!in_array($type, ['info', 'success', 'warning', 'danger'], true)) {
+    $type = 'info';
+  }
+  $message = (string)($notice[1] ?? '');
+  if ($message === '') {
+    return '';
+  }
+  return '<div class="alert alert-' . h($type) . ' alert-dismissible fade show" role="alert"><i class="fa-solid fa-cloud-arrow-down me-2"></i>' . h($message) . '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>';
+}
+
+function ms_update_extract_version(string $source): ?string {
+  if (preg_match('/\bconst\s+MS_VERSION\s*=\s*[\'\"]([^\'\"]+)[\'\"]\s*;/', $source, $match) !== 1) {
+    return null;
+  }
+  $version = trim((string)$match[1]);
+  return $version !== '' ? $version : null;
+}
+
+function ms_update_download(): ?string {
+  $url = MS_UPDATE_URL;
+
+  if (function_exists('curl_init')) {
+    $ch = curl_init($url);
+    if ($ch !== false) {
+      curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_USERAGENT => MS_APP_NAME . '/' . MS_VERSION,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_HTTPHEADER => ['Accept: text/plain', 'Cache-Control: no-cache']
+      ]);
+      $source = curl_exec($ch);
+      $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+      curl_close($ch);
+      if (is_string($source) && $status >= 200 && $status < 300 && strlen($source) <= MS_UPDATE_MAX_BYTES) {
+        return $source;
+      }
+    }
+  }
+
+  if (filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+    $context = stream_context_create([
+      'http' => [
+        'method' => 'GET',
+        'timeout' => 20,
+        'follow_location' => 1,
+        'max_redirects' => 3,
+        'ignore_errors' => false,
+        'header' => "User-Agent: " . MS_APP_NAME . '/' . MS_VERSION . "\r\nAccept: text/plain\r\nCache-Control: no-cache\r\n"
+      ],
+      'ssl' => [
+        'verify_peer' => true,
+        'verify_peer_name' => true
+      ]
+    ]);
+    $source = @file_get_contents($url, false, $context);
+    if (is_string($source) && strlen($source) <= MS_UPDATE_MAX_BYTES) {
+      return $source;
+    }
+  }
+
+  return null;
+}
+
+function ms_update_validate_source(string $source, string $expectedVersion): ?string {
+  if ($source === '' || strlen($source) < 20000) {
+    return 'The downloaded update is incomplete.';
+  }
+  if (strlen($source) > MS_UPDATE_MAX_BYTES) {
+    return 'The downloaded update is unexpectedly large.';
+  }
+  if (strncmp($source, '<?php', 5) !== 0) {
+    return 'The downloaded file is not a valid MySQL Studio PHP file.';
+  }
+
+  $requiredMarkers = [
+    "const MS_APP_NAME = 'MySQL Studio';",
+    'function connect_db(',
+    'function page_head(',
+    'function page_foot(',
+    'function render_sidebar(',
+    'function ms_auto_update('
+  ];
+  foreach ($requiredMarkers as $marker) {
+    if (strpos($source, $marker) === false) {
+      return 'The downloaded file failed the MySQL Studio integrity check.';
+    }
+  }
+
+  $version = ms_update_extract_version($source);
+  if ($version === null || $version !== $expectedVersion) {
+    return 'The downloaded file does not contain the expected version.';
+  }
+
+  try {
+    token_get_all($source, TOKEN_PARSE);
+  } catch (Throwable $e) {
+    return 'The downloaded update contains invalid PHP syntax: ' . $e->getMessage();
+  }
+
+  return null;
+}
+
+function ms_update_install(string $source, string $remoteVersion): ?string {
+  $currentFile = __FILE__;
+  $directory = dirname($currentFile);
+
+  if (!is_writable($currentFile)) {
+    return basename($currentFile) . ' is not writable by PHP.';
+  }
+  if (!is_writable($directory)) {
+    return 'The directory containing ' . basename($currentFile) . ' is not writable by PHP.';
+  }
+
+  $validationError = ms_update_validate_source($source, $remoteVersion);
+  if ($validationError !== null) {
+    return $validationError;
+  }
+
+  $temporaryFile = @tempnam($directory, '.mysql-studio-update-');
+  if (!is_string($temporaryFile) || $temporaryFile === '') {
+    return 'Unable to create the temporary update file.';
+  }
+
+  $written = @file_put_contents($temporaryFile, $source, LOCK_EX);
+  if ($written === false || $written !== strlen($source)) {
+    @unlink($temporaryFile);
+    return 'Unable to write the complete temporary update file.';
+  }
+
+  $permissions = @fileperms($currentFile);
+  if ($permissions !== false) {
+    @chmod($temporaryFile, $permissions & 0777);
+  }
+
+  $temporarySource = @file_get_contents($temporaryFile);
+  if (!is_string($temporarySource) || !hash_equals(hash('sha256', $source), hash('sha256', $temporarySource))) {
+    @unlink($temporaryFile);
+    return 'The temporary update file failed its checksum verification.';
+  }
+
+  $backupFile = ms_update_runtime_file('backup.php');
+  if (!@copy($currentFile, $backupFile)) {
+    @unlink($temporaryFile);
+    return 'Unable to create a rollback backup of the current version.';
+  }
+
+  $replaced = @rename($temporaryFile, $currentFile);
+
+  // On platforms where rename() cannot replace an existing file, use the
+  // rollback copy to make the fallback replacement safe.
+  if (!$replaced) {
+    if (@unlink($currentFile)) {
+      $replaced = @rename($temporaryFile, $currentFile);
+    }
+  }
+
+  if (!$replaced) {
+    @copy($backupFile, $currentFile);
+    @unlink($temporaryFile);
+    return 'The update could not replace the current file. The previous version has been restored.';
+  }
+
+  clearstatcache(true, $currentFile);
+  $installed = @file_get_contents($currentFile);
+  if (!is_string($installed) || !hash_equals(hash('sha256', $source), hash('sha256', $installed))) {
+    @copy($backupFile, $currentFile);
+    return 'The installed file failed verification. The previous version has been restored.';
+  }
+
+  return null;
+}
+
+function ms_auto_update(): void {
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+    return;
+  }
+  if (isset($_GET['download'])) {
+    return;
+  }
+
+  $now = time();
+  $cache = ms_update_cache_read();
+  $checkedAt = (int)($cache['checked_at'] ?? 0);
+
+  if ($checkedAt > 0 && ($now - $checkedAt) < MS_UPDATE_CHECK_SECONDS) {
+    $cachedRemoteVersion = (string)($cache['remote_version'] ?? '');
+    if (($cache['status'] ?? '') === 'install_failed' && $cachedRemoteVersion !== '' && version_compare($cachedRemoteVersion, MS_VERSION, '>')) {
+      $reason = trim((string)($cache['message'] ?? 'Automatic installation failed.'));
+      ms_update_set_notice(
+        'update-failed-' . $cachedRemoteVersion,
+        MS_APP_NAME . ' ' . $cachedRemoteVersion . ' is available, but the automatic update could not be installed: ' . $reason,
+        'warning'
+      );
+    }
+    return;
+  }
+
+  $lock = @fopen(ms_update_runtime_file('update.lock'), 'c');
+  if (!is_resource($lock)) {
+    return;
+  }
+  if (!@flock($lock, LOCK_EX | LOCK_NB)) {
+    fclose($lock);
+    return;
+  }
+
+  try {
+    // Another request may have completed the check just before this request
+    // acquired the lock, so check the cache again.
+    $cache = ms_update_cache_read();
+    $checkedAt = (int)($cache['checked_at'] ?? 0);
+    if ($checkedAt > 0 && ($now - $checkedAt) < MS_UPDATE_CHECK_SECONDS) {
+      return;
+    }
+
+    $source = ms_update_download();
+    if ($source === null) {
+      ms_update_cache_write([
+        'checked_at' => $now,
+        'local_version' => MS_VERSION,
+        'remote_version' => '',
+        'status' => 'check_failed',
+        'message' => 'GitHub could not be reached.'
+      ]);
+      return;
+    }
+
+    $remoteVersion = ms_update_extract_version($source);
+    if ($remoteVersion === null) {
+      ms_update_cache_write([
+        'checked_at' => $now,
+        'local_version' => MS_VERSION,
+        'remote_version' => '',
+        'status' => 'check_failed',
+        'message' => 'The remote version could not be determined.'
+      ]);
+      return;
+    }
+
+    if (!version_compare($remoteVersion, MS_VERSION, '>')) {
+      ms_update_cache_write([
+        'checked_at' => $now,
+        'local_version' => MS_VERSION,
+        'remote_version' => $remoteVersion,
+        'status' => 'current',
+        'message' => ''
+      ]);
+      return;
+    }
+
+    $installError = ms_update_install($source, $remoteVersion);
+    if ($installError !== null) {
+      ms_update_cache_write([
+        'checked_at' => $now,
+        'local_version' => MS_VERSION,
+        'remote_version' => $remoteVersion,
+        'status' => 'install_failed',
+        'message' => $installError
+      ]);
+      ms_update_set_notice(
+        'update-failed-' . $remoteVersion,
+        MS_APP_NAME . ' ' . $remoteVersion . ' is available, but the automatic update could not be installed: ' . $installError,
+        'warning'
+      );
+      return;
+    }
+
+    ms_update_cache_write([
+      'checked_at' => $now,
+      'local_version' => $remoteVersion,
+      'remote_version' => $remoteVersion,
+      'status' => 'updated',
+      'message' => ''
+    ]);
+    ms_update_set_notice(
+      'updated-' . $remoteVersion,
+      MS_APP_NAME . ' was automatically updated from version ' . MS_VERSION . ' to ' . $remoteVersion . '.',
+      'success'
+    );
+
+    $location = (string)($_SERVER['REQUEST_URI'] ?? './');
+    $location = str_replace(["\r", "\n"], '', $location);
+    session_write_close();
+    header('Location: ' . ($location !== '' ? $location : './'));
+    exit;
+  } finally {
+    @flock($lock, LOCK_UN);
+    fclose($lock);
+  }
+}
+
+ms_auto_update();
 
 function db_all(mysqli $db, string $sql): array {
   $result = $db->query($sql);
@@ -1766,7 +2119,7 @@ function render_sidebar(): void {
   ];
   ?><aside class="sidebar p-3">
     <div class="d-flex align-items-center justify-content-between mb-3">
-      <a class="brand text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a>
+      <a class="brand text-decoration-none d-flex align-items-center gap-2" href="?page=databases"><span><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fw-normal">v<?= h(MS_VERSION) ?></span></a>
       <button class="btn btn-sm btn-secondary" type="button" data-theme-toggle title="Switch to dark mode" aria-label="Switch to dark mode"><i class="fa-solid fa-moon"></i></button>
     </div>
     <?php if ($dbName !== '') { ?><div class="small text-body-secondary mb-2 text-truncate" title="<?= h($dbName) ?>">Database: <strong><?= h($dbName) ?></strong></div><?php } ?>
@@ -1830,7 +2183,7 @@ function column_form_fields(mysqli $db, array $values = [], string $prefix = '')
 
 function page_login(string $error): void {
   page_head('Connect', false);
-  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2"><?= h(MS_APP_NAME) ?></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
+  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
   <?php if ($error !== '') { ?><div class="alert alert-danger"><?= h($error) ?></div><?php } ?>
   <div class="card shadow-sm"><div class="card-body p-4"><form method="post" autocomplete="off"><input type="hidden" name="action" value="login"><?= csrf_field() ?>
     <div class="row g-3"><div class="col-8"><label class="form-label">Server</label><input class="form-control" name="host" value="<?= h(p('host','localhost')) ?>" required autofocus></div><div class="col-4"><label class="form-label">Port</label><input class="form-control" type="number" name="port" value="<?= h(p('port','3306')) ?>" min="1" max="65535" required></div>
@@ -2240,6 +2593,7 @@ try {
   page_head(ucwords(str_replace('_',' ',$page)), true);
   $layoutStarted = true;
   echo flash();
+  echo ms_update_notice();
   if ($error !== '') {
     echo '<div class="alert alert-danger">' . h($error) . '</div>';
   }
