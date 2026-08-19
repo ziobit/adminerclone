@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.6.0';
+const MS_VERSION = '1.6.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1450,11 +1450,38 @@ function page_head(string $title, bool $authenticated): void {
     html[data-density="ultracompact"]{--sidebar:220px;font-size:12px}html[data-density="ultracompact"] .main{padding:.45rem}html[data-density="ultracompact"] .sidebar{padding:.45rem!important}html[data-density="ultracompact"] .table>:not(caption)>*>*{padding:.12rem .3rem}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:.75rem;padding:.16rem .38rem}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.4rem .55rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.2rem .35rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.65rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.45rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.5rem;--bs-gutter-y:.5rem}
     html[data-density="compact"]{--sidebar:240px;font-size:14px}html[data-density="compact"] .main{padding:.8rem}html[data-density="compact"] .sidebar{padding:.75rem!important}html[data-density="compact"] .table>:not(caption)>*>*{padding:.28rem .45rem}html[data-density="compact"] .form-control,html[data-density="compact"] .form-select,html[data-density="compact"] .btn{font-size:.875rem;padding:.28rem .5rem}html[data-density="compact"] .card-body,html[data-density="compact"] .card-header,html[data-density="compact"] .card-footer{padding:.7rem .85rem}html[data-density="compact"] .nav-link,html[data-density="compact"] .list-group-item{padding:.35rem .55rem}
     html[data-density="large"]{--sidebar:295px;font-size:17px}html[data-density="large"] .main{padding:1.6rem}html[data-density="large"] .sidebar{padding:1.3rem!important}html[data-density="large"] .table>:not(caption)>*>*{padding:.75rem .85rem}html[data-density="large"] .form-control,html[data-density="large"] .form-select,html[data-density="large"] .btn{font-size:1rem;padding:.58rem .8rem}html[data-density="large"] .card-body,html[data-density="large"] .card-header,html[data-density="large"] .card-footer{padding:1.25rem}html[data-density="large"] .nav-link,html[data-density="large"] .list-group-item{padding:.7rem .85rem}
+    .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
 </head>
 <body>
+<div id="ms-page-loader" class="ms-page-loader" role="status" aria-live="polite" aria-label="Loading">
+  <div class="ms-page-loader-box">
+    <div class="ms-page-spinner" aria-hidden="true"></div>
+    <div id="ms-page-loader-text" class="ms-page-loader-text">Loading...</div>
+  </div>
+</div>
+<script>
+(() => {
+  'use strict';
+  const loader = document.getElementById('ms-page-loader');
+  const label = document.getElementById('ms-page-loader-text');
+  window.msShowPageLoader = text => {
+    if (!loader) return;
+    if (label) label.textContent = text || 'Loading...';
+    loader.hidden = false;
+    loader.setAttribute('aria-label', text || 'Loading...');
+  };
+  window.msHidePageLoader = () => {
+    if (loader) loader.hidden = true;
+  };
+  document.addEventListener('DOMContentLoaded', window.msHidePageLoader, {once:true});
+  window.addEventListener('pageshow', () => {
+    if (document.readyState !== 'loading') window.msHidePageLoader();
+  });
+})();
+</script>
 <?php if ($authenticated) { render_sidebar(); ?><main class="main"><?php } else { ?><main class="container py-5"><?php }
 }
 
@@ -1467,6 +1494,32 @@ function page_foot(): void {
   document.querySelectorAll('[data-confirm]').forEach(el => el.addEventListener('click', e => {
     if (!confirm(el.dataset.confirm || 'Are you sure?')) e.preventDefault();
   }));
+  document.addEventListener('click', event => {
+    if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const link = target ? target.closest('a[href]') : null;
+    if (!link) return;
+
+    const rawHref = (link.getAttribute('href') || '').trim();
+    if (rawHref === '' || rawHref === '#' || rawHref.startsWith('javascript:')) return;
+    if (link.hasAttribute('download') || link.hasAttribute('data-bs-toggle') || link.hasAttribute('data-bs-dismiss')) return;
+
+    const linkTarget = (link.getAttribute('target') || '').toLowerCase();
+    if (linkTarget !== '' && linkTarget !== '_self') return;
+
+    let destination;
+    try { destination = new URL(link.href, window.location.href); } catch (error) { return; }
+    if (destination.protocol !== 'http:' && destination.protocol !== 'https:') return;
+    if (destination.searchParams.has('download')) return;
+
+    const current = new URL(window.location.href);
+    const sameDocument = destination.origin === current.origin
+      && destination.pathname === current.pathname
+      && destination.search === current.search;
+    if (sameDocument && (destination.hash !== '' || current.hash !== '')) return;
+
+    if (typeof window.msShowPageLoader === 'function') window.msShowPageLoader('Changing page...');
+  });
   document.querySelectorAll('textarea.sql-editor').forEach(el => el.addEventListener('keydown', e => {
     if (e.key === 'Tab') { e.preventDefault(); const s=el.selectionStart, t=el.selectionEnd; el.value=el.value.substring(0,s)+'  '+el.value.substring(t); el.selectionStart=el.selectionEnd=s+2; }
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') el.form.requestSubmit();
