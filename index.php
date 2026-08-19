@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.6.1';
+const MS_VERSION = '1.7.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1451,6 +1451,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-density="compact"]{--sidebar:240px;font-size:14px}html[data-density="compact"] .main{padding:.8rem}html[data-density="compact"] .sidebar{padding:.75rem!important}html[data-density="compact"] .table>:not(caption)>*>*{padding:.28rem .45rem}html[data-density="compact"] .form-control,html[data-density="compact"] .form-select,html[data-density="compact"] .btn{font-size:.875rem;padding:.28rem .5rem}html[data-density="compact"] .card-body,html[data-density="compact"] .card-header,html[data-density="compact"] .card-footer{padding:.7rem .85rem}html[data-density="compact"] .nav-link,html[data-density="compact"] .list-group-item{padding:.35rem .55rem}
     html[data-density="large"]{--sidebar:295px;font-size:17px}html[data-density="large"] .main{padding:1.6rem}html[data-density="large"] .sidebar{padding:1.3rem!important}html[data-density="large"] .table>:not(caption)>*>*{padding:.75rem .85rem}html[data-density="large"] .form-control,html[data-density="large"] .form-select,html[data-density="large"] .btn{font-size:1rem;padding:.58rem .8rem}html[data-density="large"] .card-body,html[data-density="large"] .card-header,html[data-density="large"] .card-footer{padding:1.25rem}html[data-density="large"] .nav-link,html[data-density="large"] .list-group-item{padding:.7rem .85rem}
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
+    .ms-sql-editor-wrap{position:relative;border-radius:var(--bs-border-radius);background:var(--bs-body-bg)}.ms-sql-highlight{position:absolute;inset:0;z-index:1;margin:0;box-sizing:border-box;border-style:solid;border-color:transparent;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--bs-body-color);background:var(--bs-body-bg);border-radius:inherit}.ms-smart-sql-input{position:relative;z-index:2;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--bs-body-color);resize:vertical}.ms-smart-sql-input::selection{background:rgba(var(--ms-accent-rgb),.28)}.ms-sql-highlight .sql-k{color:#7c3aed;font-weight:700}.ms-sql-highlight .sql-t{color:#0f766e;font-weight:600}.ms-sql-highlight .sql-f{color:#2563eb}.ms-sql-highlight .sql-s{color:#b45309}.ms-sql-highlight .sql-i{color:#be185d}.ms-sql-highlight .sql-c{color:#6b7280;font-style:italic}.ms-sql-highlight .sql-n{color:#0891b2}.ms-sql-highlight .sql-v{color:#9333ea}.ms-sql-highlight .sql-o{color:#dc2626}.ms-sql-autocomplete{position:absolute;z-index:1200;min-width:280px;max-width:min(460px,calc(100% - 8px));max-height:280px;overflow:auto;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);box-shadow:0 .8rem 2.2rem rgba(0,0,0,.22);padding:.3rem}.ms-sql-autocomplete[hidden]{display:none!important}.ms-sql-suggestion{display:flex;align-items:center;gap:.6rem;width:100%;border:0;border-radius:.35rem;background:transparent;color:var(--bs-body-color);text-align:left;padding:.48rem .6rem}.ms-sql-suggestion:hover,.ms-sql-suggestion.active{background:rgba(var(--ms-accent-rgb),.12)}.ms-sql-suggestion-icon{width:1.35rem;text-align:center;color:var(--ms-accent)}.ms-sql-suggestion-main{min-width:0;flex:1}.ms-sql-suggestion-name{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-suggestion-meta{display:block;font-size:.75em;color:var(--bs-secondary-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-autocomplete-title{padding:.25rem .55rem .35rem;color:var(--bs-secondary-color);font-size:.75em;text-transform:uppercase;letter-spacing:.06em;font-weight:700}html[data-bs-theme="dark"] .ms-sql-highlight .sql-k{color:#c4b5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-t{color:#5eead4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-f{color:#93c5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-s{color:#fbbf24}html[data-bs-theme="dark"] .ms-sql-highlight .sql-i{color:#f9a8d4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-c{color:#94a3b8}html[data-bs-theme="dark"] .ms-sql-highlight .sql-n{color:#67e8f9}html[data-bs-theme="dark"] .ms-sql-highlight .sql-v{color:#d8b4fe}html[data-bs-theme="dark"] .ms-sql-highlight .sql-o{color:#fca5a5}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
@@ -1520,10 +1521,118 @@ function page_foot(): void {
 
     if (typeof window.msShowPageLoader === 'function') window.msShowPageLoader('Changing page...');
   });
-  document.querySelectorAll('textarea.sql-editor').forEach(el => el.addEventListener('keydown', e => {
-    if (e.key === 'Tab') { e.preventDefault(); const s=el.selectionStart, t=el.selectionEnd; el.value=el.value.substring(0,s)+'  '+el.value.substring(t); el.selectionStart=el.selectionEnd=s+2; }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') el.form.requestSubmit();
-  }));
+  const msSqlKeywords=new Set(`ACCESSIBLE ADD ALL ALTER ANALYZE AND AS ASC ASENSITIVE BEFORE BETWEEN BIGINT BINARY BLOB BOTH BY CALL CASCADE CASE CHANGE CHAR CHARACTER CHECK COLLATE COLUMN CONDITION CONNECTION CONSTRAINT CONTINUE CONVERT CREATE CROSS CUBE CUME_DIST CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DATABASES DAY_HOUR DAY_MICROSECOND DAY_MINUTE DAY_SECOND DEC DECIMAL DECLARE DEFAULT DELAYED DELETE DENSE_RANK DESC DESCRIBE DETERMINISTIC DISTINCT DISTINCTROW DIV DOUBLE DROP DUAL EACH ELSE ELSEIF EMPTY ENCLOSED ESCAPED EXISTS EXIT EXPLAIN FALSE FETCH FIRST_VALUE FLOAT FLOAT4 FLOAT8 FOR FORCE FOREIGN FROM FULLTEXT FUNCTION GENERATED GET GRANT GROUP GROUPING GROUPS HAVING HIGH_PRIORITY HOUR_MICROSECOND HOUR_MINUTE HOUR_SECOND IF IGNORE IN INDEX INFILE INNER INOUT INSENSITIVE INSERT INT INT1 INT2 INT3 INT4 INT8 INTEGER INTERVAL INTO IO_AFTER_GTIDS IO_BEFORE_GTIDS IS ITERATE JOIN JSON_TABLE KEY KEYS KILL LAG LAST_VALUE LEAD LEADING LEAVE LEFT LIKE LIMIT LINEAR LINES LOAD LOCALTIME LOCALTIMESTAMP LOCK LONG LONGBLOB LONGTEXT LOOP LOW_PRIORITY MASTER_BIND MASTER_SSL_VERIFY_SERVER_CERT MATCH MAXVALUE MEDIUMBLOB MEDIUMINT MEDIUMTEXT MIDDLEINT MINUTE_MICROSECOND MINUTE_SECOND MOD MODIFIES NATURAL NOT NO_WRITE_TO_BINLOG NTH_VALUE NTILE NULL NUMERIC OF ON OPTIMIZE OPTIMIZER_COSTS OPTION OPTIONALLY OR ORDER OUT OUTER OUTFILE OVER PARTITION PERCENT_RANK PRECISION PRIMARY PROCEDURE PURGE RANGE RANK READ READS READ_WRITE REAL RECURSIVE REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE RESIGNAL RESTRICT RETURN REVOKE RIGHT RLIKE ROW ROWS ROW_NUMBER SCHEMA SCHEMAS SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL SMALLINT SPATIAL SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS SQL_SMALL_RESULT SSL STARTING STORED STRAIGHT_JOIN SYSTEM TABLE TERMINATED THEN TINYBLOB TINYINT TINYTEXT TO TRAILING TRIGGER TRUE UNDO UNION UNIQUE UNLOCK UNSIGNED UPDATE USAGE USE USING UTC_DATE UTC_TIME UTC_TIMESTAMP VALUES VARBINARY VARCHAR VARCHARACTER VARYING VIRTUAL WHEN WHERE WHILE WINDOW WITH WRITE XOR YEAR_MONTH ZEROFILL`.split(/\s+/));
+  const msSqlTypes=new Set(`BIT BOOL BOOLEAN CHAR VARCHAR BINARY VARBINARY TINYTEXT TEXT MEDIUMTEXT LONGTEXT TINYBLOB BLOB MEDIUMBLOB LONGBLOB ENUM SET JSON DATE DATETIME TIMESTAMP TIME YEAR TINYINT SMALLINT MEDIUMINT INT INTEGER BIGINT DECIMAL DEC NUMERIC FIXED FLOAT DOUBLE REAL GEOMETRY POINT LINESTRING POLYGON MULTIPOINT MULTILINESTRING MULTIPOLYGON GEOMETRYCOLLECTION VECTOR UUID INET6`.split(/\s+/));
+  const msSqlFunctions=new Set(`ABS ACOS ADDDATE ADDTIME AES_DECRYPT AES_ENCRYPT ANY_VALUE ASCII ASIN ATAN ATAN2 AVG BENCHMARK BIN BIT_COUNT BIT_LENGTH CEIL CEILING CHAR_LENGTH CHARACTER_LENGTH COALESCE CONCAT CONCAT_WS CONV CONVERT_TZ COS COT COUNT CRC32 CURDATE CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP CURTIME DATABASE DATE DATE_ADD DATE_FORMAT DATE_SUB DATEDIFF DAY DAYNAME DAYOFMONTH DAYOFWEEK DAYOFYEAR DEGREES ELT EXP EXPORT_SET EXTRACT FIELD FIND_IN_SET FLOOR FORMAT FOUND_ROWS FROM_DAYS FROM_UNIXTIME GET_FORMAT GREATEST GROUP_CONCAT HEX HOUR IFNULL INET_ATON INET_NTOA INSERT INSTR INTERVAL ISNULL JSON_ARRAY JSON_ARRAYAGG JSON_CONTAINS JSON_EXTRACT JSON_OBJECT JSON_OBJECTAGG JSON_PRETTY JSON_QUOTE JSON_SEARCH JSON_SET LCASE LEAST LEFT LENGTH LN LOAD_FILE LOCATE LOG LOG10 LOG2 LOWER LPAD LTRIM MAKEDATE MAKETIME MAX MD5 MICROSECOND MID MIN MINUTE MOD MONTH MONTHNAME NOW NULLIF OCT OCTET_LENGTH ORD PERIOD_ADD PERIOD_DIFF PI POSITION POW POWER QUARTER RADIANS RAND REPEAT REPLACE REVERSE RIGHT ROUND RPAD RTRIM SEC_TO_TIME SECOND SHA SHA1 SHA2 SIGN SIN SPACE SQRT STD STDDEV STDDEV_POP STDDEV_SAMP STRCMP SUBDATE SUBSTR SUBSTRING SUBSTRING_INDEX SUM SYSDATE TAN TIME TIME_FORMAT TIME_TO_SEC TIMEDIFF TIMESTAMP TIMESTAMPADD TIMESTAMPDIFF TO_DAYS TRIM TRUNCATE UCASE UNHEX UNIX_TIMESTAMP UPPER UTC_DATE UTC_TIME UTC_TIMESTAMP UUID WEEK WEEKDAY WEEKOFYEAR YEAR`.split(/\s+/));
+  const msHtmlEscape=value=>value.replace(/[&<>]/g,char=>char==='&'?'&amp;':char==='<'?'&lt;':'&gt;');
+  const msSqlSpan=(cls,value)=>`<span class="${cls}">${msHtmlEscape(value)}</span>`;
+  const msHighlightSql=sql=>{
+    let out='',i=0;
+    const length=sql.length;
+    while(i<length){
+      const ch=sql[i],next=i+1<length?sql[i+1]:'';
+      if(ch==='-'&&next==='-'&&(i+2>=length||/\s/.test(sql[i+2]))){let j=i+2;while(j<length&&sql[j]!=='\n')j++;out+=msSqlSpan('sql-c',sql.slice(i,j));i=j;continue;}
+      if(ch==='#'){let j=i+1;while(j<length&&sql[j]!=='\n')j++;out+=msSqlSpan('sql-c',sql.slice(i,j));i=j;continue;}
+      if(ch==='/'&&next==='*'){let j=i+2;while(j<length&&!(sql[j]==='*'&&sql[j+1]==='/'))j++;j=Math.min(length,j+2);out+=msSqlSpan('sql-c',sql.slice(i,j));i=j;continue;}
+      if(ch==="'"||ch==='"'||ch==='`'){
+        const quote=ch;let j=i+1;
+        while(j<length){
+          if(sql[j]==='\\'&&j+1<length){j+=2;continue;}
+          if(sql[j]===quote){if(j+1<length&&sql[j+1]===quote){j+=2;continue;}j++;break;}
+          j++;
+        }
+        out+=msSqlSpan(quote==='`'?'sql-i':'sql-s',sql.slice(i,j));i=j;continue;
+      }
+      if(ch==='@'){let j=i+1;while(j<length&&/[A-Za-z0-9_@$]/.test(sql[j]))j++;out+=msSqlSpan('sql-v',sql.slice(i,j));i=j;continue;}
+      if(/[0-9]/.test(ch)&&(i===0||!/[A-Za-z0-9_$]/.test(sql[i-1]))){let j=i+1;while(j<length&&/[0-9A-Fa-fxXbB.eE+-]/.test(sql[j]))j++;out+=msSqlSpan('sql-n',sql.slice(i,j));i=j;continue;}
+      if(/[A-Za-z_$]/.test(ch)){
+        let j=i+1;while(j<length&&/[A-Za-z0-9_$]/.test(sql[j]))j++;
+        const word=sql.slice(i,j),upper=word.toUpperCase();let k=j;while(k<length&&/\s/.test(sql[k]))k++;
+        if(msSqlKeywords.has(upper))out+=msSqlSpan('sql-k',word);
+        else if(msSqlTypes.has(upper))out+=msSqlSpan('sql-t',word);
+        else if(msSqlFunctions.has(upper)||sql[k]==='(')out+=msSqlSpan('sql-f',word);
+        else out+=msHtmlEscape(word);
+        i=j;continue;
+      }
+      if(/[=<>!+*/%|&^-]/.test(ch)){let j=i+1;while(j<length&&/[=<>!+*/%|&^-]/.test(sql[j]))j++;out+=msSqlSpan('sql-o',sql.slice(i,j));i=j;continue;}
+      out+=msHtmlEscape(ch);i++;
+    }
+    return out;
+  };
+  const msSqlQuoteIdentifier=name=>/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)&&!msSqlKeywords.has(name.toUpperCase())?name:'`'+name.replace(/`/g,'``')+'`';
+  const msSqlCaretPosition=(textarea,position)=>{
+    const style=getComputedStyle(textarea),mirror=document.createElement('div');
+    ['boxSizing','width','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth','paddingTop','paddingRight','paddingBottom','paddingLeft','fontStyle','fontVariant','fontWeight','fontStretch','fontSize','fontFamily','lineHeight','letterSpacing','textTransform','textAlign','textIndent','wordSpacing','tabSize'].forEach(prop=>mirror.style[prop]=style[prop]);
+    mirror.style.position='absolute';mirror.style.visibility='hidden';mirror.style.left='-10000px';mirror.style.top='0';mirror.style.whiteSpace='pre-wrap';mirror.style.overflowWrap='break-word';mirror.style.wordBreak='normal';
+    mirror.textContent=textarea.value.slice(0,position);
+    const marker=document.createElement('span');marker.textContent=textarea.value.slice(position,position+1)||'.';mirror.appendChild(marker);document.body.appendChild(mirror);
+    const result={left:marker.offsetLeft-textarea.scrollLeft,top:marker.offsetTop-textarea.scrollTop,height:Number.parseFloat(style.lineHeight)||Number.parseFloat(style.fontSize)*1.5||20};mirror.remove();return result;
+  };
+  const msInitSqlEditor=textarea=>{
+    const wrap=document.createElement('div');wrap.className='ms-sql-editor-wrap';textarea.parentNode.insertBefore(wrap,textarea);wrap.appendChild(textarea);textarea.classList.add('ms-smart-sql-input');
+    const highlight=document.createElement('pre');highlight.className='ms-sql-highlight';highlight.setAttribute('aria-hidden','true');wrap.insertBefore(highlight,textarea);
+    const popup=document.createElement('div');popup.className='ms-sql-autocomplete';popup.hidden=true;popup.setAttribute('role','listbox');wrap.appendChild(popup);
+    const copyGeometry=()=>{const style=getComputedStyle(textarea);['paddingTop','paddingRight','paddingBottom','paddingLeft','fontFamily','fontSize','fontWeight','fontStyle','lineHeight','letterSpacing','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth'].forEach(prop=>highlight.style[prop]=style[prop]);};
+    const syncHighlight=()=>{highlight.innerHTML=msHighlightSql(textarea.value)+'\n';highlight.scrollTop=textarea.scrollTop;highlight.scrollLeft=textarea.scrollLeft;};
+    copyGeometry();syncHighlight();
+    let schema=null,context=null,suggestions=[],activeIndex=0;
+    if(textarea.dataset.msSqlSchemaId){const node=document.getElementById(textarea.dataset.msSqlSchemaId);if(node){try{schema=JSON.parse(node.textContent||'{}');}catch(error){schema=null;}}}
+    const tableNames=schema&&Array.isArray(schema.tables)?schema.tables:[];
+    const columnMap=schema&&schema.columns&&typeof schema.columns==='object'?schema.columns:{};
+    const tableLookup=new Map(tableNames.map(item=>[String(item.name||'').toLowerCase(),item]));
+    const closePopup=()=>{popup.hidden=true;popup.innerHTML='';context=null;suggestions=[];activeIndex=0;};
+    const rankItems=(items,prefix)=>{const needle=prefix.toLowerCase();return items.filter(item=>String(item.name||'').toLowerCase().includes(needle)).sort((a,b)=>{const an=String(a.name||'').toLowerCase(),bn=String(b.name||'').toLowerCase(),as=an.startsWith(needle)?0:1,bs=bn.startsWith(needle)?0:1;return as-bs||an.localeCompare(bn);}).slice(0,24);};
+    const resolveTable=name=>{const exact=tableLookup.get(String(name||'').toLowerCase());return exact?String(exact.name):'';};
+    const detectContext=()=>{
+      if(!schema||document.activeElement!==textarea)return null;
+      const cursor=textarea.selectionStart,before=textarea.value.slice(0,cursor);
+      const fieldMatch=before.match(/(?:`([^`\r\n]+)`|([A-Za-z0-9_$]+))\.(\`?)([A-Za-z0-9_$]*)$/);
+      if(fieldMatch){const table=resolveTable(fieldMatch[1]||fieldMatch[2]);if(table)return{kind:'column',table,prefix:fieldMatch[4]||'',start:cursor-(fieldMatch[3]||'').length-(fieldMatch[4]||'').length,end:cursor};}
+      const tail=(before.split(';').pop()||'');
+      let match=tail.match(/\b(?:UPDATE|FROM|JOIN|INTO|DESCRIBE|DESC)\s+(\`?)([A-Za-z0-9_$]*)$/i);
+      if(match)return{kind:'table',prefix:match[2]||'',start:cursor-(match[1]||'').length-(match[2]||'').length,end:cursor,insertMode:'plain'};
+      match=tail.match(/\b(?:ALTER|TRUNCATE)\s+TABLE\s+(\`?)([A-Za-z0-9_$]*)$/i);
+      if(match)return{kind:'table',prefix:match[2]||'',start:cursor-(match[1]||'').length-(match[2]||'').length,end:cursor,insertMode:'plain'};
+      match=tail.match(/\b(?:DELETE\s+FROM|REPLACE\s+INTO|INSERT\s+INTO)\s+(\`?)([A-Za-z0-9_$]*)$/i);
+      if(match)return{kind:'table',prefix:match[2]||'',start:cursor-(match[1]||'').length-(match[2]||'').length,end:cursor,insertMode:'plain'};
+      match=tail.match(/\bINSERT\s+(\`?)([A-Za-z0-9_$]*)$/i);
+      if(match)return{kind:'table',prefix:match[2]||'',start:cursor-(match[1]||'').length-(match[2]||'').length,end:cursor,insertMode:'insert'};
+      match=tail.match(/\bSELECT\s+(\`?)([A-Za-z0-9_$]*)$/i);
+      if(match)return{kind:'table',prefix:match[2]||'',start:cursor-(match[1]||'').length-(match[2]||'').length,end:cursor,insertMode:'select'};
+      return null;
+    };
+    const applySuggestion=index=>{
+      const item=suggestions[index];if(!item||!context)return;
+      let replacement=msSqlQuoteIdentifier(String(item.name));
+      if(context.kind==='table'&&context.insertMode==='select')replacement='* FROM '+replacement;
+      else if(context.kind==='table'&&context.insertMode==='insert')replacement='INTO '+replacement;
+      textarea.setRangeText(replacement,context.start,context.end,'end');textarea.dispatchEvent(new Event('input',{bubbles:true}));closePopup();textarea.focus();
+    };
+    const renderPopup=()=>{
+      context=detectContext();if(!context){closePopup();return;}
+      if(context.kind==='column')suggestions=rankItems(Array.isArray(columnMap[context.table])?columnMap[context.table]:[],context.prefix);
+      else suggestions=rankItems(tableNames,context.prefix);
+      if(!suggestions.length){closePopup();return;}
+      activeIndex=0;popup.innerHTML='';
+      const title=document.createElement('div');title.className='ms-sql-autocomplete-title';title.textContent=context.kind==='column'?'Columns · '+context.table:'Tables';popup.appendChild(title);
+      suggestions.forEach((item,index)=>{const button=document.createElement('button');button.type='button';button.className='ms-sql-suggestion'+(index===activeIndex?' active':'');button.setAttribute('role','option');button.innerHTML=`<span class="ms-sql-suggestion-icon"><i class="fa-solid ${context.kind==='column'?'fa-table-columns':'fa-table'}"></i></span><span class="ms-sql-suggestion-main"><span class="ms-sql-suggestion-name"></span><span class="ms-sql-suggestion-meta"></span></span>`;button.querySelector('.ms-sql-suggestion-name').textContent=String(item.name||'');button.querySelector('.ms-sql-suggestion-meta').textContent=context.kind==='column'?String(item.type||'')+(item.key?' · '+item.key:''):String(item.type||'TABLE');button.addEventListener('mousedown',event=>event.preventDefault());button.addEventListener('click',()=>applySuggestion(index));popup.appendChild(button);});
+      const caret=msSqlCaretPosition(textarea,textarea.selectionStart),popupWidth=Math.min(460,Math.max(280,textarea.clientWidth-8));popup.style.maxWidth=popupWidth+'px';popup.style.left=Math.max(4,Math.min(caret.left,Math.max(4,textarea.clientWidth-popupWidth)))+'px';popup.style.top=Math.max(4,caret.top+caret.height+2)+'px';popup.hidden=false;
+    };
+    const updateActive=delta=>{if(!suggestions.length)return;activeIndex=(activeIndex+delta+suggestions.length)%suggestions.length;popup.querySelectorAll('.ms-sql-suggestion').forEach((item,index)=>item.classList.toggle('active',index===activeIndex));const active=popup.querySelectorAll('.ms-sql-suggestion')[activeIndex];if(active)active.scrollIntoView({block:'nearest'});};
+    textarea.addEventListener('input',()=>{syncHighlight();renderPopup();});
+    textarea.addEventListener('scroll',()=>{syncHighlight();if(!popup.hidden)renderPopup();});
+    textarea.addEventListener('click',renderPopup);
+    textarea.addEventListener('keyup',event=>{if(['ArrowLeft','ArrowRight','Home','End','PageUp','PageDown'].includes(event.key))renderPopup();});
+    textarea.addEventListener('keydown',event=>{
+      if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();if(textarea.form)textarea.form.requestSubmit();return;}
+      if((event.ctrlKey||event.metaKey)&&event.key===' '){event.preventDefault();renderPopup();return;}
+      if(!popup.hidden&&suggestions.length){if(event.key==='ArrowDown'){event.preventDefault();updateActive(1);return;}if(event.key==='ArrowUp'){event.preventDefault();updateActive(-1);return;}if(event.key==='Enter'||event.key==='Tab'){event.preventDefault();applySuggestion(activeIndex);return;}if(event.key==='Escape'){event.preventDefault();closePopup();return;}}
+      if(event.key==='Tab'){event.preventDefault();const start=textarea.selectionStart,end=textarea.selectionEnd;textarea.setRangeText('  ',start,end,'end');textarea.dispatchEvent(new Event('input',{bubbles:true}));}
+    });
+    textarea.addEventListener('blur',()=>setTimeout(()=>{if(!wrap.contains(document.activeElement))closePopup();},120));
+    if(window.ResizeObserver)new ResizeObserver(()=>{copyGeometry();syncHighlight();}).observe(textarea);
+  };
+  document.querySelectorAll('textarea.sql-editor').forEach(msInitSqlEditor);
   document.querySelectorAll('[data-check-all]').forEach(el => el.addEventListener('change', () => {
     document.querySelectorAll(el.dataset.checkAll).forEach(box => box.checked=el.checked);
   }));
@@ -1985,8 +2094,14 @@ function page_row(mysqli $db): void {
 
 function page_sql(mysqli $db,?array $results,float $time): void {
   $sqlDefaultRows=browser_setting_int('mysqlStudioSqlRows',MS_SQL_ROWS_DEFAULT,1,100000);
+  $tableRows=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
+  $columnRows=db_all($db,'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+  $sqlSchema=['tables'=>[],'columns'=>[]];
+  foreach($tableRows as $tableRow){$tableName=(string)$tableRow['TABLE_NAME'];$sqlSchema['tables'][]=['name'=>$tableName,'type'=>(string)$tableRow['TABLE_TYPE']];$sqlSchema['columns'][$tableName]=[];}
+  foreach($columnRows as $columnRow){$tableName=(string)$columnRow['TABLE_NAME'];if(!isset($sqlSchema['columns'][$tableName]))$sqlSchema['columns'][$tableName]=[];$sqlSchema['columns'][$tableName][]=['name'=>(string)$columnRow['COLUMN_NAME'],'type'=>(string)$columnRow['COLUMN_TYPE'],'key'=>(string)$columnRow['COLUMN_KEY']];}
+  $sqlSchemaJson=json_encode($sqlSchema,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'{"tables":[],"columns":{}}';
   title_bar('SQL command',selected_db());
-  ?><div class="card mb-3"><div class="card-body"><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?><label class="form-label">SQL statements</label><textarea class="form-control sql-editor" name="sql" spellcheck="false"><?= h(p('sql',(string)($_SESSION['ms_last_sql']??''))) ?></textarea><div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><button class="btn btn-primary"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></form></div></div><?php if($results!==null)render_sql_results($results,$time);
+  ?><div class="card mb-3"><div class="card-body"><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?><label class="form-label">SQL statements</label><textarea class="form-control sql-editor" name="sql" spellcheck="false" autocomplete="off" data-ms-sql-schema-id="ms-sql-schema"><?= h(p('sql',(string)($_SESSION['ms_last_sql']??''))) ?></textarea><script type="application/json" id="ms-sql-schema"><?= $sqlSchemaJson ?></script><div class="form-text mt-2"><i class="fa-solid fa-wand-magic-sparkles me-1"></i>Smart SQL: table suggestions after <code>SELECT</code>, <code>UPDATE</code>, <code>INSERT</code>, <code>FROM</code>, <code>JOIN</code> and related clauses; type <code>table.</code> for columns. Use ↑/↓ and Enter/Tab to accept, Esc to close, Ctrl+Space to reopen suggestions.</div><div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><button class="btn btn-primary"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></form></div></div><?php if($results!==null)render_sql_results($results,$time);
 }
 
 function page_export(mysqli $db): void {
