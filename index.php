@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.8.0';
+const MS_VERSION = '1.8.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -612,6 +612,295 @@ function build_column_sql(mysqli $db, array $source, bool $includeName = true): 
     $sql .= ' INVISIBLE';
   }
   return $sql;
+}
+
+
+function ms_unsigned_decimal_compare(string $a, string $b): int {
+  $a = ltrim($a, '0');
+  $b = ltrim($b, '0');
+  $a = $a === '' ? '0' : $a;
+  $b = $b === '' ? '0' : $b;
+  if (strlen($a) !== strlen($b)) {
+    return strlen($a) < strlen($b) ? -1 : 1;
+  }
+  return strcmp($a, $b) <=> 0;
+}
+
+function ms_integer_bounds(array $column): ?array {
+  $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
+  $unsigned = stripos((string)($column['COLUMN_TYPE'] ?? ''), 'unsigned') !== false;
+  $bounds = [
+    'tinyint' => ['-128', '127', '255'],
+    'smallint' => ['-32768', '32767', '65535'],
+    'mediumint' => ['-8388608', '8388607', '16777215'],
+    'int' => ['-2147483648', '2147483647', '4294967295'],
+    'integer' => ['-2147483648', '2147483647', '4294967295'],
+    'bigint' => ['-9223372036854775808', '9223372036854775807', '18446744073709551615']
+  ];
+  if (!isset($bounds[$type])) {
+    return null;
+  }
+  return $unsigned
+    ? ['min' => '0', 'max' => $bounds[$type][2], 'unsigned' => true]
+    : ['min' => $bounds[$type][0], 'max' => $bounds[$type][1], 'unsigned' => false];
+}
+
+function ms_normalize_integer_literal(array $column, string $value): string {
+  $value = trim($value);
+  if ($value === '') {
+    return '';
+  }
+  $bounds = ms_integer_bounds($column);
+  if ($bounds === null) {
+    return $value;
+  }
+  if (preg_match('/^-?\d+$/', $value) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must contain an integer value.');
+  }
+  $negative = $value[0] === '-';
+  if ($negative && !empty($bounds['unsigned'])) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' is UNSIGNED and cannot be negative.');
+  }
+  $digits = $negative ? substr($value, 1) : $value;
+  $digits = ltrim($digits, '0');
+  $digits = $digits === '' ? '0' : $digits;
+  if ($digits === '0') {
+    $negative = false;
+  }
+  $canonical = ($negative ? '-' : '') . $digits;
+
+  if ($negative) {
+    $minAbs = ltrim((string)$bounds['min'], '-');
+    if (ms_unsigned_decimal_compare($digits, $minAbs) > 0) {
+      throw new RuntimeException((string)$column['COLUMN_NAME'] . ' is below the minimum ' . $bounds['min'] . '.');
+    }
+  } elseif (ms_unsigned_decimal_compare($digits, (string)$bounds['max']) > 0) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' is above the maximum ' . $bounds['max'] . '.');
+  }
+  return $canonical;
+}
+
+function ms_normalize_decimal_literal(array $column, string $value): string {
+  $value = trim(str_replace(',', '.', $value));
+  if ($value === '') {
+    return '';
+  }
+  $unsigned = stripos((string)($column['COLUMN_TYPE'] ?? ''), 'unsigned') !== false;
+  if ($unsigned && isset($value[0]) && $value[0] === '-') {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' is UNSIGNED and cannot be negative.');
+  }
+  if (preg_match('/^(-?)(?:(\d+)(?:\.(\d*))?|\.(\d+))$/', $value, $match) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must contain a decimal number.');
+  }
+  $negative = ($match[1] ?? '') === '-';
+  $integer = $match[2] ?? '';
+  $fraction = array_key_exists(3, $match) && $match[3] !== '' ? $match[3] : ($match[4] ?? '');
+  $hadDecimal = strpos($value, '.') !== false;
+  $integer = ltrim($integer, '0');
+  $integer = $integer === '' ? '0' : $integer;
+
+  $precision = isset($column['NUMERIC_PRECISION']) ? (int)$column['NUMERIC_PRECISION'] : 0;
+  $scale = isset($column['NUMERIC_SCALE']) ? (int)$column['NUMERIC_SCALE'] : 0;
+  if ($precision > 0) {
+    $maxIntegerDigits = max(0, $precision - $scale);
+    $significantIntegerDigits = $integer === '0' ? 0 : strlen($integer);
+    if ($significantIntegerDigits > $maxIntegerDigits) {
+      throw new RuntimeException((string)$column['COLUMN_NAME'] . ' allows at most ' . $maxIntegerDigits . ' digit(s) before the decimal point.');
+    }
+    if (strlen($fraction) > $scale) {
+      throw new RuntimeException((string)$column['COLUMN_NAME'] . ' allows at most ' . $scale . ' decimal place(s).');
+    }
+  }
+  if ($integer === '0' && ($fraction === '' || preg_match('/^0+$/', $fraction) === 1)) {
+    $negative = false;
+  }
+  return ($negative ? '-' : '') . $integer . ($hadDecimal ? '.' . $fraction : '');
+}
+
+function ms_normalize_float_literal(array $column, string $value): string {
+  $value = trim(str_replace(',', '.', $value));
+  if ($value === '') {
+    return '';
+  }
+  $unsigned = stripos((string)($column['COLUMN_TYPE'] ?? ''), 'unsigned') !== false;
+  if ($unsigned && isset($value[0]) && $value[0] === '-') {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' is UNSIGNED and cannot be negative.');
+  }
+  if (preg_match('/^-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/', $value) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must contain a valid floating-point number.');
+  }
+  $parts = preg_split('/([eE])/', $value, 2, PREG_SPLIT_DELIM_CAPTURE);
+  $mantissa = $parts[0];
+  $exponent = count($parts) === 3 ? $parts[1] . $parts[2] : '';
+  $negative = isset($mantissa[0]) && $mantissa[0] === '-';
+  if ($negative) {
+    $mantissa = substr($mantissa, 1);
+  }
+  if (strpos($mantissa, '.') === 0) {
+    $mantissa = '0' . $mantissa;
+  }
+  if (strpos($mantissa, '.') !== false) {
+    [$integer, $fraction] = explode('.', $mantissa, 2);
+    $integer = ltrim($integer, '0');
+    $integer = $integer === '' ? '0' : $integer;
+    $mantissa = $integer . '.' . $fraction;
+  } else {
+    $mantissa = ltrim($mantissa, '0');
+    $mantissa = $mantissa === '' ? '0' : $mantissa;
+  }
+  $zeroMantissa = preg_match('/^0(?:\.0*)?$/', $mantissa) === 1;
+  return (($negative && !$zeroMantissa) ? '-' : '') . $mantissa . $exponent;
+}
+
+function ms_normalize_column_literal(array $column, $rawValue): string {
+  $value = is_scalar($rawValue) || $rawValue === null ? (string)$rawValue : '';
+  $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
+  if (in_array($type, ['tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint'], true)) {
+    return ms_normalize_integer_literal($column, $value);
+  }
+  if (in_array($type, ['decimal', 'dec', 'numeric', 'fixed'], true)) {
+    return ms_normalize_decimal_literal($column, $value);
+  }
+  if (in_array($type, ['float', 'double', 'real'], true)) {
+    return ms_normalize_float_literal($column, $value);
+  }
+  if ($type === 'date' && $value !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', trim($value)) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must use YYYY-MM-DD.');
+  }
+  if (in_array($type, ['datetime', 'timestamp'], true) && $value !== '') {
+    $value = str_replace('T', ' ', trim($value));
+    if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?$/', $value) !== 1) {
+      throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must use YYYY-MM-DD HH:MM:SS.');
+    }
+    return $value;
+  }
+  if ($type === 'time' && $value !== '' && preg_match('/^-?\d{1,3}:\d{2}:\d{2}(?:\.\d{1,6})?$/', trim($value)) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must use HH:MM:SS.');
+  }
+  if ($type === 'year' && $value !== '' && preg_match('/^\d{1,4}$/', trim($value)) !== 1) {
+    throw new RuntimeException((string)$column['COLUMN_NAME'] . ' must contain a year.');
+  }
+  if ($type === 'json' && trim($value) !== '') {
+    json_decode($value, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+      throw new RuntimeException((string)$column['COLUMN_NAME'] . ' contains invalid JSON: ' . json_last_error_msg() . '.');
+    }
+  }
+  return $value;
+}
+
+function ms_column_edit_spec(array $column): array {
+  $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
+  $columnType = strtolower((string)($column['COLUMN_TYPE'] ?? ''));
+  $unsigned = strpos($columnType, 'unsigned') !== false;
+  $spec = [
+    'kind' => 'text',
+    'inputmode' => 'text',
+    'placeholder' => '',
+    'help' => '',
+    'maxlength' => 0,
+    'unsigned' => $unsigned,
+    'min' => '',
+    'max' => '',
+    'precision' => 0,
+    'scale' => 0
+  ];
+
+  $bounds = ms_integer_bounds($column);
+  if ($bounds !== null) {
+    $spec['kind'] = 'integer';
+    $spec['inputmode'] = $unsigned ? 'numeric' : 'text';
+    $spec['min'] = $bounds['min'];
+    $spec['max'] = $bounds['max'];
+    $spec['help'] = ($unsigned ? 'Unsigned integer' : 'Signed integer') . ' · ' . $bounds['min'] . ' to ' . $bounds['max'] . ' · no leading zeros';
+    return $spec;
+  }
+  if (in_array($type, ['decimal', 'dec', 'numeric', 'fixed'], true)) {
+    $spec['kind'] = 'decimal';
+    $spec['inputmode'] = 'decimal';
+    $spec['precision'] = (int)($column['NUMERIC_PRECISION'] ?? 0);
+    $spec['scale'] = (int)($column['NUMERIC_SCALE'] ?? 0);
+    $spec['help'] = ($unsigned ? 'Unsigned ' : 'Signed ') . strtoupper($type);
+    if ($spec['precision'] > 0) {
+      $spec['help'] .= '(' . $spec['precision'] . ',' . $spec['scale'] . ')';
+    }
+    $spec['help'] .= ' · decimal separator .';
+    return $spec;
+  }
+  if (in_array($type, ['float', 'double', 'real'], true)) {
+    $spec['kind'] = 'float';
+    $spec['inputmode'] = 'decimal';
+    $spec['help'] = ($unsigned ? 'Unsigned ' : 'Signed ') . strtoupper($type) . ' · scientific notation supported';
+    return $spec;
+  }
+  if ($type === 'date') {
+    $spec['kind'] = 'date';
+    $spec['inputmode'] = 'numeric';
+    $spec['placeholder'] = 'YYYY-MM-DD';
+    $spec['help'] = 'Date · YYYY-MM-DD';
+    return $spec;
+  }
+  if (in_array($type, ['datetime', 'timestamp'], true)) {
+    $spec['kind'] = 'datetime';
+    $spec['inputmode'] = 'numeric';
+    $spec['placeholder'] = 'YYYY-MM-DD HH:MM:SS';
+    $spec['help'] = strtoupper($type) . ' · YYYY-MM-DD HH:MM:SS';
+    return $spec;
+  }
+  if ($type === 'time') {
+    $spec['kind'] = 'time';
+    $spec['inputmode'] = 'numeric';
+    $spec['placeholder'] = 'HH:MM:SS';
+    $spec['help'] = 'TIME · HH:MM:SS · negative times are allowed';
+    return $spec;
+  }
+  if ($type === 'year') {
+    $spec['kind'] = 'year';
+    $spec['inputmode'] = 'numeric';
+    $spec['placeholder'] = 'YYYY';
+    $spec['maxlength'] = 4;
+    $spec['help'] = 'YEAR · digits only';
+    return $spec;
+  }
+  if (in_array($type, ['char', 'varchar'], true)) {
+    $spec['kind'] = 'text';
+    $spec['maxlength'] = (int)($column['CHARACTER_MAXIMUM_LENGTH'] ?? 0);
+    if ($spec['maxlength'] > 0) {
+      $spec['help'] = 'Maximum ' . $spec['maxlength'] . ' character(s)';
+    }
+    return $spec;
+  }
+  if ($type === 'json') {
+    $spec['kind'] = 'json';
+    $spec['help'] = 'JSON syntax is checked before saving';
+    return $spec;
+  }
+  return $spec;
+}
+
+function ms_smart_input_attributes(array $spec): string {
+  $attributes = ' data-ms-smart-input data-ms-kind="' . h($spec['kind']) . '"';
+  $attributes .= ' data-ms-unsigned="' . (!empty($spec['unsigned']) ? '1' : '0') . '"';
+  if ($spec['min'] !== '') {
+    $attributes .= ' data-ms-min="' . h($spec['min']) . '"';
+  }
+  if ($spec['max'] !== '') {
+    $attributes .= ' data-ms-max="' . h($spec['max']) . '"';
+  }
+  if ((int)$spec['precision'] > 0) {
+    $attributes .= ' data-ms-precision="' . h((string)$spec['precision']) . '" data-ms-scale="' . h((string)$spec['scale']) . '"';
+  }
+  if ($spec['inputmode'] !== '') {
+    $attributes .= ' inputmode="' . h($spec['inputmode']) . '"';
+  }
+  if ((int)$spec['maxlength'] > 0) {
+    $attributes .= ' maxlength="' . h((string)$spec['maxlength']) . '"';
+  }
+  if ($spec['placeholder'] !== '') {
+    $attributes .= ' placeholder="' . h($spec['placeholder']) . '"';
+  }
+  $attributes .= ' autocomplete="off" spellcheck="false"';
+  return $attributes;
 }
 
 function render_value($value, int $max = 500): string {
@@ -1343,7 +1632,8 @@ try {
           } elseif (!empty($expressions[$name])) {
             $sqlValue = (string)($input[$name] ?? 'NULL');
           } else {
-            $sqlValue = qs($db, $input[$name] ?? '');
+            $literalValue = ms_normalize_column_literal($column, $input[$name] ?? '');
+            $sqlValue = qs($db, $literalValue);
           }
           $assignments[$name] = $sqlValue;
         }
@@ -2410,8 +2700,8 @@ function page_row(mysqli $db): void {
       }
     }
   }
-  title_bar(($mode === 'edit' ? 'Edit' : 'Insert') . ' row: ' . $table, 'Expressions are executed as SQL; use only trusted input.');
-  ?><form method="post" enctype="multipart/form-data">
+  title_bar(($mode === 'edit' ? 'Edit' : 'Insert') . ' row: ' . $table, 'Literal values are validated according to their MySQL type. Enable SQL expression to enter raw SQL.');
+  ?><form method="post" enctype="multipart/form-data" data-ms-row-form>
     <input type="hidden" name="action" value="save_row">
     <input type="hidden" name="identity" value="<?= h($identity === null ? '' : encode_identity($identity)) ?>">
     <?= csrf_field() ?>
@@ -2420,30 +2710,313 @@ function page_row(mysqli $db): void {
       $name = (string)$column['COLUMN_NAME'];
       $generated = strpos((string)$column['EXTRA'], 'GENERATED') !== false;
       $binary = preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) === 1;
-      ?><tr><td><strong><?= h($name) ?></strong><?php if ($column['COLUMN_KEY']) { ?><span class="badge text-bg-primary ms-1"><?= h($column['COLUMN_KEY']) ?></span><?php } ?></td><td class="code small"><?= h($column['COLUMN_TYPE']) ?></td><td>
+      $spec = ms_column_edit_spec($column);
+      $currentIsNull = $mode === 'edit' && array_key_exists($name, $values) && $values[$name] === null;
+      ?><tr data-ms-field-row><td><strong><?= h($name) ?></strong><?php if ($column['COLUMN_KEY']) { ?><span class="badge text-bg-primary ms-1"><?= h($column['COLUMN_KEY']) ?></span><?php } ?></td><td class="code small"><?= h($column['COLUMN_TYPE']) ?></td><td>
       <?php if ($generated) { ?>
         <span class="text-body-secondary">Generated automatically</span>
       <?php } elseif ($binary) { ?>
         <?php if ($mode === 'edit' && array_key_exists($name, $values) && $values[$name] !== null) { ?><div class="small mb-1"><?= h(strlen((string)$values[$name])) ?> existing bytes</div><?php } ?>
         <input class="form-control mb-1" type="file" name="upload[<?= h($name) ?>]">
         <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="2" placeholder="Or enter textual bytes"></textarea>
-      <?php } elseif (in_array($column['DATA_TYPE'], ['text','mediumtext','longtext','json'], true)) { ?>
+      <?php } elseif (in_array($column['DATA_TYPE'], ['text','mediumtext','longtext'], true)) { ?>
         <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="4"><?= h($values[$name] ?? '') ?></textarea>
+      <?php } elseif ($column['DATA_TYPE'] === 'json') { ?>
+        <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="6"<?= ms_smart_input_attributes($spec) ?>><?= h($values[$name] ?? '') ?></textarea>
+        <div class="form-text"><?= h($spec['help']) ?></div>
       <?php } elseif ($column['DATA_TYPE'] === 'enum' && preg_match_all("/'((?:[^'\\\\]|\\\\.)*)'/", (string)$column['COLUMN_TYPE'], $matches)) { ?>
         <select class="form-select" name="value[<?= h($name) ?>]"><?php foreach ($matches[1] as $option) { $option = stripcslashes($option); ?><option<?= (($values[$name] ?? '') === $option) ? ' selected' : '' ?>><?= h($option) ?></option><?php } ?></select>
       <?php } else { ?>
-        <input class="form-control" name="value[<?= h($name) ?>]" value="<?= h($values[$name] ?? '') ?>">
+        <input class="form-control<?= in_array($spec['kind'], ['integer','decimal','float','date','datetime','time','year'], true) ? ' code' : '' ?>" name="value[<?= h($name) ?>]" value="<?= h($values[$name] ?? '') ?>"<?= ms_smart_input_attributes($spec) ?>>
+        <?php if ($spec['help'] !== '') { ?><div class="form-text"><?= h($spec['help']) ?></div><?php } ?>
       <?php } ?></td><td><?php if (!$generated) { ?>
-        <label class="d-block"><input class="form-check-input" type="checkbox" name="is_null[<?= h($name) ?>]"> NULL</label>
-        <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]"> SQL expression</label>
+        <label class="d-block"><input class="form-check-input" type="checkbox" name="is_null[<?= h($name) ?>]" data-ms-null<?= $currentIsNull ? ' checked' : '' ?>> NULL</label>
+        <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]" data-ms-expression> SQL expression</label>
         <?php if ($binary && $mode === 'edit') { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]" checked> Keep existing</label><?php } ?>
       <?php } ?></td></tr>
     <?php } ?>
     </tbody></table></div></div>
     <div class="mt-3 d-flex gap-2"><button class="btn btn-primary">Save row</button><a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Cancel</a></div>
   </form>
-  <?php if ($mode === 'edit') { ?><form method="post" class="mt-2"><input type="hidden" name="action" value="clone_row"><input type="hidden" name="identity" value="<?= h(encode_identity($identity)) ?>"><?= csrf_field() ?><button class="btn btn-secondary">Clone row</button></form><?php }
+  <?php if ($mode === 'edit') { ?><form method="post" class="mt-2"><input type="hidden" name="action" value="clone_row"><input type="hidden" name="identity" value="<?= h(encode_identity($identity)) ?>"><?= csrf_field() ?><button class="btn btn-secondary">Clone row</button></form><?php } ?>
+  <script>
+  (() => {
+    'use strict';
+
+    const form = document.querySelector('[data-ms-row-form]');
+    if (!form) return;
+
+    const compareUnsignedDecimal = (a, b) => {
+      a = String(a || '').replace(/^0+/, '') || '0';
+      b = String(b || '').replace(/^0+/, '') || '0';
+      if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+      return a === b ? 0 : (a < b ? -1 : 1);
+    };
+
+    const normalizeInteger = (value, unsigned) => {
+      let source = String(value || '');
+      const negative = !unsigned && source.startsWith('-');
+      source = source.replace(/\D/g, '');
+      source = source.replace(/^0+(?=\d)/, '');
+      if (source === '') return negative ? '-' : '';
+      if (/^0+$/.test(source)) return '0';
+      return (negative ? '-' : '') + source;
+    };
+
+    const normalizeDecimal = (value, unsigned) => {
+      let source = String(value || '').replace(/,/g, '.');
+      const negative = !unsigned && source.startsWith('-');
+      source = source.replace(/[^\d.]/g, '');
+      const dot = source.indexOf('.');
+      if (dot !== -1) {
+        source = source.slice(0, dot + 1) + source.slice(dot + 1).replace(/\./g, '');
+      }
+      let [integer = '', fraction] = source.split('.', 2);
+      integer = integer.replace(/^0+(?=\d)/, '');
+      if (source.startsWith('.')) integer = '0';
+      const hasDot = source.includes('.');
+      let result = (negative ? '-' : '') + integer;
+      if (hasDot) result += '.' + (fraction ?? '');
+      if (result === '-0' || result === '-0.') return result;
+      return result;
+    };
+
+    const normalizeFloat = (value, unsigned) => {
+      const source = String(value || '').replace(/,/g, '.');
+      let out = '';
+      let mantissaDigit = false;
+      let dotSeen = false;
+      let exponentSeen = false;
+      let exponentDigit = false;
+      for (const char of source) {
+        if (/\d/.test(char)) {
+          out += char;
+          if (exponentSeen) exponentDigit = true;
+          else mantissaDigit = true;
+          continue;
+        }
+        if (char === '.' && !dotSeen && !exponentSeen) {
+          if (!mantissaDigit) {
+            if (out === '-') out += '0';
+            else if (out === '') out = '0';
+          }
+          out += '.';
+          dotSeen = true;
+          continue;
+        }
+        if ((char === 'e' || char === 'E') && mantissaDigit && !exponentSeen) {
+          out += 'e';
+          exponentSeen = true;
+          continue;
+        }
+        if (char === '-' && out === '' && !unsigned) {
+          out = '-';
+          continue;
+        }
+        if ((char === '-' || char === '+') && exponentSeen && /e$/i.test(out)) {
+          out += char;
+        }
+      }
+
+      const eIndex = out.search(/e/i);
+      const mantissaWithSign = eIndex === -1 ? out : out.slice(0, eIndex);
+      const exponent = eIndex === -1 ? '' : out.slice(eIndex);
+      const negative = mantissaWithSign.startsWith('-');
+      let mantissa = negative ? mantissaWithSign.slice(1) : mantissaWithSign;
+      if (mantissa.includes('.')) {
+        const parts = mantissa.split('.', 2);
+        let integer = parts[0].replace(/^0+(?=\d)/, '');
+        if (integer === '') integer = '0';
+        mantissa = integer + '.' + parts[1];
+      } else {
+        mantissa = mantissa.replace(/^0+(?=\d)/, '');
+      }
+      return (negative ? '-' : '') + mantissa + exponent;
+    };
+
+    const sanitize = input => {
+      const kind = input.dataset.msKind || 'text';
+      const unsigned = input.dataset.msUnsigned === '1';
+      if (kind === 'integer') return normalizeInteger(input.value, unsigned);
+      if (kind === 'decimal') return normalizeDecimal(input.value, unsigned);
+      if (kind === 'float') return normalizeFloat(input.value, unsigned);
+      if (kind === 'year') return input.value.replace(/\D/g, '').slice(0, 4);
+      if (kind === 'date') return input.value.replace(/[^\d-]/g, '');
+      if (kind === 'datetime') return input.value.replace(/[^\dTt :.\-]/g, '').replace(/t/g, 'T');
+      if (kind === 'time') {
+        let source = input.value.replace(/[^\d:.\-]/g, '');
+        const negative = source.startsWith('-');
+        source = source.replace(/-/g, '');
+        return (negative ? '-' : '') + source;
+      }
+      return input.value;
+    };
+
+    const fieldControls = input => {
+      const row = input.closest('[data-ms-field-row]');
+      return {
+        row,
+        nullToggle: row ? row.querySelector('[data-ms-null]') : null,
+        expressionToggle: row ? row.querySelector('[data-ms-expression]') : null
+      };
+    };
+
+    const rawMode = input => {
+      const controls = fieldControls(input);
+      return !!(controls.expressionToggle && controls.expressionToggle.checked);
+    };
+
+    const nullMode = input => {
+      const controls = fieldControls(input);
+      return !!(controls.nullToggle && controls.nullToggle.checked);
+    };
+
+    const validate = input => {
+      input.setCustomValidity('');
+      if (input.disabled || rawMode(input) || nullMode(input)) return true;
+
+      const value = input.value.trim();
+      const kind = input.dataset.msKind || 'text';
+      const unsigned = input.dataset.msUnsigned === '1';
+      if (value === '') return true;
+
+      if (kind === 'integer') {
+        if (!/^-?\d+$/.test(value)) {
+          input.setCustomValidity('Enter a whole number.');
+          return false;
+        }
+        if (unsigned && value.startsWith('-')) {
+          input.setCustomValidity('This column is UNSIGNED and cannot be negative.');
+          return false;
+        }
+        const negative = value.startsWith('-');
+        const digits = (negative ? value.slice(1) : value).replace(/^0+/, '') || '0';
+        const min = input.dataset.msMin || '';
+        const max = input.dataset.msMax || '';
+        if (negative && min && compareUnsignedDecimal(digits, min.replace(/^-/, '')) > 0) {
+          input.setCustomValidity('Minimum value: ' + min);
+          return false;
+        }
+        if (!negative && max && compareUnsignedDecimal(digits, max) > 0) {
+          input.setCustomValidity('Maximum value: ' + max);
+          return false;
+        }
+      } else if (kind === 'decimal') {
+        if (!/^-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))$/.test(value)) {
+          input.setCustomValidity('Enter a valid decimal number.');
+          return false;
+        }
+        if (unsigned && value.startsWith('-')) {
+          input.setCustomValidity('This column is UNSIGNED and cannot be negative.');
+          return false;
+        }
+        const precision = Number.parseInt(input.dataset.msPrecision || '0', 10);
+        const scale = Number.parseInt(input.dataset.msScale || '0', 10);
+        if (precision > 0) {
+          const unsignedValue = value.replace(/^-/, '');
+          const [integer = '', fraction = ''] = unsignedValue.split('.', 2);
+          const integerDigits = (integer.replace(/^0+/, '') || '').length;
+          if (integerDigits > Math.max(0, precision - scale)) {
+            input.setCustomValidity('Too many digits before the decimal point.');
+            return false;
+          }
+          if (fraction.length > scale) {
+            input.setCustomValidity('Maximum ' + scale + ' decimal place(s).');
+            return false;
+          }
+        }
+      } else if (kind === 'float') {
+        if (!/^-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/.test(value)) {
+          input.setCustomValidity('Enter a valid floating-point number.');
+          return false;
+        }
+        if (unsigned && value.startsWith('-')) {
+          input.setCustomValidity('This column is UNSIGNED and cannot be negative.');
+          return false;
+        }
+      } else if (kind === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        input.setCustomValidity('Use YYYY-MM-DD.');
+        return false;
+      } else if (kind === 'datetime' && !/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?$/.test(value)) {
+        input.setCustomValidity('Use YYYY-MM-DD HH:MM:SS.');
+        return false;
+      } else if (kind === 'time' && !/^-?\d{1,3}:\d{2}:\d{2}(?:\.\d{1,6})?$/.test(value)) {
+        input.setCustomValidity('Use HH:MM:SS.');
+        return false;
+      } else if (kind === 'year' && !/^\d{1,4}$/.test(value)) {
+        input.setCustomValidity('Enter a year using digits only.');
+        return false;
+      } else if (kind === 'json') {
+        try {
+          JSON.parse(input.value);
+        } catch (error) {
+          input.setCustomValidity('Invalid JSON: ' + error.message);
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const syncField = row => {
+      const input = row.querySelector('[data-ms-smart-input]');
+      if (!input) return;
+      const nullToggle = row.querySelector('[data-ms-null]');
+      const expressionToggle = row.querySelector('[data-ms-expression]');
+      const isNull = !!(nullToggle && nullToggle.checked);
+      const isExpression = !!(expressionToggle && expressionToggle.checked);
+      input.disabled = isNull;
+      input.classList.toggle('border-warning', isExpression && !isNull);
+      input.classList.toggle('font-monospace', isExpression);
+      if (!isExpression && !isNull) {
+        const next = sanitize(input);
+        if (next !== input.value) input.value = next;
+      }
+      validate(input);
+    };
+
+    form.querySelectorAll('[data-ms-smart-input]').forEach(input => {
+      input.addEventListener('input', () => {
+        if (!rawMode(input) && !nullMode(input)) {
+          const start = input.selectionStart;
+          const oldLength = input.value.length;
+          const next = sanitize(input);
+          if (next !== input.value) {
+            input.value = next;
+            if (typeof start === 'number' && typeof input.setSelectionRange === 'function') {
+              const delta = input.value.length - oldLength;
+              const nextPos = Math.max(0, Math.min(input.value.length, start + delta));
+              input.setSelectionRange(nextPos, nextPos);
+            }
+          }
+        }
+        input.setCustomValidity('');
+      });
+      input.addEventListener('blur', () => validate(input));
+    });
+
+    form.querySelectorAll('[data-ms-field-row]').forEach(row => {
+      const nullToggle = row.querySelector('[data-ms-null]');
+      const expressionToggle = row.querySelector('[data-ms-expression]');
+      if (nullToggle) nullToggle.addEventListener('change', () => syncField(row));
+      if (expressionToggle) expressionToggle.addEventListener('change', () => syncField(row));
+      syncField(row);
+    });
+
+    form.addEventListener('submit', event => {
+      let firstInvalid = null;
+      form.querySelectorAll('[data-ms-smart-input]').forEach(input => {
+        if (!validate(input) && firstInvalid === null) firstInvalid = input;
+      });
+      if (firstInvalid) {
+        event.preventDefault();
+        firstInvalid.reportValidity();
+        firstInvalid.focus();
+      }
+    });
+  })();
+  </script><?php
 }
+
 
 function page_sql(mysqli $db,?array $results,float $time): void {
   $sqlDefaultRows=browser_setting_int('mysqlStudioSqlRows',MS_SQL_ROWS_DEFAULT,1,100000);
