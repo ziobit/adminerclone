@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.9.0';
+const MS_VERSION = '1.9.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2140,8 +2140,8 @@ function page_head(string $title, bool $authenticated): void {
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
     .ms-sql-editor-wrap{position:relative;border-radius:var(--bs-border-radius);background:var(--bs-body-bg)}.ms-sql-highlight{position:absolute;inset:0;z-index:1;margin:0;box-sizing:border-box;border-style:solid;border-color:transparent;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--bs-body-color);background:var(--bs-body-bg);border-radius:inherit}.ms-smart-sql-input{position:relative;z-index:2;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--bs-body-color);resize:vertical}.ms-smart-sql-input::selection{background:rgba(var(--ms-accent-rgb),.28)}.ms-sql-highlight .sql-k{color:#7c3aed;font-weight:700}.ms-sql-highlight .sql-t{color:#0f766e;font-weight:600}.ms-sql-highlight .sql-f{color:#2563eb}.ms-sql-highlight .sql-s{color:#b45309}.ms-sql-highlight .sql-i{color:#be185d}.ms-sql-highlight .sql-c{color:#6b7280;font-style:italic}.ms-sql-highlight .sql-n{color:#0891b2}.ms-sql-highlight .sql-v{color:#9333ea}.ms-sql-highlight .sql-o{color:#dc2626}.ms-sql-autocomplete{position:absolute;z-index:1200;min-width:280px;max-width:min(460px,calc(100% - 8px));max-height:280px;overflow:auto;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);box-shadow:0 .8rem 2.2rem rgba(0,0,0,.22);padding:.3rem}.ms-sql-autocomplete[hidden]{display:none!important}.ms-sql-suggestion{display:flex;align-items:center;gap:.6rem;width:100%;border:0;border-radius:.35rem;background:transparent;color:var(--bs-body-color);text-align:left;padding:.48rem .6rem}.ms-sql-suggestion:hover,.ms-sql-suggestion.active{background:rgba(var(--ms-accent-rgb),.12)}.ms-sql-suggestion-icon{width:1.35rem;text-align:center;color:var(--ms-accent)}.ms-sql-suggestion-main{min-width:0;flex:1}.ms-sql-suggestion-name{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-suggestion-meta{display:block;font-size:.75em;color:var(--bs-secondary-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-autocomplete-title{padding:.25rem .55rem .35rem;color:var(--bs-secondary-color);font-size:.75em;text-transform:uppercase;letter-spacing:.06em;font-weight:700}html[data-bs-theme="dark"] .ms-sql-highlight .sql-k{color:#c4b5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-t{color:#5eead4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-f{color:#93c5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-s{color:#fbbf24}html[data-bs-theme="dark"] .ms-sql-highlight .sql-i{color:#f9a8d4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-c{color:#94a3b8}html[data-bs-theme="dark"] .ms-sql-highlight .sql-n{color:#67e8f9}html[data-bs-theme="dark"] .ms-sql-highlight .sql-v{color:#d8b4fe}html[data-bs-theme="dark"] .ms-sql-highlight .sql-o{color:#fca5a5}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
-    html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:6.25rem}
-    html[data-density="ultracompact"] .ms-db-tools{gap:.05rem!important}html[data-density="ultracompact"] .ms-db-tools .nav-link{padding:.14rem .28rem;line-height:1.1}html[data-density="ultracompact"] .ms-db-tools .nav-link i{font-size:.88em;margin-right:.25rem!important}html[data-density="compact"] .ms-db-tools{gap:.12rem!important}html[data-density="compact"] .ms-db-tools .nav-link{padding:.3rem .48rem;line-height:1.2}html[data-density="compact"] .ms-db-tools .nav-link i{margin-right:.4rem!important}html[data-density="large"] .ms-db-tools{gap:.42rem!important}html[data-density="large"] .ms-db-tools .nav-link{padding:.78rem .9rem;line-height:1.35}html[data-density="large"] .ms-db-tools .nav-link i{font-size:1.08em;margin-right:.7rem!important}
+    html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
+    html[data-density="ultracompact"] .ms-db-tools{gap:.05rem!important}html[data-density="ultracompact"] .ms-db-tools .nav-link{padding:.10rem .24rem!important;line-height:1.05;font-size:.72rem}html[data-density="ultracompact"] .ms-db-tools .nav-link i{font-size:.84em;margin-right:.20rem!important}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools{gap:.10rem!important}html[data-density="compact"] .ms-db-tools .nav-link{padding:.22rem .38rem!important;line-height:1.15;font-size:.82rem}html[data-density="compact"] .ms-db-tools .nav-link i{font-size:.92em;margin-right:.30rem!important}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools{gap:.42rem!important}html[data-density="large"] .ms-db-tools .nav-link{padding:.78rem .9rem!important;line-height:1.35;font-size:1.05rem}html[data-density="large"] .ms-db-tools .nav-link i{font-size:1.08em;margin-right:.7rem!important}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
 </head>
@@ -2327,6 +2327,26 @@ function page_foot(): void {
   }));
   let settings=window.msLoadSettings();
   window.msApplySettings(settings);
+  document.querySelectorAll('[data-ms-page-jump]').forEach(input => {
+    const goToPage = () => {
+      const max = Math.max(1, Number.parseInt(input.dataset.msPages || '1', 10) || 1);
+      let target = Number.parseInt(input.value, 10);
+      if (!Number.isFinite(target)) return;
+      target = Math.max(1, Math.min(max, target));
+      input.value = String(target);
+      const destination = new URL(window.location.href);
+      destination.searchParams.set('p', String(target));
+      if (typeof window.msShowPageLoader === 'function') window.msShowPageLoader('Changing page...');
+      window.location.href = destination.toString();
+    };
+    input.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      goToPage();
+    });
+    input.addEventListener('change', goToPage);
+  });
+
   const settingsForm=document.getElementById('ms-settings-form');
   if(settingsForm){
     const selectCurrent=()=>{
@@ -2628,13 +2648,31 @@ function build_select_query(mysqli $db,string $table,array $columns): array {
 }
 
 function render_select_pagination(int $page, int $pages, string $position): void {
-  $page = max(1, min($pages, $page));
   $pages = max(1, $pages);
-  ?><nav class="my-3 no-print" aria-label="Table pages" data-ms-pagination="<?= h($position) ?>"><ul class="pagination mb-0 flex-wrap">
-    <li class="page-item <?= $page <= 1 ? 'disabled' : '' ?>"><a class="page-link" href="<?= $page <= 1 ? '#' : h(url(['p' => 1])) ?>"<?= $page <= 1 ? ' tabindex="-1" aria-disabled="true"' : '' ?> title="First page"><i class="fa-solid fa-angles-left me-1"></i>First</a></li>
-    <?php for ($i = max(1, $page - 3); $i <= min($pages, $page + 3); $i++) { ?><li class="page-item <?= $i === $page ? 'active' : '' ?>"><a class="page-link" href="<?= h(url(['p' => $i])) ?>"<?= $i === $page ? ' aria-current="page"' : '' ?>><?= h((string)$i) ?></a></li><?php } ?>
-    <li class="page-item <?= $page >= $pages ? 'disabled' : '' ?>"><a class="page-link" href="<?= $page >= $pages ? '#' : h(url(['p' => $pages])) ?>"<?= $page >= $pages ? ' tabindex="-1" aria-disabled="true"' : '' ?> title="Last page">Last<i class="fa-solid fa-angles-right ms-1"></i></a></li>
-  </ul></nav><?php
+  $page = max(1, min($pages, $page));
+  $manyPages = $pages > 6;
+  $firstPages = $manyPages ? range(1, min(3, $pages)) : range(1, $pages);
+  $lastPages = $manyPages ? range(max(4, $pages - 2), $pages) : [];
+  $edgePages = array_values(array_unique(array_merge($firstPages, $lastPages)));
+  $middleCurrent = $manyPages && !in_array($page, $edgePages, true);
+
+  $renderPage = static function (int $number, int $current, int $total): void {
+    $active = $number === $current;
+    ?><li class="page-item <?= $active ? 'active' : '' ?>"><a class="page-link d-flex align-items-center gap-1" href="<?= h(url(['p' => $number])) ?>"<?= $active ? ' aria-current="page"' : '' ?> title="Page <?= h((string)$number) ?>"><?php if ($number === 1) { ?><i class="fa-solid fa-backward-fast" aria-hidden="true"></i><?php } ?><span><?= h((string)$number) ?></span><?php if ($number === $total) { ?><i class="fa-solid fa-forward-fast" aria-hidden="true"></i><?php } ?></a></li><?php
+  };
+
+  ?><nav class="my-3 no-print" aria-label="Table pages" data-ms-pagination="<?= h($position) ?>"><ul class="pagination mb-0 flex-wrap"><?php
+    foreach ($firstPages as $number) {
+      $renderPage((int)$number, $page, $pages);
+    }
+
+    if ($manyPages) {
+      ?><li class="page-item ms-page-jump-item"><input class="form-control ms-page-jump<?= $middleCurrent ? ' ms-page-jump-current' : '' ?>" type="number" inputmode="numeric" min="1" max="<?= h((string)$pages) ?>" step="1"<?= $middleCurrent ? ' value="' . h((string)$page) . '"' : '' ?> placeholder="Page" title="Enter a page number from 1 to <?= h((string)$pages) ?> and press Enter" aria-label="Go to page" data-ms-page-jump data-ms-pages="<?= h((string)$pages) ?>"></li><?php
+      foreach ($lastPages as $number) {
+        $renderPage((int)$number, $page, $pages);
+      }
+    }
+  ?></ul></nav><?php
 }
 
 function page_select(mysqli $db): void {
@@ -2782,7 +2820,7 @@ function page_row(mysqli $db): void {
           <div class="input-group ms-date-editor" data-ms-date-editor data-ms-picker-kind="<?= h($spec['kind']) ?>">
             <input class="form-control code ms-manual-input" name="value[<?= h($name) ?>]" value="<?= h($values[$name] ?? '') ?>"<?= ms_smart_input_attributes($spec) ?> data-ms-manual-input>
             <input class="form-control code ms-picker-input" type="<?= h($pickerType) ?>"<?= $spec['kind'] === 'datetime' ? ' step="1"' : '' ?> data-ms-picker-input hidden>
-            <button class="btn btn-outline-secondary ms-picker-toggle" type="button" data-ms-picker-toggle title="Switch to date picker"><i class="fa-solid fa-calendar-days me-1"></i><span data-ms-picker-label>Picker</span></button>
+            <button class="btn btn-outline-secondary ms-picker-toggle" type="button" data-ms-picker-toggle title="Switch to date picker" aria-label="Switch to date picker"><i class="fa-solid fa-calendar-days"></i></button>
           </div>
         <?php } else { ?>
           <input class="form-control<?= in_array($spec['kind'], ['integer','decimal','float','time','year'], true) ? ' code' : '' ?>" name="value[<?= h($name) ?>]" value="<?= h($values[$name] ?? '') ?>"<?= ms_smart_input_attributes($spec) ?>>
@@ -3044,7 +3082,6 @@ function page_row(mysqli $db): void {
       const manual = editor.querySelector('[data-ms-manual-input]');
       const picker = editor.querySelector('[data-ms-picker-input]');
       const toggle = editor.querySelector('[data-ms-picker-toggle]');
-      const label = editor.querySelector('[data-ms-picker-label]');
       if (!manual || !picker || !toggle) return;
       const kind = editor.dataset.msPickerKind || 'date';
       const expressionToggle = row.querySelector('[data-ms-expression]');
@@ -3057,10 +3094,10 @@ function page_row(mysqli $db): void {
       manual.hidden = usePicker;
       picker.hidden = !usePicker;
       editor.dataset.msPickerMode = usePicker ? 'picker' : 'manual';
-      if (label) label.textContent = usePicker ? 'Type' : 'Picker';
       toggle.title = usePicker ? 'Switch to typing' : 'Switch to date picker';
+      toggle.setAttribute('aria-label', toggle.title);
       const icon = toggle.querySelector('i');
-      if (icon) icon.className = usePicker ? 'fa-solid fa-keyboard me-1' : 'fa-solid fa-calendar-days me-1';
+      if (icon) icon.className = usePicker ? 'fa-solid fa-keyboard' : 'fa-solid fa-calendar-days';
       if (usePicker) {
         picker.focus();
         if (openPicker && typeof picker.showPicker === 'function') {
