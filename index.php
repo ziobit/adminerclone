@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.9.1';
+const MS_VERSION = '1.10.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1632,6 +1632,36 @@ try {
           throw new RuntimeException($db->error);
         }
         go([], 'Column updated.');
+      } elseif ($action === 'reorder_column') {
+        $table = g('table');
+        if (!table_exists($db, $table)) {
+          throw new RuntimeException('Table not found.');
+        }
+        $columnName = p('column');
+        $after = p('after');
+        $columns = table_columns($db, $table);
+        $columnNames = array_map('strval', array_column($columns, 'COLUMN_NAME'));
+        if (!in_array($columnName, $columnNames, true)) {
+          throw new RuntimeException('Column not found.');
+        }
+        if ($after !== '' && !in_array($after, $columnNames, true)) {
+          throw new RuntimeException('Invalid target column position.');
+        }
+        if ($after === $columnName) {
+          throw new RuntimeException('A column cannot be positioned after itself.');
+        }
+        $currentIndex = array_search($columnName, $columnNames, true);
+        $currentAfter = $currentIndex === 0 ? '' : (string)$columnNames[$currentIndex - 1];
+        if ($after === $currentAfter) {
+          go([], 'Column position unchanged.', 'info');
+        }
+        $definition = exact_column_definition($db, $table, $columnName);
+        $sql = 'ALTER TABLE ' . qi($table) . ' MODIFY COLUMN ' . qi($columnName) . ' ' . $definition;
+        $sql .= $after === '' ? ' FIRST' : ' AFTER ' . qi($after);
+        if (!$db->query($sql)) {
+          throw new RuntimeException($db->error);
+        }
+        go([], 'Column position updated.');
       } elseif ($action === 'drop_column') {
         $sql = 'ALTER TABLE ' . qi(g('table')) . ' DROP COLUMN ' . qi(p('column'));
         if (!$db->query($sql)) {
@@ -2567,6 +2597,35 @@ function page_create_table(mysqli $db): void {
   <button class="btn btn-primary mt-2">Create table</button></form><?php
 }
 
+function exact_column_definition(mysqli $db, string $table, string $columnName): string {
+  $row = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
+  if (!$row) {
+    throw new RuntimeException('Unable to read the table definition.');
+  }
+  $create = '';
+  foreach ($row as $key => $value) {
+    if (stripos((string)$key, 'Create ') === 0) {
+      $create = (string)$value;
+      break;
+    }
+  }
+  if ($create === '') {
+    throw new RuntimeException('Unable to read the table definition.');
+  }
+  $escaped = preg_quote(str_replace('`', '``', $columnName), '/');
+  if (preg_match('/^\s*`' . $escaped . '`\s+([^\r\n]+)$/m', $create, $match) !== 1) {
+    throw new RuntimeException('Unable to reconstruct the column definition safely.');
+  }
+  $definition = trim((string)$match[1]);
+  if (substr($definition, -1) === ',') {
+    $definition = rtrim(substr($definition, 0, -1));
+  }
+  if ($definition === '') {
+    throw new RuntimeException('The column definition is empty.');
+  }
+  return $definition;
+}
+
 function parse_column_meta(array $column): array {
   $type = strtoupper((string)$column['DATA_TYPE']);
   $length = '';
@@ -2576,6 +2635,192 @@ function parse_column_meta(array $column): array {
   return ['name'=>$column['COLUMN_NAME'],'type'=>$type,'length'=>$length,'nullable'=>$column['IS_NULLABLE']==='YES','default_set'=>$column['COLUMN_DEFAULT']!==null,'default'=>$column['COLUMN_DEFAULT']??'','default_expression'=>preg_match('/CURRENT_TIMESTAMP|^\(.+\)$/i',(string)($column['COLUMN_DEFAULT']??''))===1,'unsigned'=>strpos((string)$column['COLUMN_TYPE'],'unsigned')!==false,'auto_increment'=>strpos((string)$column['EXTRA'],'auto_increment')!==false,'on_update'=>stripos((string)$column['EXTRA'],'on update')!==false,'invisible'=>stripos((string)$column['EXTRA'],'invisible')!==false,'collation'=>$column['COLLATION_NAME']??'','comment'=>$column['COLUMN_COMMENT'],'generated'=>$column['GENERATION_EXPRESSION']??'','stored'=>strpos((string)$column['EXTRA'],'STORED')!==false];
 }
 
+function column_is_numeric_type(string $type): bool {
+  return in_array(strtolower($type), [
+    'bit','tinyint','smallint','mediumint','int','integer','bigint','decimal','dec','numeric','fixed',
+    'float','double','double precision','real','bool','boolean'
+  ], true);
+}
+
+function column_is_text_type(string $type): bool {
+  return in_array(strtolower($type), [
+    'char','varchar','tinytext','text','mediumtext','longtext','enum','set'
+  ], true);
+}
+
+function column_is_temporal_type(string $type): bool {
+  return in_array(strtolower($type), ['date','datetime','timestamp','time','year'], true);
+}
+
+function column_is_spatial_type(string $type): bool {
+  return in_array(strtolower($type), [
+    'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection'
+  ], true);
+}
+
+function column_is_binary_type(string $type): bool {
+  return in_array(strtolower($type), [
+    'binary','varbinary','tinyblob','blob','mediumblob','longblob'
+  ], true);
+}
+
+function column_statistics_summary(mysqli $db, string $table, array $column): array {
+  $name = (string)$column['COLUMN_NAME'];
+  $type = strtolower((string)$column['DATA_TYPE']);
+  $value = qi($name);
+  $distinctExpression = $value;
+  if ($type === 'json') {
+    $distinctExpression = 'CAST(' . $value . ' AS CHAR)';
+  } elseif (column_is_spatial_type($type)) {
+    $distinctExpression = 'ST_AsBinary(' . $value . ')';
+  }
+  $parts = [
+    'COUNT(*) AS total_rows',
+    'COUNT(' . $value . ') AS non_null_rows',
+    'SUM(' . $value . ' IS NULL) AS null_rows',
+    'COUNT(DISTINCT ' . $distinctExpression . ') AS distinct_values'
+  ];
+  $comparable = column_is_numeric_type($type) || column_is_text_type($type) || column_is_temporal_type($type) || in_array($type, ['binary','varbinary'], true);
+  if ($comparable) {
+    $parts[] = 'MIN(' . $value . ') AS min_value';
+    $parts[] = 'MAX(' . $value . ') AS max_value';
+  }
+  if (column_is_numeric_type($type)) {
+    $parts[] = 'AVG(' . $value . ') AS avg_value';
+    $parts[] = 'STDDEV_POP(' . $value . ') AS stddev_value';
+    $parts[] = 'SUM(' . $value . ') AS sum_value';
+    $parts[] = 'SUM(' . $value . ' = 0) AS zero_rows';
+    $parts[] = 'SUM(' . $value . ' < 0) AS negative_rows';
+  }
+  if (column_is_text_type($type)) {
+    $parts[] = 'AVG(CHAR_LENGTH(' . $value . ')) AS avg_length';
+    $parts[] = 'MIN(CHAR_LENGTH(' . $value . ')) AS min_length';
+    $parts[] = 'MAX(CHAR_LENGTH(' . $value . ')) AS max_length';
+    $parts[] = 'SUM(' . $value . " = '') AS empty_rows";
+  }
+  if (column_is_binary_type($type)) {
+    $parts[] = 'AVG(OCTET_LENGTH(' . $value . ')) AS avg_bytes';
+    $parts[] = 'MIN(OCTET_LENGTH(' . $value . ')) AS min_bytes';
+    $parts[] = 'MAX(OCTET_LENGTH(' . $value . ')) AS max_bytes';
+    $parts[] = 'SUM(OCTET_LENGTH(' . $value . ') = 0) AS empty_rows';
+  }
+  $started = microtime(true);
+  $row = db_one($db, 'SELECT ' . implode(', ', $parts) . ' FROM ' . qi($table));
+  if (!$row) {
+    throw new RuntimeException('Unable to calculate column statistics.');
+  }
+  $row['_time'] = microtime(true) - $started;
+  return $row;
+}
+
+function column_distinct_select_parts(array $column): array {
+  $name = (string)$column['COLUMN_NAME'];
+  $type = strtolower((string)$column['DATA_TYPE']);
+  $value = qi($name);
+  if (column_is_spatial_type($type)) {
+    return ['IF(' . $value . ' IS NULL, NULL, HEX(ST_AsBinary(' . $value . ')))', 'ST_AsBinary(' . $value . ')'];
+  }
+  if (column_is_binary_type($type)) {
+    return ['IF(' . $value . ' IS NULL, NULL, HEX(' . $value . '))', $value];
+  }
+  if ($type === 'json') {
+    return ['CAST(' . $value . ' AS CHAR)', 'CAST(' . $value . ' AS CHAR)'];
+  }
+  return [$value, $value];
+}
+
+function stats_number($value, int $decimals = 2): string {
+  if ($value === null || $value === '') {
+    return '—';
+  }
+  if (is_numeric($value)) {
+    return number_format((float)$value, $decimals, '.', ',');
+  }
+  return (string)$value;
+}
+
+function render_stat_box(string $label, string $value, string $hint = ''): void {
+  ?><div class="col-6 col-md-4 col-xl-3"><div class="border rounded p-2 h-100"><div class="small text-body-secondary"><?= h($label) ?></div><div class="fw-semibold text-break"><?= h($value) ?></div><?php if ($hint !== '') { ?><div class="small text-body-secondary mt-1"><?= h($hint) ?></div><?php } ?></div></div><?php
+}
+
+function render_column_statistics(mysqli $db, string $table, array $column, bool $expandDistinct): void {
+  $name = (string)$column['COLUMN_NAME'];
+  $type = strtolower((string)$column['DATA_TYPE']);
+  try {
+    $stats = column_statistics_summary($db, $table, $column);
+  } catch (Throwable $e) {
+    ?><div class="alert alert-danger mb-0"><strong>Statistics failed:</strong> <?= h($e->getMessage()) ?></div><?php
+    return;
+  }
+  $total = (int)($stats['total_rows'] ?? 0);
+  $nonNull = (int)($stats['non_null_rows'] ?? 0);
+  $nulls = (int)($stats['null_rows'] ?? 0);
+  $distinct = (int)($stats['distinct_values'] ?? 0);
+  $nullPct = $total > 0 ? ($nulls * 100 / $total) : 0.0;
+  $uniquePct = $nonNull > 0 ? ($distinct * 100 / $nonNull) : 0.0;
+  $keyLabel = (string)($column['COLUMN_KEY'] ?? '');
+  $keyText = $keyLabel === 'PRI' ? 'Primary key' : ($keyLabel === 'UNI' ? 'Unique index' : ($keyLabel === 'MUL' ? 'Indexed' : 'Not indexed'));
+  ?><div class="card border-info-subtle mt-3 mb-1 ms-column-statistics">
+    <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><div><strong><i class="fa-solid fa-chart-column me-2"></i>Statistics: <?= h($name) ?></strong><span class="text-body-secondary ms-2"><?= h((string)$column['COLUMN_TYPE']) ?></span></div><span class="small text-body-secondary">Calculated in <?= h(number_format((float)$stats['_time'], 4)) ?> s</span></div>
+    <div class="card-body">
+      <div class="row g-2 mb-3"><?php
+        render_stat_box('Rows', number_format($total));
+        render_stat_box('Non-NULL', number_format($nonNull));
+        render_stat_box('NULL', number_format($nulls), number_format($nullPct, 2) . '% of rows');
+        render_stat_box('Distinct non-NULL', number_format($distinct), number_format($uniquePct, 2) . '% of non-NULL values');
+        render_stat_box('Index status', $keyText);
+        render_stat_box('Nullable', ((string)$column['IS_NULLABLE'] === 'YES') ? 'Yes' : 'No');
+        if (array_key_exists('min_value', $stats)) render_stat_box('Minimum', $stats['min_value'] === null ? '—' : (string)$stats['min_value']);
+        if (array_key_exists('max_value', $stats)) render_stat_box('Maximum', $stats['max_value'] === null ? '—' : (string)$stats['max_value']);
+        if (column_is_numeric_type($type)) {
+          render_stat_box('Average', stats_number($stats['avg_value'] ?? null, 6));
+          render_stat_box('Std. deviation', stats_number($stats['stddev_value'] ?? null, 6), 'Population standard deviation');
+          render_stat_box('Sum', stats_number($stats['sum_value'] ?? null, 6));
+          render_stat_box('Zero values', number_format((int)($stats['zero_rows'] ?? 0)));
+          render_stat_box('Negative values', number_format((int)($stats['negative_rows'] ?? 0)));
+        }
+        if (column_is_text_type($type)) {
+          render_stat_box('Average length', stats_number($stats['avg_length'] ?? null, 2) . ' chars');
+          render_stat_box('Shortest length', stats_number($stats['min_length'] ?? null, 0) . ' chars');
+          render_stat_box('Longest length', stats_number($stats['max_length'] ?? null, 0) . ' chars');
+          render_stat_box('Empty strings', number_format((int)($stats['empty_rows'] ?? 0)));
+        }
+        if (column_is_binary_type($type)) {
+          render_stat_box('Average size', stats_number($stats['avg_bytes'] ?? null, 2) . ' bytes');
+          render_stat_box('Smallest size', stats_number($stats['min_bytes'] ?? null, 0) . ' bytes');
+          render_stat_box('Largest size', stats_number($stats['max_bytes'] ?? null, 0) . ' bytes');
+          render_stat_box('Empty values', number_format((int)($stats['empty_rows'] ?? 0)));
+        }
+      ?></div>
+      <?php
+      $showDistinct = $distinct < 10 || $expandDistinct;
+      if (!$showDistinct) {
+        $expandUrl = '?' . http_build_query(['page'=>'structure','table'=>$table,'stats'=>$name,'distinct'=>'all']);
+        ?><div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2 mb-0"><span><i class="fa-solid fa-triangle-exclamation me-2"></i>This column has <?= h(number_format($distinct)) ?> distinct non-NULL values. Expanding all frequencies can take significant time and may generate a very large page.</span><a class="btn btn-warning btn-sm" href="<?= h($expandUrl) ?>" data-confirm="This will group and display every distinct value in this column. On a large table this can take a long time and produce a very large response. Continue?"><i class="fa-solid fa-list me-1"></i>Expand all distinct values</a></div><?php
+      } else {
+        [$displayExpression, $groupExpression] = column_distinct_select_parts($column);
+        $sql = 'SELECT ' . $displayExpression . ' AS value_display, COUNT(*) AS occurrences FROM ' . qi($table) . ' GROUP BY ' . $groupExpression . ' ORDER BY occurrences DESC';
+        $started = microtime(true);
+        $result = $db->query($sql, MYSQLI_USE_RESULT);
+        if (!$result instanceof mysqli_result) {
+          ?><div class="alert alert-danger mb-0">Unable to calculate value frequencies: <?= h($db->error) ?></div><?php
+        } else {
+          ?><div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2"><strong>Value frequencies</strong><span class="small text-body-secondary"><?= $distinct < 10 ? 'Shown automatically because there are fewer than 10 distinct non-NULL values.' : 'All distinct values requested explicitly.' ?></span></div>
+          <div class="table-responsive border rounded" style="max-height:32rem"><table class="table table-sm table-striped align-middle mb-0"><thead class="sticky-top"><tr><th>Value</th><th class="text-end">Count</th><th class="text-end">Percent</th></tr></thead><tbody><?php
+          while ($frequency = $result->fetch_assoc()) {
+            $count = (int)$frequency['occurrences'];
+            $percent = $total > 0 ? ($count * 100 / $total) : 0.0;
+            ?><tr><td class="code"><?php if ($frequency['value_display'] === null) { ?><span class="badge text-bg-secondary">NULL</span><?php } else { echo render_value($frequency['value_display'], 1000); } ?></td><td class="text-end"><?= h(number_format($count)) ?></td><td class="text-end"><?= h(number_format($percent, 4)) ?>%</td></tr><?php
+          }
+          $result->free();
+          ?></tbody></table></div><div class="small text-body-secondary mt-2">Frequency query completed in <?= h(number_format(microtime(true) - $started, 4)) ?> s.</div><?php
+        }
+      }
+      ?>
+    </div>
+  </div><?php
+}
+
 function page_structure(mysqli $db): void {
   $table=g('table'); if(!table_exists($db,$table)) throw new RuntimeException('Table not found.');
   $columns=table_columns($db,$table); $status=db_one($db,'SHOW TABLE STATUS LIKE '.qs($db,$table));
@@ -2583,16 +2828,89 @@ function page_structure(mysqli $db): void {
   $foreign=db_all($db,"SELECT CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,ORDINAL_POSITION FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME,ORDINAL_POSITION");
   $checks=db_all($db,"SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=DATABASE() AND tc.TABLE_NAME=".qs($db,$table)." AND tc.CONSTRAINT_TYPE='CHECK'");
   $triggers=db_all($db,'SELECT TRIGGER_NAME,ACTION_TIMING,EVENT_MANIPULATION,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND EVENT_OBJECT_TABLE='.qs($db,$table));
+  $statsColumn=g('stats');
+  $columnNames=array_map('strval',array_column($columns,'COLUMN_NAME'));
+  if($statsColumn!==''&&!in_array($statsColumn,$columnNames,true)) $statsColumn='';
+  $expandDistinct=$statsColumn!==''&&g('distinct')==='all';
   title_bar('Structure: '.$table, $status['Comment']??'', '<a class="btn btn-primary" href="?page=select&amp;table='.urlencode($table).'">Browse data</a>');
-  ?><ul class="nav nav-tabs mb-3"><li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#columns">Columns</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#indexes">Indexes</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#foreign">Foreign keys</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#checks">Checks</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-triggers">Triggers</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#partitions">Partitions</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-settings">Table</button></li></ul>
-  <div class="tab-content"><div class="tab-pane fade show active" id="columns"><div class="accordion" id="columnAccordion"><?php foreach($columns as $i=>$column){$meta=parse_column_meta($column);?><div class="accordion-item"><h2 class="accordion-header"><button class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#col<?= $i ?>"><span class="code"><?= h($column['COLUMN_NAME'].' '.$column['COLUMN_TYPE']) ?></span><?php if($column['COLUMN_KEY']){?><span class="badge text-bg-primary ms-2"><?= h($column['COLUMN_KEY']) ?></span><?php }?></button></h2><div id="col<?= $i ?>" class="accordion-collapse collapse" data-bs-parent="#columnAccordion"><div class="accordion-body"><form method="post"><input type="hidden" name="action" value="alter_column"><input type="hidden" name="old_name" value="<?= h($column['COLUMN_NAME']) ?>"><?= csrf_field() ?><?php column_form_fields($db,$meta); ?><div class="row mt-2"><div class="col-md-3"><label class="form-label">Position</label><select class="form-select" name="position"><option value="">Keep</option><option value="FIRST">First</option><?php foreach($columns as $c){if($c['COLUMN_NAME']!==$column['COLUMN_NAME']){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }}?></select></div><div class="col-md-9 d-flex align-items-end gap-2"><button class="btn btn-primary">Save column</button></form><form method="post"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($column['COLUMN_NAME']) ?>"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Drop this column and its data?">Drop</button></form></div></div></div></div></div><?php }?></div>
-  <div class="card mt-3"><div class="card-header">Add column</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_column"><?= csrf_field() ?><?php column_form_fields($db,['type'=>'VARCHAR','length'=>'255','nullable'=>true]); ?><div class="row mt-2"><div class="col-md-3"><select class="form-select" name="position"><option value="">At end</option><option value="FIRST">First</option><?php foreach($columns as $c){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col"><button class="btn btn-primary">Add column</button></div></div></form></div></div></div>
+  ?><style>
+    .ms-structure-column-handle{cursor:grab;touch-action:none;min-width:2.5rem;border:0;border-right:1px solid var(--bs-border-color);background:transparent;color:var(--bs-secondary-color)}
+    .ms-structure-column-handle:active{cursor:grabbing}.ms-structure-column.ms-structure-dragging{opacity:.45}.ms-structure-column.ms-structure-drop-before{box-shadow:inset 0 3px 0 var(--ms-accent)}.ms-structure-column.ms-structure-drop-after{box-shadow:inset 0 -3px 0 var(--ms-accent)}
+    .ms-structure-column .accordion-button{min-width:0}.ms-column-statistics .sticky-top{z-index:1}
+  </style>
+  <ul class="nav nav-tabs mb-3"><li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#columns">Columns</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#indexes">Indexes</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#foreign">Foreign keys</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#checks">Checks</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-triggers">Triggers</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#partitions">Partitions</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-settings">Table</button></li></ul>
+  <div class="tab-content"><div class="tab-pane fade show active" id="columns">
+    <div class="alert alert-info py-2 small"><i class="fa-solid fa-grip-vertical me-2"></i>Drag a column by its grip to change the physical column order in the database. Reordering executes an <code>ALTER TABLE</code>, so very large tables may take time or require a table rebuild depending on the server/version.</div>
+    <form method="post" id="msColumnReorderForm" class="d-none"><input type="hidden" name="action" value="reorder_column"><input type="hidden" name="column" value=""><input type="hidden" name="after" value=""><?= csrf_field() ?></form>
+    <div class="accordion" id="columnAccordion" data-ms-structure-columns><?php
+      foreach($columns as $i=>$column){
+        $meta=parse_column_meta($column);
+        $columnName=(string)$column['COLUMN_NAME'];
+        $showStats=$statsColumn===$columnName;
+        ?><div class="accordion-item ms-structure-column" data-ms-structure-column="<?= h($columnName) ?>"><h2 class="accordion-header d-flex"><button type="button" class="ms-structure-column-handle" draggable="true" data-ms-structure-handle title="Drag to reorder column" aria-label="Drag <?= h($columnName) ?> to reorder"><i class="fa-solid fa-grip-vertical"></i></button><button class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#col<?= $i ?>"><span class="code text-truncate"><?= h($columnName.' '.$column['COLUMN_TYPE']) ?></span><?php if($column['COLUMN_KEY']){?><span class="badge text-bg-primary ms-2"><?= h($column['COLUMN_KEY']) ?></span><?php }?></button></h2><div id="col<?= $i ?>" class="accordion-collapse collapse<?= $showStats?' show':'' ?>" data-bs-parent="#columnAccordion"><div class="accordion-body">
+          <form method="post"><input type="hidden" name="action" value="alter_column"><input type="hidden" name="old_name" value="<?= h($columnName) ?>"><?= csrf_field() ?><?php column_form_fields($db,$meta); ?><div class="row mt-2"><div class="col-md-3"><label class="form-label">Position</label><select class="form-select" name="position"><option value="">Keep</option><option value="FIRST">First</option><?php foreach($columns as $c){if($c['COLUMN_NAME']!==$columnName){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }}?></select></div><div class="col-md-9 d-flex align-items-end"><button class="btn btn-primary">Save column</button></div></div></form>
+          <div class="d-flex flex-wrap gap-2 mt-2"><a class="btn btn-info" href="?<?= h(http_build_query(['page'=>'structure','table'=>$table,'stats'=>$columnName])) ?>"><i class="fa-solid fa-chart-column me-1"></i>Statistics</a><form method="post"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($columnName) ?>"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Drop this column and its data?">Drop</button></form></div>
+          <?php if($showStats) render_column_statistics($db,$table,$column,$expandDistinct); ?>
+        </div></div></div><?php
+      }
+    ?></div>
+    <div class="card mt-3"><div class="card-header">Add column</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_column"><?= csrf_field() ?><?php column_form_fields($db,['type'=>'VARCHAR','length'=>'255','nullable'=>true]); ?><div class="row mt-2"><div class="col-md-3"><select class="form-select" name="position"><option value="">At end</option><option value="FIRST">First</option><?php foreach($columns as $c){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col"><button class="btn btn-primary">Add column</button></div></div></form></div></div>
+  </div>
   <div class="tab-pane fade" id="indexes"><?php render_indexes($db,$table,$indexes,$columns); ?></div>
   <div class="tab-pane fade" id="foreign"><?php render_foreign_keys($db,$table,$foreign,$columns); ?></div>
   <div class="tab-pane fade" id="checks"><?php render_checks($db,$checks); ?></div>
   <div class="tab-pane fade" id="table-triggers"><?php render_table_triggers($triggers); ?></div>
   <div class="tab-pane fade" id="partitions"><?php render_partitions($db,$table); ?></div>
-  <div class="tab-pane fade" id="table-settings"><?php render_table_settings($db,$table,$status); ?></div></div><?php
+  <div class="tab-pane fade" id="table-settings"><?php render_table_settings($db,$table,$status); ?></div></div>
+  <script>
+  (()=>{
+    'use strict';
+    const list=document.querySelector('[data-ms-structure-columns]');
+    const form=document.getElementById('msColumnReorderForm');
+    if(!list||!form)return;
+    const columnInput=form.querySelector('input[name="column"]');
+    const afterInput=form.querySelector('input[name="after"]');
+    let dragged=null;
+    const clear=()=>list.querySelectorAll('.ms-structure-column').forEach(item=>item.classList.remove('ms-structure-drop-before','ms-structure-drop-after'));
+    list.querySelectorAll('[data-ms-structure-handle]').forEach(handle=>{
+      handle.addEventListener('dragstart',event=>{
+        dragged=handle.closest('.ms-structure-column');
+        if(!dragged)return;
+        dragged.classList.add('ms-structure-dragging');
+        event.dataTransfer.effectAllowed='move';
+        event.dataTransfer.setData('text/plain',dragged.dataset.msStructureColumn||'');
+      });
+      handle.addEventListener('dragend',()=>{
+        if(dragged)dragged.classList.remove('ms-structure-dragging');
+        clear();dragged=null;
+      });
+    });
+    list.querySelectorAll('.ms-structure-column').forEach(item=>{
+      const dropTarget=item.querySelector('.accordion-header');
+      if(!dropTarget)return;
+      dropTarget.addEventListener('dragover',event=>{
+        if(!dragged||dragged===item)return;
+        event.preventDefault();event.dataTransfer.dropEffect='move';clear();
+        const rect=dropTarget.getBoundingClientRect();
+        const before=event.clientY<rect.top+rect.height/2;
+        item.classList.add(before?'ms-structure-drop-before':'ms-structure-drop-after');
+      });
+      dropTarget.addEventListener('drop',event=>{
+        if(!dragged||dragged===item)return;
+        event.preventDefault();
+        const rect=dropTarget.getBoundingClientRect();
+        const before=event.clientY<rect.top+rect.height/2;
+        if(before)list.insertBefore(dragged,item);else list.insertBefore(dragged,item.nextSibling);
+        clear();
+        const previous=dragged.previousElementSibling;
+        columnInput.value=dragged.dataset.msStructureColumn||'';
+        afterInput.value=previous&&previous.classList.contains('ms-structure-column')?(previous.dataset.msStructureColumn||''):'';
+        if(typeof window.msShowPageLoader==='function')window.msShowPageLoader('Reordering column...');
+        form.submit();
+      });
+    });
+  })();
+  </script><?php
 }
 
 function render_table_triggers(array $triggers): void {
