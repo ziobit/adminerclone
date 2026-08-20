@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.2';
+const MS_VERSION = '1.11.3';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2787,7 +2787,6 @@ function page_foot(): void {
     document.getElementById('ms-menu-hide-all').addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>settingsForm.querySelector(`[name="menu[${key}]"]`).checked=false);settingsForm.dispatchEvent(new Event('change'));});
     document.getElementById('ms-settings-reset').addEventListener('click',()=>{settings=JSON.parse(JSON.stringify(window.msSettingsMeta.defaults));selectCurrent();window.msSaveSettings(settings);window.msApplySettings(settings);const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);});
   }
-  const arraysEqual=(left,right)=>Array.isArray(left)&&Array.isArray(right)&&left.length===right.length&&left.every((value,index)=>value===right[index]);
   document.querySelectorAll('[data-ms-table-layout]').forEach(table=>{
     let nativeColumns=[];
     try{nativeColumns=JSON.parse(table.dataset.msColumns||'[]');}catch(error){nativeColumns=[];}
@@ -2796,10 +2795,35 @@ function page_foot(): void {
     const context={server:table.dataset.msServer||'',database:table.dataset.msDatabase||'',table:table.dataset.msTable||''};
     if(!layoutKey||!context.server||!context.database||!context.table)return;
     if(!settings.tableLayouts||typeof settings.tableLayouts!=='object'||Array.isArray(settings.tableLayouts))settings.tableLayouts={};
-    let layout=settings.tableLayouts[layoutKey]||null;
-    const widthsAreValid=layout&&layout.widths&&typeof layout.widths==='object'&&!Array.isArray(layout.widths)&&Object.entries(layout.widths).every(([column,width])=>nativeColumns.includes(column)&&Number.isFinite(Number(width))&&Number(width)>=48&&Number(width)<=1200);
-    const layoutIsValid=layout&&layout.server===context.server&&layout.database===context.database&&layout.table===context.table&&arraysEqual(layout.columns,nativeColumns)&&Array.isArray(layout.order)&&layout.order.length===nativeColumns.length&&new Set(layout.order).size===nativeColumns.length&&layout.order.every(column=>nativeColumns.includes(column))&&widthsAreValid;
-    if(layout&&!layoutIsValid){delete settings.tableLayouts[layoutKey];window.msSaveSettings(settings);layout=null;}
+
+    const normalizeLayout=raw=>{
+      if(!raw||raw.server!==context.server||raw.database!==context.database||raw.table!==context.table)return null;
+      const order=[];
+      const seen=new Set();
+      if(Array.isArray(raw.order)){
+        raw.order.forEach(column=>{
+          if(typeof column==='string'&&nativeColumns.includes(column)&&!seen.has(column)){order.push(column);seen.add(column);}
+        });
+      }
+      nativeColumns.forEach(column=>{if(!seen.has(column)){order.push(column);seen.add(column);}});
+      const widths={};
+      if(raw.widths&&typeof raw.widths==='object'&&!Array.isArray(raw.widths)){
+        Object.entries(raw.widths).forEach(([column,width])=>{
+          const numeric=Number(width);
+          if(nativeColumns.includes(column)&&Number.isFinite(numeric)&&numeric>=48&&numeric<=1200)widths[column]=numeric;
+        });
+      }
+      return {server:context.server,database:context.database,table:context.table,columns:[...nativeColumns],order,widths};
+    };
+
+    let layout=normalizeLayout(settings.tableLayouts[layoutKey]||null);
+    if(layout){
+      const serializedBefore=JSON.stringify(settings.tableLayouts[layoutKey]||null);
+      const serializedAfter=JSON.stringify(layout);
+      settings.tableLayouts[layoutKey]=layout;
+      if(serializedBefore!==serializedAfter)window.msSaveSettings(settings);
+    }
+
     const cellsFor=column=>Array.from(table.querySelectorAll('[data-ms-column]')).filter(cell=>cell.dataset.msColumn===column);
     const setColumnWidth=(column,width)=>{
       const pixels=Math.max(48,Math.min(1200,Math.round(width)));
@@ -2812,12 +2836,28 @@ function page_foot(): void {
         order.forEach(column=>{const cell=cells.get(column);if(cell)row.appendChild(cell);});
       });
     };
-    if(layout){applyOrder(layout.order);Object.entries(layout.widths).forEach(([column,width])=>setColumnWidth(column,Number(width)));}
+    const currentFullOrder=()=>layout&&Array.isArray(layout.order)&&layout.order.length?[...layout.order]:[...nativeColumns];
+    const mergeVisibleOrder=visibleOrder=>{
+      const visibleSet=new Set(visibleOrder);
+      let visibleIndex=0;
+      return currentFullOrder().map(column=>visibleSet.has(column)?visibleOrder[visibleIndex++]:column);
+    };
+
+    if(layout){
+      applyOrder(layout.order);
+      Object.entries(layout.widths).forEach(([column,width])=>setColumnWidth(column,Number(width)));
+    }
+
     const saveLayout=()=>{
-      const order=Array.from(table.querySelectorAll('thead th[data-ms-column]')).map(th=>th.dataset.msColumn);
-      const widths={};
-      table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{const width=Number.parseInt(th.style.width,10);if(Number.isFinite(width))widths[th.dataset.msColumn]=width;});
-      settings.tableLayouts[layoutKey]={server:context.server,database:context.database,table:context.table,columns:[...nativeColumns],order,widths};
+      const visibleOrder=Array.from(table.querySelectorAll('thead th[data-ms-column]')).map(th=>th.dataset.msColumn);
+      const order=mergeVisibleOrder(visibleOrder);
+      const widths=layout&&layout.widths&&typeof layout.widths==='object'?{...layout.widths}:{};
+      table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{
+        const width=Number.parseInt(th.style.width,10);
+        if(Number.isFinite(width))widths[th.dataset.msColumn]=width;
+      });
+      layout={server:context.server,database:context.database,table:context.table,columns:[...nativeColumns],order,widths};
+      settings.tableLayouts[layoutKey]=layout;
       window.msSaveSettings(settings);
     };
     const clearDropMarkers=()=>table.querySelectorAll('.ms-column-drop-before,.ms-column-drop-after').forEach(th=>th.classList.remove('ms-column-drop-before','ms-column-drop-after'));
@@ -3388,7 +3428,7 @@ function page_select(mysqli $db): void {
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
-  $layoutColumns=$visibleColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
+  $layoutColumns=$allColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $actions='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
@@ -4094,7 +4134,7 @@ function render_column_display_settings(): void {
       foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
       foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
     }
-    ?><p class="text-body-secondary">These rules are stored server-side in <code><?= h(ms_column_config_file()) ?></code> for this connection/database. They affect table browsing only; they do not alter the database schema or exported data.</p>
+    ?><p class="text-body-secondary">These rules are stored server-side in <code><?= h(ms_column_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
     <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
