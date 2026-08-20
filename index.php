@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.10.0';
+const MS_VERSION = '1.10.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1151,6 +1151,33 @@ function execute_sql(mysqli $db, string $sql, bool $showAll = false, int $displa
   return [$results, microtime(true) - $started];
 }
 
+
+function sql_statement_explainable(string $statement): bool {
+  $clean = preg_replace('/\A(?:\s|--[^\r\n]*(?:\r\n|\r|\n|$)|\#[^\r\n]*(?:\r\n|\r|\n|$)|\/\*.*?\*\/)+/s', '', $statement);
+  if (!is_string($clean)) {
+    return false;
+  }
+  $clean = ltrim($clean);
+  return preg_match('/\A(?:SELECT|UPDATE|DELETE|INSERT|REPLACE|WITH)\b/i', $clean) === 1;
+}
+
+function explain_sql(mysqli $db, string $sql, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
+  $statements = split_sql_script($sql);
+  if (!$statements) {
+    throw new RuntimeException('No executable SQL statement found.');
+  }
+  $explainStatements = [];
+  foreach ($statements as $statement) {
+    if (!sql_statement_explainable($statement)) {
+      $preview = preg_replace('/\s+/', ' ', trim($statement));
+      $preview = is_string($preview) ? substr($preview, 0, 160) : '';
+      throw new RuntimeException('EXPLAIN supports SELECT, UPDATE, DELETE, INSERT, REPLACE and WITH statements. Unsupported statement: ' . $preview);
+    }
+    $explainStatements[] = 'EXPLAIN ' . $statement;
+  }
+  return execute_sql($db, implode(";\n", $explainStatements), true, $displayLimit);
+}
+
 function download_headers(string $filename, string $contentType = 'application/octet-stream'): void {
   header('Content-Type: ' . $contentType);
   header('Content-Disposition: attachment; filename="' . str_replace(['"', "\r", "\n"], '', $filename) . '"');
@@ -1560,7 +1587,13 @@ try {
           throw new RuntimeException('Enter SQL or choose a SQL file.');
         }
         $sqlDisplayLimit = max(1, min(100000, (int)p('row_limit', (string)browser_setting_int('mysqlStudioSqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000))));
-        [$sqlResults, $sqlTime] = execute_sql($db, $sql, p('show_all') === '1', $sqlDisplayLimit);
+        if (p('sql_submit') === 'explain') {
+          [$sqlResults, $sqlTime] = explain_sql($db, $sql, $sqlDisplayLimit);
+          $sqlExplainMode = true;
+        } else {
+          [$sqlResults, $sqlTime] = execute_sql($db, $sql, p('show_all') === '1', $sqlDisplayLimit);
+          $sqlExplainMode = false;
+        }
         $_SESSION['ms_last_sql'] = $sql;
       } elseif ($action === 'create_table') {
         $name = trim(p('name'));
@@ -2170,8 +2203,8 @@ function page_head(string $title, bool $authenticated): void {
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
     .ms-sql-editor-wrap{position:relative;border-radius:var(--bs-border-radius);background:var(--bs-body-bg)}.ms-sql-highlight{position:absolute;inset:0;z-index:1;margin:0;box-sizing:border-box;border-style:solid;border-color:transparent;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--bs-body-color);background:var(--bs-body-bg);border-radius:inherit}.ms-smart-sql-input{position:relative;z-index:2;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--bs-body-color);resize:vertical}.ms-smart-sql-input::selection{background:rgba(var(--ms-accent-rgb),.28)}.ms-sql-highlight .sql-k{color:#7c3aed;font-weight:700}.ms-sql-highlight .sql-t{color:#0f766e;font-weight:600}.ms-sql-highlight .sql-f{color:#2563eb}.ms-sql-highlight .sql-s{color:#b45309}.ms-sql-highlight .sql-i{color:#be185d}.ms-sql-highlight .sql-c{color:#6b7280;font-style:italic}.ms-sql-highlight .sql-n{color:#0891b2}.ms-sql-highlight .sql-v{color:#9333ea}.ms-sql-highlight .sql-o{color:#dc2626}.ms-sql-autocomplete{position:absolute;z-index:1200;min-width:280px;max-width:min(460px,calc(100% - 8px));max-height:280px;overflow:auto;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);box-shadow:0 .8rem 2.2rem rgba(0,0,0,.22);padding:.3rem}.ms-sql-autocomplete[hidden]{display:none!important}.ms-sql-suggestion{display:flex;align-items:center;gap:.6rem;width:100%;border:0;border-radius:.35rem;background:transparent;color:var(--bs-body-color);text-align:left;padding:.48rem .6rem}.ms-sql-suggestion:hover,.ms-sql-suggestion.active{background:rgba(var(--ms-accent-rgb),.12)}.ms-sql-suggestion-icon{width:1.35rem;text-align:center;color:var(--ms-accent)}.ms-sql-suggestion-main{min-width:0;flex:1}.ms-sql-suggestion-name{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-suggestion-meta{display:block;font-size:.75em;color:var(--bs-secondary-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-autocomplete-title{padding:.25rem .55rem .35rem;color:var(--bs-secondary-color);font-size:.75em;text-transform:uppercase;letter-spacing:.06em;font-weight:700}html[data-bs-theme="dark"] .ms-sql-highlight .sql-k{color:#c4b5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-t{color:#5eead4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-f{color:#93c5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-s{color:#fbbf24}html[data-bs-theme="dark"] .ms-sql-highlight .sql-i{color:#f9a8d4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-c{color:#94a3b8}html[data-bs-theme="dark"] .ms-sql-highlight .sql-n{color:#67e8f9}html[data-bs-theme="dark"] .ms-sql-highlight .sql-v{color:#d8b4fe}html[data-bs-theme="dark"] .ms-sql-highlight .sql-o{color:#fca5a5}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
-    html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
-    html[data-density="ultracompact"] .ms-db-tools{gap:.05rem!important}html[data-density="ultracompact"] .ms-db-tools .nav-link{padding:.10rem .24rem!important;line-height:1.05;font-size:.72rem}html[data-density="ultracompact"] .ms-db-tools .nav-link i{font-size:.84em;margin-right:.20rem!important}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools{gap:.10rem!important}html[data-density="compact"] .ms-db-tools .nav-link{padding:.22rem .38rem!important;line-height:1.15;font-size:.82rem}html[data-density="compact"] .ms-db-tools .nav-link i{font-size:.92em;margin-right:.30rem!important}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools{gap:.42rem!important}html[data-density="large"] .ms-db-tools .nav-link{padding:.78rem .9rem!important;line-height:1.35;font-size:1.05rem}html[data-density="large"] .ms-db-tools .nav-link i{font-size:1.08em;margin-right:.7rem!important}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
+    html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
+    html[data-density="ultracompact"] .ms-db-tools .nav-link{line-height:1.1}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools .nav-link{line-height:1.15}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools .nav-link{line-height:1.25}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
 </head>
@@ -2503,7 +2536,7 @@ function render_sidebar(): void {
       <div class="brand d-flex align-items-center gap-2"><a class="text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a><a class="badge text-bg-secondary fw-normal text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a></div>
     </div>
     <?php if ($dbName !== '') { ?><div class="small text-body-secondary mb-2 text-truncate" title="<?= h($dbName) ?>">Database: <strong><?= h($dbName) ?></strong></div><?php } ?>
-    <nav class="nav nav-pills flex-column gap-1 ms-db-tools">
+    <nav class="nav nav-pills flex-column ms-db-tools small">
       <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables'], true)) continue; ?>
         <a class="nav-link <?= $page === $key ? 'active' : 'text-body' ?>" data-ms-menu="<?= h($key) ?>" href="?page=<?= h($key) ?>"><i class="fa-solid <?= h($icon) ?> fa-fw me-2"></i><?= h($label) ?></a>
       <?php } ?>
@@ -2795,7 +2828,7 @@ function render_column_statistics(mysqli $db, string $table, array $column, bool
       <?php
       $showDistinct = $distinct < 10 || $expandDistinct;
       if (!$showDistinct) {
-        $expandUrl = '?' . http_build_query(['page'=>'structure','table'=>$table,'stats'=>$name,'distinct'=>'all']);
+        $expandUrl = '?' . http_build_query(['page'=>'structure','table'=>$table,'stats'=>$name,'distinct'=>'all']) . '#ms-column-' . substr(sha1($name), 0, 16);
         ?><div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2 mb-0"><span><i class="fa-solid fa-triangle-exclamation me-2"></i>This column has <?= h(number_format($distinct)) ?> distinct non-NULL values. Expanding all frequencies can take significant time and may generate a very large page.</span><a class="btn btn-warning btn-sm" href="<?= h($expandUrl) ?>" data-confirm="This will group and display every distinct value in this column. On a large table this can take a long time and produce a very large response. Continue?"><i class="fa-solid fa-list me-1"></i>Expand all distinct values</a></div><?php
       } else {
         [$displayExpression, $groupExpression] = column_distinct_select_parts($column);
@@ -2836,7 +2869,7 @@ function page_structure(mysqli $db): void {
   ?><style>
     .ms-structure-column-handle{cursor:grab;touch-action:none;min-width:2.5rem;border:0;border-right:1px solid var(--bs-border-color);background:transparent;color:var(--bs-secondary-color)}
     .ms-structure-column-handle:active{cursor:grabbing}.ms-structure-column.ms-structure-dragging{opacity:.45}.ms-structure-column.ms-structure-drop-before{box-shadow:inset 0 3px 0 var(--ms-accent)}.ms-structure-column.ms-structure-drop-after{box-shadow:inset 0 -3px 0 var(--ms-accent)}
-    .ms-structure-column .accordion-button{min-width:0}.ms-column-statistics .sticky-top{z-index:1}
+    .ms-structure-column{scroll-margin-top:.75rem}.ms-structure-column .accordion-button{min-width:0}.ms-column-statistics .sticky-top{z-index:1}
   </style>
   <ul class="nav nav-tabs mb-3"><li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#columns">Columns</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#indexes">Indexes</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#foreign">Foreign keys</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#checks">Checks</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-triggers">Triggers</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#partitions">Partitions</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-settings">Table</button></li></ul>
   <div class="tab-content"><div class="tab-pane fade show active" id="columns">
@@ -2847,9 +2880,10 @@ function page_structure(mysqli $db): void {
         $meta=parse_column_meta($column);
         $columnName=(string)$column['COLUMN_NAME'];
         $showStats=$statsColumn===$columnName;
-        ?><div class="accordion-item ms-structure-column" data-ms-structure-column="<?= h($columnName) ?>"><h2 class="accordion-header d-flex"><button type="button" class="ms-structure-column-handle" draggable="true" data-ms-structure-handle title="Drag to reorder column" aria-label="Drag <?= h($columnName) ?> to reorder"><i class="fa-solid fa-grip-vertical"></i></button><button class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#col<?= $i ?>"><span class="code text-truncate"><?= h($columnName.' '.$column['COLUMN_TYPE']) ?></span><?php if($column['COLUMN_KEY']){?><span class="badge text-bg-primary ms-2"><?= h($column['COLUMN_KEY']) ?></span><?php }?></button></h2><div id="col<?= $i ?>" class="accordion-collapse collapse<?= $showStats?' show':'' ?>" data-bs-parent="#columnAccordion"><div class="accordion-body">
+        $columnAnchor='ms-column-'.substr(sha1($columnName),0,16);
+        ?><div class="accordion-item ms-structure-column" id="<?= h($columnAnchor) ?>" data-ms-structure-column="<?= h($columnName) ?>"<?= $showStats?' data-ms-stats-active="1"':'' ?>><h2 class="accordion-header d-flex"><button type="button" class="ms-structure-column-handle" draggable="true" data-ms-structure-handle title="Drag to reorder column" aria-label="Drag <?= h($columnName) ?> to reorder"><i class="fa-solid fa-grip-vertical"></i></button><button class="accordion-button collapsed" data-bs-toggle="collapse" data-bs-target="#col<?= $i ?>"><span class="code text-truncate"><?= h($columnName.' '.$column['COLUMN_TYPE']) ?></span><?php if($column['COLUMN_KEY']){?><span class="badge text-bg-primary ms-2"><?= h($column['COLUMN_KEY']) ?></span><?php }?></button></h2><div id="col<?= $i ?>" class="accordion-collapse collapse<?= $showStats?' show':'' ?>" data-bs-parent="#columnAccordion"><div class="accordion-body">
           <form method="post"><input type="hidden" name="action" value="alter_column"><input type="hidden" name="old_name" value="<?= h($columnName) ?>"><?= csrf_field() ?><?php column_form_fields($db,$meta); ?><div class="row mt-2"><div class="col-md-3"><label class="form-label">Position</label><select class="form-select" name="position"><option value="">Keep</option><option value="FIRST">First</option><?php foreach($columns as $c){if($c['COLUMN_NAME']!==$columnName){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }}?></select></div><div class="col-md-9 d-flex align-items-end"><button class="btn btn-primary">Save column</button></div></div></form>
-          <div class="d-flex flex-wrap gap-2 mt-2"><a class="btn btn-info" href="?<?= h(http_build_query(['page'=>'structure','table'=>$table,'stats'=>$columnName])) ?>"><i class="fa-solid fa-chart-column me-1"></i>Statistics</a><form method="post"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($columnName) ?>"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Drop this column and its data?">Drop</button></form></div>
+          <div class="d-flex flex-wrap gap-2 mt-2"><a class="btn btn-info" href="?<?= h(http_build_query(['page'=>'structure','table'=>$table,'stats'=>$columnName])) ?>#<?= h($columnAnchor) ?>"><i class="fa-solid fa-chart-column me-1"></i>Statistics</a><form method="post"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($columnName) ?>"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Drop this column and its data?">Drop</button></form></div>
           <?php if($showStats) render_column_statistics($db,$table,$column,$expandDistinct); ?>
         </div></div></div><?php
       }
@@ -2868,6 +2902,10 @@ function page_structure(mysqli $db): void {
     const list=document.querySelector('[data-ms-structure-columns]');
     const form=document.getElementById('msColumnReorderForm');
     if(!list||!form)return;
+    const activeStats=list.querySelector('[data-ms-stats-active="1"]');
+    if(activeStats){
+      requestAnimationFrame(()=>requestAnimationFrame(()=>activeStats.scrollIntoView({block:'start',inline:'nearest'})));
+    }
     const columnInput=form.querySelector('input[name="column"]');
     const afterInput=form.querySelector('input[name="after"]');
     let dragged=null;
@@ -3522,7 +3560,7 @@ function page_sql(mysqli $db,?array $results,float $time): void {
   foreach($columnRows as $columnRow){$tableName=(string)$columnRow['TABLE_NAME'];if(!isset($sqlSchema['columns'][$tableName]))$sqlSchema['columns'][$tableName]=[];$sqlSchema['columns'][$tableName][]=['name'=>(string)$columnRow['COLUMN_NAME'],'type'=>(string)$columnRow['COLUMN_TYPE'],'key'=>(string)$columnRow['COLUMN_KEY']];}
   $sqlSchemaJson=json_encode($sqlSchema,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'{"tables":[],"columns":{}}';
   title_bar('SQL command',selected_db());
-  ?><div class="card mb-3"><div class="card-body"><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?><label class="form-label">SQL statements</label><textarea class="form-control sql-editor" name="sql" spellcheck="false" autocomplete="off" data-ms-sql-schema-id="ms-sql-schema"><?= h(p('sql',(string)($_SESSION['ms_last_sql']??''))) ?></textarea><script type="application/json" id="ms-sql-schema"><?= $sqlSchemaJson ?></script><div class="form-text mt-2"><i class="fa-solid fa-wand-magic-sparkles me-1"></i>Smart SQL: table suggestions after <code>SELECT</code>, <code>UPDATE</code>, <code>INSERT</code>, <code>FROM</code>, <code>JOIN</code> and related clauses; type <code>table.</code> for columns. Use ↑/↓ and Enter/Tab to accept, Esc to close, Ctrl+Space to reopen suggestions.</div><div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><button class="btn btn-primary"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></form></div></div><?php if($results!==null)render_sql_results($results,$time);
+  ?><div class="card mb-3"><div class="card-body"><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?><label class="form-label">SQL statements</label><textarea class="form-control sql-editor" name="sql" spellcheck="false" autocomplete="off" data-ms-sql-schema-id="ms-sql-schema"><?= h(p('sql',(string)($_SESSION['ms_last_sql']??''))) ?></textarea><script type="application/json" id="ms-sql-schema"><?= $sqlSchemaJson ?></script><div class="form-text mt-2"><i class="fa-solid fa-wand-magic-sparkles me-1"></i>Smart SQL: table suggestions after <code>SELECT</code>, <code>UPDATE</code>, <code>INSERT</code>, <code>FROM</code>, <code>JOIN</code> and related clauses; type <code>table.</code> for columns. Use ↑/↓ and Enter/Tab to accept, Esc to close, Ctrl+Space to reopen suggestions.</div><div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><div class="d-inline-flex flex-wrap justify-content-md-end gap-2"><button class="btn btn-outline-secondary" type="submit" name="sql_submit" value="explain" title="Show the optimizer execution plan without executing the statement"><i class="fa-solid fa-magnifying-glass-chart me-1"></i>Explain SQL</button><button class="btn btn-primary" type="submit" name="sql_submit" value="execute"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></div></form></div></div><?php if(!empty($sqlExplainMode)){?><div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>EXPLAIN shows the optimizer plan and does not execute the submitted DML statement.</div><?php } if($results!==null)render_sql_results($results,$time);
 }
 
 function page_export(mysqli $db): void {
