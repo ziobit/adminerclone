@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.10.1';
+const MS_VERSION = '1.11.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -33,7 +33,7 @@ session_start();
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
-header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob:");
+header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https: http:");
 
 if (empty($_SESSION['ms_csrf'])) {
   $_SESSION['ms_csrf'] = bin2hex(random_bytes(32));
@@ -140,6 +140,213 @@ function ms_update_cache_write(array $cache): void {
     return;
   }
   @file_put_contents(ms_update_runtime_file('update.json'), $json, LOCK_EX);
+}
+
+/**
+ * Server-side column display configuration.
+ *
+ * This is intentionally stored in the system temporary directory, beside the
+ * updater runtime files, so database/table display rules are not normally
+ * web-accessible. Rules are separated by connection, database and table.
+ */
+function ms_column_config_file(): string {
+  return ms_update_runtime_file('column-display.json');
+}
+
+function ms_column_config_lock_file(): string {
+  return ms_update_runtime_file('column-display.lock');
+}
+
+function ms_server_config_key(): string {
+  $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
+  return hash('sha256',
+    (string)($login['host'] ?? '') . "\0" .
+    (string)($login['port'] ?? '') . "\0" .
+    (string)($login['socket'] ?? '') . "\0" .
+    (string)($login['user'] ?? '')
+  );
+}
+
+function ms_column_config_read(): array {
+  $raw = @file_get_contents(ms_column_config_file());
+  if (!is_string($raw) || trim($raw) === '') {
+    return ['version' => 1, 'servers' => []];
+  }
+  $decoded = json_decode($raw, true);
+  if (!is_array($decoded)) {
+    return ['version' => 1, 'servers' => []];
+  }
+  if (!isset($decoded['servers']) || !is_array($decoded['servers'])) {
+    $decoded['servers'] = [];
+  }
+  $decoded['version'] = 1;
+  return $decoded;
+}
+
+function ms_column_config_mutate(callable $mutator): void {
+  $lock = @fopen(ms_column_config_lock_file(), 'c');
+  if ($lock === false) {
+    throw new RuntimeException('Unable to open the column-display configuration lock file.');
+  }
+  if (!@flock($lock, LOCK_EX)) {
+    fclose($lock);
+    throw new RuntimeException('Unable to lock the column-display configuration.');
+  }
+  try {
+    $config = ms_column_config_read();
+    $updated = $mutator($config);
+    if (!is_array($updated)) {
+      throw new RuntimeException('The column-display configuration update is invalid.');
+    }
+    $updated['version'] = 1;
+    if (!isset($updated['servers']) || !is_array($updated['servers'])) {
+      $updated['servers'] = [];
+    }
+    $json = json_encode($updated, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($json)) {
+      throw new RuntimeException('Unable to encode the column-display configuration.');
+    }
+    $path = ms_column_config_file();
+    $temporary = $path . '.tmp-' . bin2hex(random_bytes(5));
+    $written = @file_put_contents($temporary, $json . "\n", LOCK_EX);
+    if ($written === false) {
+      @unlink($temporary);
+      throw new RuntimeException('Unable to write the column-display configuration.');
+    }
+    if (!@rename($temporary, $path)) {
+      @unlink($temporary);
+      throw new RuntimeException('Unable to replace the column-display configuration.');
+    }
+  } finally {
+    @flock($lock, LOCK_UN);
+    fclose($lock);
+  }
+}
+
+function ms_column_view_table_config(string $database, string $table): array {
+  $config = ms_column_config_read();
+  $serverKey = ms_server_config_key();
+  $tableConfig = $config['servers'][$serverKey]['databases'][$database]['tables'][$table] ?? [];
+  if (!is_array($tableConfig)) {
+    return [];
+  }
+  foreach (['hidden', 'images', 'soft_fk'] as $key) {
+    if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) {
+      $tableConfig[$key] = [];
+    }
+  }
+  return $tableConfig;
+}
+
+function ms_column_view_database_config(string $database): array {
+  $config = ms_column_config_read();
+  $serverKey = ms_server_config_key();
+  $databaseConfig = $config['servers'][$serverKey]['databases'][$database] ?? [];
+  return is_array($databaseConfig) ? $databaseConfig : [];
+}
+
+function ms_column_view_update_table(string $database, string $table, callable $mutator): void {
+  ms_column_config_mutate(static function (array $config) use ($database, $table, $mutator): array {
+    $serverKey = ms_server_config_key();
+    if (!isset($config['servers'][$serverKey]) || !is_array($config['servers'][$serverKey])) {
+      $config['servers'][$serverKey] = ['databases' => []];
+    }
+    if (!isset($config['servers'][$serverKey]['databases']) || !is_array($config['servers'][$serverKey]['databases'])) {
+      $config['servers'][$serverKey]['databases'] = [];
+    }
+    if (!isset($config['servers'][$serverKey]['databases'][$database]) || !is_array($config['servers'][$serverKey]['databases'][$database])) {
+      $config['servers'][$serverKey]['databases'][$database] = ['tables' => []];
+    }
+    if (!isset($config['servers'][$serverKey]['databases'][$database]['tables']) || !is_array($config['servers'][$serverKey]['databases'][$database]['tables'])) {
+      $config['servers'][$serverKey]['databases'][$database]['tables'] = [];
+    }
+    $current = $config['servers'][$serverKey]['databases'][$database]['tables'][$table] ?? [];
+    if (!is_array($current)) {
+      $current = [];
+    }
+    foreach (['hidden', 'images', 'soft_fk'] as $key) {
+      if (!isset($current[$key]) || !is_array($current[$key])) {
+        $current[$key] = [];
+      }
+    }
+    $current = $mutator($current);
+    foreach (['hidden', 'images', 'soft_fk'] as $key) {
+      if (empty($current[$key])) {
+        unset($current[$key]);
+      }
+    }
+    if ($current) {
+      $config['servers'][$serverKey]['databases'][$database]['tables'][$table] = $current;
+    } else {
+      unset($config['servers'][$serverKey]['databases'][$database]['tables'][$table]);
+    }
+    return $config;
+  });
+}
+
+function ms_column_view_hide(string $database, string $table, string $column, bool $hidden): void {
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $hidden): array {
+    if ($hidden) {
+      $config['hidden'][$column] = true;
+    } else {
+      unset($config['hidden'][$column]);
+    }
+    return $config;
+  });
+}
+
+function ms_column_view_show_all(string $database): void {
+  ms_column_config_mutate(static function (array $config) use ($database): array {
+    $serverKey = ms_server_config_key();
+    $tables = $config['servers'][$serverKey]['databases'][$database]['tables'] ?? [];
+    if (!is_array($tables)) {
+      return $config;
+    }
+    foreach ($tables as $table => $tableConfig) {
+      if (!is_array($tableConfig)) {
+        continue;
+      }
+      unset($tableConfig['hidden']);
+      if ($tableConfig) {
+        $config['servers'][$serverKey]['databases'][$database]['tables'][$table] = $tableConfig;
+      } else {
+        unset($config['servers'][$serverKey]['databases'][$database]['tables'][$table]);
+      }
+    }
+    return $config;
+  });
+}
+
+function ms_column_view_set_image(string $database, string $table, string $column, ?array $rule): void {
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $rule): array {
+    if ($rule === null) {
+      unset($config['images'][$column]);
+    } else {
+      $config['images'][$column] = $rule;
+      // A column has one alternative display transformation at a time.
+      unset($config['soft_fk'][$column]);
+    }
+    return $config;
+  });
+}
+
+function ms_column_view_set_soft_fk(string $database, string $table, string $column, ?array $rule): void {
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $rule): array {
+    if ($rule === null) {
+      unset($config['soft_fk'][$column]);
+    } else {
+      $config['soft_fk'][$column] = $rule;
+      unset($config['images'][$column]);
+    }
+    return $config;
+  });
+}
+
+function ms_safe_image_base_url(string $url): bool {
+  if ($url === '' || preg_match('/[\x00-\x1F\x7F<>"\']/', $url) === 1) {
+    return false;
+  }
+  return preg_match('#\A(?:https?://|/|\./|\.\./)#i', $url) === 1;
 }
 
 function ms_update_set_notice(string $key, string $message, string $type = 'info'): void {
@@ -565,6 +772,66 @@ function table_exists(mysqli $db, string $table): bool {
 
 function table_columns(mysqli $db, string $table): array {
   return db_all($db, 'SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table) . ' ORDER BY ORDINAL_POSITION');
+}
+
+
+function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
+  $maps = [];
+  if (!$rows || !$rules) {
+    return $maps;
+  }
+  foreach ($rules as $sourceColumn => $rule) {
+    if (!is_array($rule)) {
+      continue;
+    }
+    $targetTable = (string)($rule['table'] ?? '');
+    $idColumn = (string)($rule['id_column'] ?? '');
+    $valueColumn = (string)($rule['value_column'] ?? '');
+    if ($targetTable === '' || $idColumn === '' || $valueColumn === '' || !table_exists($db, $targetTable)) {
+      continue;
+    }
+    $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
+    if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
+      continue;
+    }
+    $values = [];
+    foreach ($rows as $row) {
+      if (array_key_exists($sourceColumn, $row) && $row[$sourceColumn] !== null) {
+        $values[(string)$row[$sourceColumn]] = $row[$sourceColumn];
+      }
+    }
+    if (!$values) {
+      $maps[$sourceColumn] = [];
+      continue;
+    }
+    $quoted = [];
+    foreach ($values as $value) {
+      $quoted[] = qs($db, $value);
+    }
+    $lookup = db_all(
+      $db,
+      'SELECT ' . qi($idColumn) . ' AS __ms_id, ' . qi($valueColumn) . ' AS __ms_value FROM ' . qi($targetTable) .
+      ' WHERE ' . qi($idColumn) . ' IN (' . implode(', ', $quoted) . ')'
+    );
+    $map = [];
+    foreach ($lookup as $targetRow) {
+      $map[(string)($targetRow['__ms_id'] ?? '')] = $targetRow['__ms_value'] ?? null;
+    }
+    $maps[$sourceColumn] = $map;
+  }
+  return $maps;
+}
+
+function ms_render_image_value($value, array $rule): string {
+  if ($value === null) {
+    return render_value(null);
+  }
+  $baseUrl = (string)($rule['base_url'] ?? '');
+  $width = max(16, min(1024, (int)($rule['width'] ?? 96)));
+  $src = $baseUrl . (string)$value;
+  return '<a href="' . h($src) . '" target="_blank" rel="noopener" title="' . h((string)$value) . '">' .
+    '<img src="' . h($src) . '" alt="' . h((string)$value) . '" loading="lazy" decoding="async" width="' . $width . '" style="width:' . $width . 'px;max-width:' . $width . 'px;height:auto;max-height:' . $width . 'px;object-fit:contain">' .
+    '</a>';
 }
 
 function primary_columns(mysqli $db, string $table): array {
@@ -1476,6 +1743,25 @@ try {
   if (!empty($_SESSION['ms_login'])) {
     $db = connect_db(false);
 
+    if (g('ajax') === 'soft_fk_columns') {
+      header('Content-Type: application/json; charset=UTF-8');
+      try {
+        if (selected_db() === '' || !$db->select_db(selected_db())) {
+          throw new RuntimeException('Choose a database first.');
+        }
+        $targetTable = g('table');
+        if ($targetTable === '' || !table_exists($db, $targetTable)) {
+          throw new RuntimeException('Table or view not found.');
+        }
+        $columnNames = array_values(array_map('strval', array_column(table_columns($db, $targetTable), 'COLUMN_NAME')));
+        echo json_encode(['ok' => true, 'columns' => $columnNames], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      } catch (Throwable $ajaxError) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      exit;
+    }
+
     if (g('download') === 'blob') {
       $table = g('table');
       $column = g('column');
@@ -1569,6 +1855,67 @@ try {
 
       if (selected_db() !== '' && !$db->select_db(selected_db())) {
         throw new RuntimeException($db->error);
+      }
+
+      if (strpos($action, 'column_view_') === 0) {
+        $database = selected_db();
+        if ($database === '') {
+          throw new RuntimeException('Choose a database first.');
+        }
+        $configTable = p('config_table');
+        $configColumn = p('config_column');
+
+        if (in_array($action, ['column_view_hide', 'column_view_image_save', 'column_view_soft_fk_save'], true)) {
+          if ($configTable === '' || !table_exists($db, $configTable)) {
+            throw new RuntimeException('The source table no longer exists.');
+          }
+          $sourceColumns = array_column(table_columns($db, $configTable), 'COLUMN_NAME');
+          if ($configColumn === '' || !in_array($configColumn, $sourceColumns, true)) {
+            throw new RuntimeException('The source column no longer exists.');
+          }
+        }
+
+        if ($action === 'column_view_hide') {
+          ms_column_view_hide($database, $configTable, $configColumn, true);
+          go([], 'Column ' . $configColumn . ' is now hidden while browsing ' . $configTable . '.');
+        } elseif ($action === 'column_view_show') {
+          ms_column_view_hide($database, $configTable, $configColumn, false);
+          go([], 'Column ' . $configColumn . ' is visible again.');
+        } elseif ($action === 'column_view_show_all') {
+          ms_column_view_show_all($database);
+          go([], 'All hidden columns in ' . $database . ' are visible again.');
+        } elseif ($action === 'column_view_image_save') {
+          $baseUrl = trim(p('image_base_url'));
+          $width = max(16, min(1024, (int)p('image_width', '96')));
+          if (!ms_safe_image_base_url($baseUrl)) {
+            throw new RuntimeException('Enter an HTTP(S) URL or a relative URL beginning with /, ./ or ../.');
+          }
+          ms_column_view_set_image($database, $configTable, $configColumn, ['base_url' => $baseUrl, 'width' => $width]);
+          go([], $configTable . '.' . $configColumn . ' will now be displayed as a lazy-loaded image.');
+        } elseif ($action === 'column_view_image_remove') {
+          ms_column_view_set_image($database, $configTable, $configColumn, null);
+          go([], 'Image display removed from ' . $configTable . '.' . $configColumn . '.');
+        } elseif ($action === 'column_view_soft_fk_save') {
+          $targetTable = p('soft_fk_table');
+          $idColumn = p('soft_fk_id_column');
+          $valueColumn = p('soft_fk_value_column');
+          if ($targetTable === '' || !table_exists($db, $targetTable)) {
+            throw new RuntimeException('Choose a valid target table or view.');
+          }
+          $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
+          if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
+            throw new RuntimeException('Choose valid ID and display-value columns.');
+          }
+          ms_column_view_set_soft_fk($database, $configTable, $configColumn, [
+            'table' => $targetTable,
+            'id_column' => $idColumn,
+            'value_column' => $valueColumn
+          ]);
+          go([], 'Soft foreign key configured for ' . $configTable . '.' . $configColumn . '.');
+        } elseif ($action === 'column_view_soft_fk_remove') {
+          ms_column_view_set_soft_fk($database, $configTable, $configColumn, null);
+          go([], 'Soft foreign key removed from ' . $configTable . '.' . $configColumn . '.');
+        }
       }
 
       if ($action === 'run_sql') {
@@ -2205,7 +2552,7 @@ function page_head(string $title, bool $authenticated): void {
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
     html[data-density="ultracompact"] .ms-db-tools .nav-link{line-height:1.1}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools .nav-link{line-height:1.15}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools .nav-link{line-height:1.25}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
-    @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
+    @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}.ms-column-context-menu{position:fixed;z-index:1090;min-width:190px;padding:.35rem;background:var(--bs-body-bg);border:1px solid var(--bs-border-color);border-radius:var(--bs-border-radius)}.ms-column-context-menu .dropdown-item{border-radius:.25rem;padding:.45rem .65rem}.ms-column-context-menu .dropdown-item:hover{background:var(--bs-tertiary-bg)}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
 </head>
 <body>
@@ -3035,15 +3382,135 @@ function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));
-  $layoutColumns=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$headers=$rows?array_keys($rows[0]):$layoutColumns;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
+  $viewConfig=$aggregated?['hidden'=>[],'images'=>[],'soft_fk'=>[]]:ms_column_view_table_config(selected_db(),$table);
+  $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];
+  $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
+  $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
+  $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
+  $layoutColumns=$visibleColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
+  $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $actions='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   title_bar($table,number_format($total).' result(s)',$actions);
   ?><div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body"><form method="get"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
-  <form method="post"><input type="hidden" name="action" value="delete_rows"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-layout-key="<?= h($layoutKey) ?>" data-ms-server="<?= h($layoutServer) ?>" data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>"<?php } ?>><thead><tr><?php if($editable&&!$aggregated){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><th data-ms-static-column="actions">Actions</th><?php }foreach($headers as $header){?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h((string)$header) ?>" draggable="true"<?php } ?>><?= h($header) ?><?php if(!$aggregated){ ?><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } ?></th><?php }?></tr></thead><tbody><?php foreach($rows as $row){$identity=[];foreach(primary_columns($db,$table)?:array_column($columns,'COLUMN_NAME') as $key)$identity[$key]=$row[$key]??null;$encoded=encode_identity($identity);?><tr><?php if($editable&&!$aggregated){?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><td class="text-nowrap" data-ms-static-column="actions"><a class="btn btn-secondary btn-sm" href="?page=row&amp;mode=edit&amp;table=<?= urlencode($table) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-pen"></i></a></td><?php }foreach($row as $name=>$value){$colMeta=null;foreach($columns as $c)if($c['COLUMN_NAME']===$name){$colMeta=$c;break;}?><td<?php if(!$aggregated){ ?> data-ms-column="<?= h((string)$name) ?>"<?php } ?>><?php if($colMeta&&preg_match('/blob|binary/i',(string)$colMeta['DATA_TYPE'])&&$value!==null){?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode((string)$name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php }elseif(isset($relations[$name])&&$value!==null){$rel=$relations[$name];$relUrl='?'.http_build_query(['page'=>'select','table'=>$rel['REFERENCED_TABLE_NAME'],'filter_col'=>[$rel['REFERENCED_COLUMN_NAME']],'filter_op'=>['='],'filter_val'=>[(string)$value]]);?><a href="<?= h($relUrl) ?>" title="Open referenced row"><?= render_value($value) ?> <i class="fa-solid fa-arrow-up-right-from-square small"></i></a><?php }else{echo render_value($value);}?></td><?php }?></tr><?php }?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
+  <form method="post"><input type="hidden" name="action" value="delete_rows"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-layout-key="<?= h($layoutKey) ?>" data-ms-server="<?= h($layoutServer) ?>" data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>"<?php } ?>><thead><tr><?php
+    if($editable&&!$aggregated){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><th data-ms-static-column="actions">Actions</th><?php }
+    foreach($headers as $header){
+      $header=(string)$header;
+      $imageRule=is_array($imageColumns[$header]??null)?$imageColumns[$header]:[];
+      $softRule=is_array($softFkRules[$header]??null)?$softFkRules[$header]:[];
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" draggable="true" data-ms-column-context="1" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?= h($header) ?><?php if(!$aggregated){ ?><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } ?></th><?php
+    }
+  ?></tr></thead><tbody><?php
+  foreach($rows as $row){
+    $identity=[];foreach(primary_columns($db,$table)?:array_column($columns,'COLUMN_NAME') as $key)$identity[$key]=$row[$key]??null;$encoded=encode_identity($identity);
+    ?><tr><?php if($editable&&!$aggregated){?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><td class="text-nowrap" data-ms-static-column="actions"><a class="btn btn-secondary btn-sm" href="?page=row&amp;mode=edit&amp;table=<?= urlencode($table) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-pen"></i></a></td><?php }
+    foreach($row as $name=>$value){
+      $name=(string)$name;
+      if(!$aggregated&&!empty($hiddenColumns[$name]))continue;
+      $colMeta=null;foreach($columns as $c)if($c['COLUMN_NAME']===$name){$colMeta=$c;break;}
+      ?><td<?php if(!$aggregated){ ?> data-ms-column="<?= h($name) ?>"<?php } ?>><?php
+      if(!$aggregated&&isset($imageColumns[$name])&&is_array($imageColumns[$name])){
+        echo ms_render_image_value($value,$imageColumns[$name]);
+      }elseif(!$aggregated&&isset($softFkRules[$name])&&is_array($softFkRules[$name])&&$value!==null){
+        $soft=$softFkRules[$name];$map=$softFkMaps[$name]??[];$key=(string)$value;$found=array_key_exists($key,$map);$display=$found?$map[$key]:$value;
+        $relUrl='?'.http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
+      }elseif($colMeta&&preg_match('/blob|binary/i',(string)$colMeta['DATA_TYPE'])&&$value!==null){
+        ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
+      }elseif(isset($relations[$name])&&$value!==null){
+        $rel=$relations[$name];$relUrl='?'.http_build_query(['page'=>'select','table'=>$rel['REFERENCED_TABLE_NAME'],'filter_col'=>[$rel['REFERENCED_COLUMN_NAME']],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Open referenced row"><?= render_value($value) ?> <i class="fa-solid fa-arrow-up-right-from-square small"></i></a><?php
+      }else{echo render_value($value);}
+      ?></td><?php
+    }
+    ?></tr><?php
+  }
+  ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if(!$aggregated){ ?>
+  <form method="post" id="ms-column-hide-form" class="d-none"><input type="hidden" name="action" value="column_view_hide"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value=""><?= csrf_field() ?></form>
+  <div id="ms-column-context-menu" class="ms-column-context-menu shadow" hidden>
+    <button type="button" class="dropdown-item" data-ms-column-action="hide"><i class="fa-solid fa-eye-slash fa-fw me-2"></i>Hide</button>
+    <button type="button" class="dropdown-item" data-ms-column-action="image"><i class="fa-solid fa-image fa-fw me-2"></i>Show as image</button>
+    <button type="button" class="dropdown-item" data-ms-column-action="soft-fk"><i class="fa-solid fa-link fa-fw me-2"></i>Soft Foreign Key</button>
+  </div>
+
+  <div class="modal fade" id="ms-image-column-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog"><div class="modal-content"><form method="post" id="ms-image-column-form">
+      <input type="hidden" name="action" value="column_view_image_save"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value=""><?= csrf_field() ?>
+      <div class="modal-header"><h2 class="modal-title fs-5"><i class="fa-solid fa-image me-2"></i>Show column as image</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body"><div class="mb-3"><div class="small text-body-secondary">Column</div><div class="fw-semibold" data-ms-modal-column></div></div><label class="form-label" for="ms-image-base-url">URL prefix</label><input class="form-control code" id="ms-image-base-url" name="image_base_url" required placeholder="https://example.com/images/"><div class="form-text">The database value is appended exactly to this URL. Example: prefix <code>https://site/images/</code> + value <code>123.jpg</code>.</div><label class="form-label mt-3" for="ms-image-width">Image width</label><div class="input-group"><input class="form-control" type="number" id="ms-image-width" name="image_width" min="16" max="1024" value="96" required><span class="input-group-text">px</span></div><div class="form-text">Images are lazy-loaded. Default: 96 px.</div></div>
+      <div class="modal-footer"><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div>
+    </form></div></div>
+  </div>
+
+  <div class="modal fade" id="ms-soft-fk-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog"><div class="modal-content"><form method="post" id="ms-soft-fk-form">
+      <input type="hidden" name="action" value="column_view_soft_fk_save"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value=""><?= csrf_field() ?>
+      <div class="modal-header"><h2 class="modal-title fs-5"><i class="fa-solid fa-link me-2"></i>Soft Foreign Key</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body"><div class="mb-3"><div class="small text-body-secondary">Source column</div><div class="fw-semibold" data-ms-modal-column></div></div><p class="text-body-secondary small">This does not create a MySQL constraint. It only changes how values are displayed in MySQL Studio and links them to the chosen target row.</p>
+        <label class="form-label" for="ms-soft-fk-table">Target table / view</label><select class="form-select" id="ms-soft-fk-table" name="soft_fk_table" required><option value="">Choose…</option><?php foreach($softTargetTables as $targetTable){?><option value="<?= h($targetTable) ?>"><?= h($targetTable) ?></option><?php }?></select>
+        <div class="row g-3 mt-1"><div class="col-md-6"><label class="form-label" for="ms-soft-fk-id">ID column</label><select class="form-select" id="ms-soft-fk-id" name="soft_fk_id_column" required disabled><option value="">Choose table first…</option></select></div><div class="col-md-6"><label class="form-label" for="ms-soft-fk-value">Display-value column</label><select class="form-select" id="ms-soft-fk-value" name="soft_fk_value_column" required disabled><option value="">Choose table first…</option></select></div></div>
+        <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>The relationship is display-only. MySQL will not enforce referential integrity.</div>
+      </div>
+      <div class="modal-footer"><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div>
+    </form></div></div>
+  </div>
+  <script>
+  document.addEventListener('DOMContentLoaded',()=>{
+    'use strict';
+    const menu=document.getElementById('ms-column-context-menu');
+    const hideForm=document.getElementById('ms-column-hide-form');
+    const imageForm=document.getElementById('ms-image-column-form');
+    const imageModal=document.getElementById('ms-image-column-modal');
+    const imageBase=document.getElementById('ms-image-base-url');
+    const imageWidth=document.getElementById('ms-image-width');
+    const softForm=document.getElementById('ms-soft-fk-form');
+    const softModal=document.getElementById('ms-soft-fk-modal');
+    const softTable=document.getElementById('ms-soft-fk-table');
+    const softId=document.getElementById('ms-soft-fk-id');
+    const softValue=document.getElementById('ms-soft-fk-value');
+    let currentHeader=null;
+    const closeMenu=()=>{if(menu)menu.hidden=true;};
+    const setColumnLabels=(modal,column)=>modal.querySelectorAll('[data-ms-modal-column]').forEach(el=>el.textContent=column);
+    const fillColumnSelect=(select,columns,selected)=>{select.innerHTML='<option value="">Choose…</option>';columns.forEach(column=>{const option=document.createElement('option');option.value=column;option.textContent=column;if(column===selected)option.selected=true;select.appendChild(option);});select.disabled=false;};
+    const loadSoftColumns=async(table,idSelected='',valueSelected='')=>{
+      softId.disabled=true;softValue.disabled=true;softId.innerHTML='<option>Loading…</option>';softValue.innerHTML='<option>Loading…</option>';
+      if(!table){softId.innerHTML='<option value="">Choose table first…</option>';softValue.innerHTML='<option value="">Choose table first…</option>';return;}
+      try{
+        const response=await fetch(`?ajax=soft_fk_columns&table=${encodeURIComponent(table)}`,{credentials:'same-origin',headers:{'Accept':'application/json'}});
+        const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'Unable to load columns.');
+        fillColumnSelect(softId,data.columns||[],idSelected);fillColumnSelect(softValue,data.columns||[],valueSelected);
+      }catch(error){softId.innerHTML='<option value="">Unable to load</option>';softValue.innerHTML='<option value="">Unable to load</option>';softId.disabled=true;softValue.disabled=true;alert(error.message||'Unable to load target columns.');}
+    };
+    document.querySelectorAll('th[data-ms-column-context]').forEach(header=>header.addEventListener('contextmenu',event=>{
+      if(event.target instanceof Element&&event.target.closest('[data-ms-col-resizer]'))return;
+      event.preventDefault();currentHeader=header;menu.hidden=false;
+      const width=menu.offsetWidth||190,height=menu.offsetHeight||120;
+      menu.style.left=`${Math.max(4,Math.min(window.innerWidth-width-4,event.clientX))}px`;menu.style.top=`${Math.max(4,Math.min(window.innerHeight-height-4,event.clientY))}px`;
+    }));
+    document.addEventListener('click',event=>{if(!menu.contains(event.target))closeMenu();});
+    window.addEventListener('blur',closeMenu);window.addEventListener('resize',closeMenu);document.addEventListener('scroll',closeMenu,true);
+    menu.querySelectorAll('[data-ms-column-action]').forEach(button=>button.addEventListener('click',async()=>{
+      if(!currentHeader)return;const column=currentHeader.dataset.msColumn||'';const action=button.dataset.msColumnAction;closeMenu();
+      if(action==='hide'){
+        if(confirm(`Hide column “${column}” from this table view? You can restore it from Settings.`)){hideForm.elements.config_column.value=column;hideForm.submit();}
+        return;
+      }
+      if(action==='image'){
+        imageForm.elements.config_column.value=column;setColumnLabels(imageModal,column);imageBase.value=currentHeader.dataset.msImageBase||'';imageWidth.value=currentHeader.dataset.msImageWidth||'96';bootstrap.Modal.getOrCreateInstance(imageModal).show();setTimeout(()=>imageBase.focus(),150);return;
+      }
+      if(action==='soft-fk'){
+        softForm.elements.config_column.value=column;setColumnLabels(softModal,column);const target=currentHeader.dataset.msSoftTable||'';const id=currentHeader.dataset.msSoftId||'';const value=currentHeader.dataset.msSoftValue||'';softTable.value=target;bootstrap.Modal.getOrCreateInstance(softModal).show();await loadSoftColumns(target,id,value);return;
+      }
+    }));
+    softTable.addEventListener('change',()=>loadSoftColumns(softTable.value));
+  });
+  </script>
+  <?php } ?>
   <?php if($showAll){?><div class="alert alert-info mt-3 mb-0 no-print"><i class="fa-solid fa-list me-1"></i>All <?= h(number_format($total)) ?> result(s) are displayed. <a href="<?= h(url(['show_all'=>null,'p'=>null,'limit'=>null])) ?>">Return to paginated view</a>.</div><?php }else{render_select_pagination($page,$pages,'bottom');}?><div class="small text-body-secondary code mt-2">Query: <?= h($sql) ?></div><?php
 }
 
@@ -3611,6 +4078,29 @@ function page_users(mysqli $db): void {
   <div class="row g-3"><div class="col-lg-5"><div class="card mb-3"><div class="card-header">Create user</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="create_user"><?= csrf_field() ?><label class="form-label">Username</label><input class="form-control mb-2" name="new_user" required><label class="form-label">Host</label><input class="form-control mb-2" name="new_host" value="%" required><label class="form-label">Password</label><input class="form-control mb-2" type="password" name="new_password" required><button class="btn btn-primary">Create user</button></form></div></div><div class="card"><div class="card-header">Change password / account state</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="alter_user"><?= csrf_field() ?><label class="form-label">Username</label><input class="form-control mb-2" name="alter_user" required><label class="form-label">Host</label><input class="form-control mb-2" name="alter_host" value="%" required><label class="form-label">New password (optional)</label><input class="form-control mb-2" type="password" name="alter_password"><label class="form-label">Account state</label><select class="form-select mb-2" name="lock_mode"><option value="">No change</option><option value="lock">Lock</option><option value="unlock">Unlock</option></select><button class="btn btn-primary">Update user</button></form></div></div></div><div class="col-lg-7"><div class="card"><div class="card-header">Grant or revoke privileges</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="grant_privileges"><?= csrf_field() ?><div class="row g-2"><div class="col-md-4"><label class="form-label">Operation</label><select class="form-select" name="privilege_mode"><option value="grant">Grant</option><option value="revoke">Revoke</option></select></div><div class="col-md-4"><label class="form-label">User</label><input class="form-control" name="grant_user" required></div><div class="col-md-4"><label class="form-label">Host</label><input class="form-control" name="grant_host" value="%" required></div><div class="col-md-6"><label class="form-label">Scope</label><select class="form-select" name="scope"><option value="database">Database</option><option value="global">Global</option></select></div><div class="col-md-6"><label class="form-label">Database</label><input class="form-control" name="grant_database" value="<?= h(selected_db()) ?>"></div><div class="col-12"><label class="form-label">Privileges</label><div class="d-flex flex-wrap gap-3"><?php foreach(['ALL PRIVILEGES','SELECT','INSERT','UPDATE','DELETE','CREATE','DROP','ALTER','INDEX','REFERENCES','EXECUTE','CREATE VIEW','SHOW VIEW','TRIGGER','EVENT','CREATE ROUTINE','ALTER ROUTINE'] as $priv){?><label><input class="form-check-input" type="checkbox" name="privilege[]" value="<?= h($priv) ?>"> <?= h($priv) ?></label><?php }?></div></div><div class="col-12"><label><input class="form-check-input" type="checkbox" name="grant_option"> WITH GRANT OPTION</label></div><div class="col"><button class="btn btn-primary">Apply privileges</button></div></div></form></div></div></div></div><?php
 }
 
+function render_column_display_settings(): void {
+  $database = selected_db();
+  ?><section class="card mt-4 mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
+  if ($database === '') {
+    ?><div class="alert alert-info mb-0">Choose a database first to manage hidden columns, image displays and soft foreign keys.</div><?php
+  } else {
+    $databaseConfig = ms_column_view_database_config($database);
+    $tables = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
+    $hidden = []; $images = []; $softFks = [];
+    foreach ($tables as $table => $tableConfig) {
+      if (!is_array($tableConfig)) continue;
+      foreach ((array)($tableConfig['hidden'] ?? []) as $column => $enabled) if ($enabled) $hidden[] = [(string)$table, (string)$column];
+      foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
+      foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
+    }
+    ?><p class="text-body-secondary">These rules are stored server-side in <code><?= h(ms_column_config_file()) ?></code> for this connection/database. They affect table browsing only; they do not alter the database schema or exported data.</p>
+    <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
+  }
+  ?></div></section><?php
+}
+
 function page_settings(): void {
   $densities = [
     'ultracompact' => ['Ultracompact', 'Maximum information density for large tables.'],
@@ -3644,7 +4134,7 @@ function page_settings(): void {
     'users' => ['fa-users-gear', 'Users & rights'],
     'variables' => ['fa-sliders', 'Variables']
   ];
-  title_bar('Settings', 'Preferences are saved in this browser and remain active after logout.');
+  title_bar('Settings', 'Browser preferences plus server-side column display rules.');
   $updateCache = ms_update_cache_read();
   $updateCheckedAt = (int)($updateCache['checked_at'] ?? 0);
   $updateRemoteVersion = trim((string)($updateCache['remote_version'] ?? ''));
@@ -3697,6 +4187,7 @@ function page_settings(): void {
 
     <div class="d-flex flex-wrap gap-2"><button class="btn btn-primary" type="submit"><i class="fa-solid fa-floppy-disk me-1"></i>Save settings</button><button class="btn btn-secondary" type="button" id="ms-settings-reset"><i class="fa-solid fa-rotate-left me-1"></i>Restore defaults</button></div>
   </form><?php
+  render_column_display_settings();
 }
 
 if (empty($_SESSION['ms_login'])) {
