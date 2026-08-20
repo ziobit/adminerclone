@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.0';
+const MS_VERSION = '1.11.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2541,7 +2541,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-scheme="contrast"]{--ms-accent:#111827;--ms-accent-hover:#000;--ms-accent-rgb:17,24,39;--ms-accent-text:#fff;--ms-link:#111827}
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
-    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:grab;user-select:none;padding-right:1rem}.ms-layout-table th[data-ms-column]:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:420px;max-height:9rem;overflow:auto;white-space:pre-wrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;min-height:220px;tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
+    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:default;user-select:none;padding-right:1rem}.ms-col-drag-handle{display:inline-flex;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:420px;max-height:9rem;overflow:auto;white-space:pre-wrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;min-height:220px;tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:220px;font-size:12px}html[data-density="ultracompact"] .main{padding:.45rem}html[data-density="ultracompact"] .sidebar{padding:.45rem!important}html[data-density="ultracompact"] .table>:not(caption)>*>*{padding:.12rem .3rem}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:.75rem;padding:.16rem .38rem}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.4rem .55rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.2rem .35rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.65rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.45rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.5rem;--bs-gutter-y:.5rem}
@@ -2824,7 +2824,8 @@ function page_foot(): void {
     let draggedColumn='';
     table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{
       th.addEventListener('dragstart',event=>{
-        if(event.target instanceof Element&&event.target.closest('[data-ms-col-resizer]')){event.preventDefault();return;}
+        const target=event.target instanceof Element?event.target:null;
+        if(!target||!target.closest('[data-ms-column-drag-handle]')){event.preventDefault();return;}
         draggedColumn=th.dataset.msColumn;th.classList.add('ms-column-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',draggedColumn);
       });
       th.addEventListener('dragover',event=>{
@@ -2847,11 +2848,11 @@ function page_foot(): void {
       const handle=th.querySelector('[data-ms-col-resizer]');
       if(handle)handle.addEventListener('pointerdown',event=>{
         if(event.button!==0)return;
-        event.preventDefault();event.stopPropagation();th.draggable=false;document.body.classList.add('ms-column-resizing');
+        event.preventDefault();event.stopPropagation();document.body.classList.add('ms-column-resizing');
         const startX=event.clientX,startWidth=th.getBoundingClientRect().width,column=th.dataset.msColumn;
         let finished=false;
         const move=moveEvent=>setColumnWidth(column,startWidth+moveEvent.clientX-startX);
-        const finish=()=>{if(finished)return;finished=true;window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',finish);window.removeEventListener('pointercancel',finish);document.body.classList.remove('ms-column-resizing');th.draggable=true;saveLayout();};
+        const finish=()=>{if(finished)return;finished=true;window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',finish);window.removeEventListener('pointercancel',finish);document.body.classList.remove('ms-column-resizing');saveLayout();};
         window.addEventListener('pointermove',move);window.addEventListener('pointerup',finish);window.addEventListener('pointercancel',finish);
       });
     });
@@ -3401,7 +3402,7 @@ function page_select(mysqli $db): void {
       $header=(string)$header;
       $imageRule=is_array($imageColumns[$header]??null)?$imageColumns[$header]:[];
       $softRule=is_array($softFkRules[$header]??null)?$softFkRules[$header]:[];
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" draggable="true" data-ms-column-context="1" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?= h($header) ?><?php if(!$aggregated){ ?><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } ?></th><?php
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><?php } ?><?= h($header) ?><?php if(!$aggregated){ ?><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   foreach($rows as $row){
@@ -3488,10 +3489,10 @@ function page_select(mysqli $db): void {
     };
     document.querySelectorAll('th[data-ms-column-context]').forEach(header=>header.addEventListener('contextmenu',event=>{
       if(event.target instanceof Element&&event.target.closest('[data-ms-col-resizer]'))return;
-      event.preventDefault();currentHeader=header;menu.hidden=false;
+      event.preventDefault();event.stopPropagation();currentHeader=header;menu.hidden=false;
       const width=menu.offsetWidth||190,height=menu.offsetHeight||120;
       menu.style.left=`${Math.max(4,Math.min(window.innerWidth-width-4,event.clientX))}px`;menu.style.top=`${Math.max(4,Math.min(window.innerHeight-height-4,event.clientY))}px`;
-    }));
+    },true));
     document.addEventListener('click',event=>{if(!menu.contains(event.target))closeMenu();});
     window.addEventListener('blur',closeMenu);window.addEventListener('resize',closeMenu);document.addEventListener('scroll',closeMenu,true);
     menu.querySelectorAll('[data-ms-column-action]').forEach(button=>button.addEventListener('click',async()=>{
