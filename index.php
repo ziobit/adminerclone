@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.11';
+const MS_VERSION = '1.11.13';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -67,6 +67,10 @@ function browser_setting_int(string $cookie, int $default, int $minimum, int $ma
     return $default;
   }
   return max($minimum, min($maximum, (int)$_COOKIE[$cookie]));
+}
+
+function ms_raw_db_view(): bool {
+  return isset($_COOKIE['mysqlStudioRawDbView']) && !is_array($_COOKIE['mysqlStudioRawDbView']) && (string)$_COOKIE['mysqlStudioRawDbView'] === '1';
 }
 
 function csrf_field(): string {
@@ -968,8 +972,8 @@ function ms_render_formatted_value($value, array $rule): string {
   if ($kind === 'date' || $kind === 'datetime') {
     $format = (string)($rule['format'] ?? ($kind === 'date' ? 'd-m-Y' : 'd-m-Y H:i:s'));
     $allowed = $kind === 'date'
-      ? ['d-m-Y', 'd/m/Y', 'Y-m-d', 'M j, Y']
-      : ['d-m-Y H:i', 'd-m-Y H:i:s', 'd/m/Y H:i', 'd/m/Y H:i:s', 'Y-m-d H:i', 'Y-m-d H:i:s', 'M j, Y H:i'];
+      ? ['d-m-Y', 'd/m/Y', 'd.m.Y', 'j/n/Y', 'Y-m-d', 'Ymd', 'm/d/Y', 'm-d-Y', 'j M Y', 'j F Y', 'M j, Y', 'F j, Y', 'D, d M Y', 'l, j F Y']
+      : ['d-m-Y H:i', 'd-m-Y H:i:s', 'd/m/Y H:i', 'd/m/Y H:i:s', 'd.m.Y H:i', 'd.m.Y H:i:s', 'j/n/Y H:i', 'Y-m-d H:i', 'Y-m-d H:i:s', 'Y-m-d\TH:i', 'Y-m-d\TH:i:s', 'm/d/Y H:i', 'm/d/Y H:i:s', 'm/d/Y h:i A', 'm/d/Y h:i:s A', 'd/m/Y h:i A', 'd/m/Y h:i:s A', 'j M Y H:i', 'j F Y H:i', 'M j, Y H:i', 'M j, Y h:i A', 'F j, Y H:i', 'F j, Y h:i A', 'D, d M Y H:i', 'l, j F Y H:i'];
     if (!in_array($format, $allowed, true)) {
       return render_value($value);
     }
@@ -2114,7 +2118,7 @@ try {
             go([], $configTable . '.' . $configColumn . ' now uses the default display' . ($hideColumn ? ' and is hidden.' : '.'));
           } elseif ($style === 'date') {
             $format = p('date_format');
-            if (!in_array($format, ['d-m-Y', 'd/m/Y', 'Y-m-d', 'M j, Y'], true)) {
+            if (!in_array($format, ['d-m-Y', 'd/m/Y', 'd.m.Y', 'j/n/Y', 'Y-m-d', 'Ymd', 'm/d/Y', 'm-d-Y', 'j M Y', 'j F Y', 'M j, Y', 'F j, Y', 'D, d M Y', 'l, j F Y'], true)) {
               throw new RuntimeException('Choose a valid date format.');
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'date', 'format' => $format]);
@@ -2122,7 +2126,7 @@ try {
             go([], $configTable . '.' . $configColumn . ' date display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'datetime') {
             $format = p('datetime_format');
-            if (!in_array($format, ['d-m-Y H:i', 'd-m-Y H:i:s', 'd/m/Y H:i', 'd/m/Y H:i:s', 'Y-m-d H:i', 'Y-m-d H:i:s', 'M j, Y H:i'], true)) {
+            if (!in_array($format, ['d-m-Y H:i', 'd-m-Y H:i:s', 'd/m/Y H:i', 'd/m/Y H:i:s', 'd.m.Y H:i', 'd.m.Y H:i:s', 'j/n/Y H:i', 'Y-m-d H:i', 'Y-m-d H:i:s', 'Y-m-d\TH:i', 'Y-m-d\TH:i:s', 'm/d/Y H:i', 'm/d/Y H:i:s', 'm/d/Y h:i A', 'm/d/Y h:i:s A', 'd/m/Y h:i A', 'd/m/Y h:i:s A', 'j M Y H:i', 'j F Y H:i', 'M j, Y H:i', 'M j, Y h:i A', 'F j, Y H:i', 'F j, Y h:i A', 'D, d M Y H:i', 'l, j F Y H:i'], true)) {
               throw new RuntimeException('Choose a valid date/time format.');
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'datetime', 'format' => $format]);
@@ -2793,7 +2797,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-scheme="contrast"]{--ms-accent:#111827;--ms-accent-hover:#000;--ms-accent-rgb:17,24,39;--ms-accent-text:#fff;--ms-link:#111827}
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
-    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:context-menu;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
+    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;padding:.38rem .5rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg)}.ms-raw-db-switch .form-check{min-height:0}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.ms-raw-db-switch.is-active{border-color:var(--bs-warning);background:var(--bs-warning-bg-subtle)}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:context-menu;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -3172,9 +3176,17 @@ function render_sidebar(): void {
     ['users', 'fa-users-gear', 'Users & rights'],
     ['variables', 'fa-sliders', 'Variables']
   ];
+  $rawDbView = ms_raw_db_view();
   ?><aside class="sidebar p-3">
     <div class="mb-3">
       <div class="brand d-flex align-items-center gap-2"><a class="text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a><a class="badge text-bg-secondary fw-normal text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a></div>
+      <div class="ms-raw-db-switch<?= $rawDbView ? ' is-active' : '' ?>" id="ms-raw-db-switch-box" title="Show raw database fields and values, temporarily ignoring all saved custom column views">
+        <div class="form-check form-switch m-0 d-flex align-items-center gap-2">
+          <input class="form-check-input m-0" type="checkbox" role="switch" id="ms-raw-db-view"<?= $rawDbView ? ' checked' : '' ?>>
+          <label class="form-check-label small fw-semibold flex-grow-1" for="ms-raw-db-view"><i class="fa-solid fa-database me-1"></i>Raw DB view</label>
+        </div>
+        <div class="small text-body-secondary mt-1">Ignore custom column views</div>
+      </div>
     </div>
     <?php if ($dbName !== '') { ?><div class="small text-body-secondary mb-2 text-truncate" title="<?= h($dbName) ?>">Database: <strong><?= h($dbName) ?></strong></div><?php } ?>
     <nav class="nav nav-pills flex-column ms-db-tools small">
@@ -3194,7 +3206,22 @@ function render_sidebar(): void {
     <hr><a class="nav-link mb-2 <?= $page === 'settings' ? 'active' : 'text-body' ?>" href="?page=settings"><i class="fa-solid fa-gear fa-fw me-2"></i>Settings</a>
     <form method="post"><input type="hidden" name="action" value="logout"><?= csrf_field() ?><button class="btn btn-secondary btn-sm w-100"><i class="fa-solid fa-right-from-bracket me-1"></i>Log out</button></form>
     <div class="small text-body-secondary mt-3"><a class="text-body-secondary text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a> · PHP 7.4+</div>
-  </aside><?php
+  </aside>
+  <script>
+  (()=>{
+    'use strict';
+    const toggle=document.getElementById('ms-raw-db-view');
+    const box=document.getElementById('ms-raw-db-switch-box');
+    if(!toggle)return;
+    toggle.addEventListener('change',()=>{
+      const secure=location.protocol==='https:'?'; Secure':'';
+      document.cookie=`mysqlStudioRawDbView=${toggle.checked?'1':'0'}; Max-Age=31536000; Path=/; SameSite=Lax${secure}`;
+      if(box)box.classList.toggle('is-active',toggle.checked);
+      if(typeof window.msShowPageLoader==='function')window.msShowPageLoader(toggle.checked?'Opening raw DB view...':'Restoring custom views...');
+      location.reload();
+    });
+  })();
+  </script><?php
 }
 
 function title_bar(string $title, string $subtitle = '', string $actions = ''): void {
@@ -3681,8 +3708,11 @@ function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));
-  $viewConfig=$aggregated?['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]]:ms_column_view_table_config(selected_db(),$table);
+  $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
+  $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
+  $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
   $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];
+  $storedHiddenColumns=is_array($storedViewConfig['hidden']??null)?$storedViewConfig['hidden']:[];$storedImageColumns=is_array($storedViewConfig['images']??null)?$storedViewConfig['images']:[];$storedSoftFkRules=is_array($storedViewConfig['soft_fk']??null)?$storedViewConfig['soft_fk']:[];$storedFormatRules=is_array($storedViewConfig['formats']??null)?$storedViewConfig['formats']:[];$storedLabelRules=is_array($storedViewConfig['labels']??null)?$storedViewConfig['labels']:[];
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
@@ -3703,7 +3733,11 @@ function page_select(mysqli $db): void {
       $softRule=is_array($softFkRules[$header]??null)?$softFkRules[$header]:[];
       $formatRule=is_array($formatRules[$header]??null)?$formatRules[$header]:[];
       $displayLabel=trim((string)($labelRules[$header]??''));$visibleHeader=$displayLabel!==''?$displayLabel:$header;
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-hidden="<?= !empty($hiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($displayLabel) ?>" data-ms-display-kind="<?= h((string)($formatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($formatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($formatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($formatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><button type="button" class="ms-col-view-button" data-ms-column-view title="Display settings for <?= h($header) ?>" aria-label="Display settings for <?= h($header) ?>"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i></button><span class="ms-col-header-name" title="Database field: <?= h($header) ?> · Right-click for column settings"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      $storedImageRule=is_array($storedImageColumns[$header]??null)?$storedImageColumns[$header]:[];
+      $storedSoftRule=is_array($storedSoftFkRules[$header]??null)?$storedSoftFkRules[$header]:[];
+      $storedFormatRule=is_array($storedFormatRules[$header]??null)?$storedFormatRules[$header]:[];
+      $storedDisplayLabel=trim((string)($storedLabelRules[$header]??''));
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><button type="button" class="ms-col-view-button" data-ms-column-view title="Display settings for <?= h($header) ?>" aria-label="Display settings for <?= h($header) ?>"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i></button><span class="ms-col-header-name" title="Database field: <?= h($header) ?> · Right-click for column settings"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   foreach($rows as $row){
@@ -3759,23 +3793,69 @@ function page_select(mysqli $db): void {
         <div class="border rounded p-3 mt-3" data-ms-display-section="date" hidden>
           <label class="form-label" for="ms-date-format">Date format</label>
           <select class="form-select" id="ms-date-format" name="date_format">
-            <option value="d-m-Y">31-08-2026</option>
-            <option value="d/m/Y">31/08/2026</option>
-            <option value="Y-m-d">2026-08-31</option>
-            <option value="M j, Y">Aug 31, 2026</option>
+            <optgroup label="European / day first">
+              <option value="d-m-Y">31-08-2026</option>
+              <option value="d/m/Y">31/08/2026</option>
+              <option value="d.m.Y">31.08.2026</option>
+              <option value="j/n/Y">31/8/2026</option>
+            </optgroup>
+            <optgroup label="ISO / sortable">
+              <option value="Y-m-d">2026-08-31</option>
+              <option value="Ymd">20260831</option>
+            </optgroup>
+            <optgroup label="US / month first">
+              <option value="m/d/Y">08/31/2026</option>
+              <option value="m-d-Y">08-31-2026</option>
+            </optgroup>
+            <optgroup label="Textual">
+              <option value="j M Y">31 Aug 2026</option>
+              <option value="j F Y">31 August 2026</option>
+              <option value="M j, Y">Aug 31, 2026</option>
+              <option value="F j, Y">August 31, 2026</option>
+              <option value="D, d M Y">Mon, 31 Aug 2026</option>
+              <option value="l, j F Y">Monday, 31 August 2026</option>
+            </optgroup>
           </select>
         </div>
 
         <div class="border rounded p-3 mt-3" data-ms-display-section="datetime" hidden>
           <label class="form-label" for="ms-datetime-format">Date/time format</label>
           <select class="form-select" id="ms-datetime-format" name="datetime_format">
-            <option value="d-m-Y H:i">31-08-2026 14:35</option>
-            <option value="d-m-Y H:i:s">31-08-2026 14:35:52</option>
-            <option value="d/m/Y H:i">31/08/2026 14:35</option>
-            <option value="d/m/Y H:i:s">31/08/2026 14:35:52</option>
-            <option value="Y-m-d H:i">2026-08-31 14:35</option>
-            <option value="Y-m-d H:i:s">2026-08-31 14:35:52</option>
-            <option value="M j, Y H:i">Aug 31, 2026 14:35</option>
+            <optgroup label="European · 24-hour">
+              <option value="d-m-Y H:i">31-08-2026 14:35</option>
+              <option value="d-m-Y H:i:s">31-08-2026 14:35:52</option>
+              <option value="d/m/Y H:i">31/08/2026 14:35</option>
+              <option value="d/m/Y H:i:s">31/08/2026 14:35:52</option>
+              <option value="d.m.Y H:i">31.08.2026 14:35</option>
+              <option value="d.m.Y H:i:s">31.08.2026 14:35:52</option>
+              <option value="j/n/Y H:i">31/8/2026 14:35</option>
+            </optgroup>
+            <optgroup label="ISO / sortable">
+              <option value="Y-m-d H:i">2026-08-31 14:35</option>
+              <option value="Y-m-d H:i:s">2026-08-31 14:35:52</option>
+              <option value="Y-m-d\TH:i">2026-08-31T14:35</option>
+              <option value="Y-m-d\TH:i:s">2026-08-31T14:35:52</option>
+            </optgroup>
+            <optgroup label="US / month first">
+              <option value="m/d/Y H:i">08/31/2026 14:35</option>
+              <option value="m/d/Y H:i:s">08/31/2026 14:35:52</option>
+              <option value="m/d/Y h:i A">08/31/2026 02:35 PM</option>
+              <option value="m/d/Y h:i:s A">08/31/2026 02:35:52 PM</option>
+            </optgroup>
+            <optgroup label="Day first · 12-hour">
+              <option value="d/m/Y h:i A">31/08/2026 02:35 PM</option>
+              <option value="d/m/Y h:i:s A">31/08/2026 02:35:52 PM</option>
+            </optgroup>
+            <optgroup label="Textual">
+              <option value="j M Y H:i">31 Aug 2026 14:35</option>
+              <option value="j F Y H:i">31 August 2026 14:35</option>
+              <option value="M j, Y H:i">Aug 31, 2026 14:35</option>
+              <option value="M j, Y h:i A">Aug 31, 2026 02:35 PM</option>
+              <option value="F j, Y H:i">August 31, 2026 14:35</option>
+              <option value="F j, Y h:i A">August 31, 2026 02:35 PM</option>
+              <option value="D, d M Y H:i">Mon, 31 Aug 2026 14:35</option>
+              <option value="l, j F Y H:i">Monday, 31 August 2026 14:35</option>
+            </optgroup>
           </select>
         </div>
 
