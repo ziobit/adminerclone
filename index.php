@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.9';
+const MS_VERSION = '1.11.11';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -324,7 +324,7 @@ function ms_column_view_table_config(string $database, string $table): array {
   if (!is_array($tableConfig)) {
     return [];
   }
-  foreach (['hidden', 'images', 'soft_fk', 'formats'] as $key) {
+  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
     if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) {
       $tableConfig[$key] = [];
     }
@@ -358,13 +358,13 @@ function ms_column_view_update_table(string $database, string $table, callable $
     if (!is_array($current)) {
       $current = [];
     }
-    foreach (['hidden', 'images', 'soft_fk', 'formats'] as $key) {
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
       if (!isset($current[$key]) || !is_array($current[$key])) {
         $current[$key] = [];
       }
     }
     $current = $mutator($current);
-    foreach (['hidden', 'images', 'soft_fk', 'formats'] as $key) {
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
       if (empty($current[$key])) {
         unset($current[$key]);
       }
@@ -445,6 +445,17 @@ function ms_column_view_set_format(string $database, string $table, string $colu
     } else {
       $config['formats'][$column] = $rule;
       unset($config['images'][$column], $config['soft_fk'][$column]);
+    }
+    return $config;
+  });
+}
+
+function ms_column_view_set_label(string $database, string $table, string $column, ?string $label): void {
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $label): array {
+    if ($label === null || $label === '') {
+      unset($config['labels'][$column]);
+    } else {
+      $config['labels'][$column] = $label;
     }
     return $config;
   });
@@ -2085,26 +2096,38 @@ try {
           go([], 'Soft foreign key removed from ' . $configTable . '.' . $configColumn . '.');
         } elseif ($action === 'column_view_display_clear') {
           ms_column_view_clear_display($database, $configTable, $configColumn);
-          go([], 'Display customization removed from ' . $configTable . '.' . $configColumn . '.');
+          ms_column_view_set_label($database, $configTable, $configColumn, null);
+          ms_column_view_hide($database, $configTable, $configColumn, false);
+          go([], 'Display customization removed and ' . $configTable . '.' . $configColumn . ' is visible again.');
         } elseif ($action === 'column_view_display_save') {
+          $displayLabel = trim(p('display_label'));
+          $displayLabelLength = preg_match_all('/./us', $displayLabel, $displayLabelChars);
+          if ($displayLabelLength === false || $displayLabelLength > 200) {
+            throw new RuntimeException('The custom field name must be valid UTF-8 and 200 characters or fewer.');
+          }
+          ms_column_view_set_label($database, $configTable, $configColumn, $displayLabel !== '' ? $displayLabel : null);
+          $hideColumn = p('hide_column') === '1';
           $style = p('display_style');
           if ($style === '' || $style === 'default') {
             ms_column_view_clear_display($database, $configTable, $configColumn);
-            go([], $configTable . '.' . $configColumn . ' now uses the default display.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' now uses the default display' . ($hideColumn ? ' and is hidden.' : '.'));
           } elseif ($style === 'date') {
             $format = p('date_format');
             if (!in_array($format, ['d-m-Y', 'd/m/Y', 'Y-m-d', 'M j, Y'], true)) {
               throw new RuntimeException('Choose a valid date format.');
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'date', 'format' => $format]);
-            go([], $configTable . '.' . $configColumn . ' date display saved.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' date display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'datetime') {
             $format = p('datetime_format');
             if (!in_array($format, ['d-m-Y H:i', 'd-m-Y H:i:s', 'd/m/Y H:i', 'd/m/Y H:i:s', 'Y-m-d H:i', 'Y-m-d H:i:s', 'M j, Y H:i'], true)) {
               throw new RuntimeException('Choose a valid date/time format.');
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'datetime', 'format' => $format]);
-            go([], $configTable . '.' . $configColumn . ' date/time display saved.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' date/time display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'money') {
             $currency = p('money_currency');
             if (!in_array($currency, ['', 'EUR', 'USD', 'THB', 'GBP'], true)) {
@@ -2112,7 +2135,8 @@ try {
             }
             $decimals = max(0, min(4, (int)p('money_decimals', '2')));
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'money', 'currency' => $currency, 'decimals' => $decimals]);
-            go([], $configTable . '.' . $configColumn . ' money display saved.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' money display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'image') {
             $baseUrl = trim(p('image_base_url'));
             $width = max(16, min(1024, (int)p('image_width', '96')));
@@ -2120,7 +2144,8 @@ try {
               throw new RuntimeException('Enter an HTTP(S) URL or a relative URL beginning with /, ./ or ../.');
             }
             ms_column_view_set_image($database, $configTable, $configColumn, ['base_url' => $baseUrl, 'width' => $width]);
-            go([], $configTable . '.' . $configColumn . ' image display saved.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' image display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'soft_fk') {
             $targetTable = p('soft_fk_table');
             $idColumn = p('soft_fk_id_column');
@@ -2133,7 +2158,8 @@ try {
               throw new RuntimeException('Choose valid ID and display-value columns.');
             }
             ms_column_view_set_soft_fk($database, $configTable, $configColumn, ['table' => $targetTable, 'id_column' => $idColumn, 'value_column' => $valueColumn]);
-            go([], 'Virtual foreign key saved for ' . $configTable . '.' . $configColumn . '.');
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], 'Virtual foreign key saved for ' . $configTable . '.' . $configColumn . ($hideColumn ? ' and column hidden.' : '.'));
           } else {
             throw new RuntimeException('Choose a valid display style.');
           }
@@ -2767,7 +2793,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-scheme="contrast"]{--ms-accent:#111827;--ms-accent-hover:#000;--ms-accent-rgb:17,24,39;--ms-accent-text:#fff;--ms-link:#111827}
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
-    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:default;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
+    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:context-menu;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -2779,7 +2805,7 @@ function page_head(string $title, bool $authenticated): void {
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
     html[data-density="ultracompact"] .ms-db-tools .nav-link{line-height:1.1}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools .nav-link{line-height:1.15}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools .nav-link{line-height:1.25}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
-    @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}.ms-column-context-menu{position:fixed;z-index:1090;min-width:190px;padding:.35rem;background:var(--bs-body-bg);border:1px solid var(--bs-border-color);border-radius:var(--bs-border-radius)}.ms-column-context-menu .dropdown-item{border-radius:.25rem;padding:.45rem .65rem}.ms-column-context-menu .dropdown-item:hover{background:var(--bs-tertiary-bg)}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
+    @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}.ms-ios-switch{padding-left:3.4rem;min-height:1.75rem}.ms-ios-switch .form-check-input{width:2.9rem;height:1.65rem;margin-left:-3.4rem;margin-top:.05rem;border-radius:999px;cursor:pointer;box-shadow:none}.ms-ios-switch .form-check-input:focus{box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.18)}.ms-ios-switch .form-check-label{cursor:pointer;line-height:1.75rem}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
   </style>
 </head>
 <body>
@@ -3655,8 +3681,8 @@ function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));
-  $viewConfig=$aggregated?['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[]]:ms_column_view_table_config(selected_db(),$table);
-  $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];
+  $viewConfig=$aggregated?['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]]:ms_column_view_table_config(selected_db(),$table);
+  $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
@@ -3676,7 +3702,8 @@ function page_select(mysqli $db): void {
       $imageRule=is_array($imageColumns[$header]??null)?$imageColumns[$header]:[];
       $softRule=is_array($softFkRules[$header]??null)?$softFkRules[$header]:[];
       $formatRule=is_array($formatRules[$header]??null)?$formatRules[$header]:[];
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-display-kind="<?= h((string)($formatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($formatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($formatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($formatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><button type="button" class="ms-col-view-button" data-ms-column-view title="Display settings for <?= h($header) ?>" aria-label="Display settings for <?= h($header) ?>"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i></button><span class="ms-col-header-name" title="<?= h($header) ?>"><?= h($header) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      $displayLabel=trim((string)($labelRules[$header]??''));$visibleHeader=$displayLabel!==''?$displayLabel:$header;
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-hidden="<?= !empty($hiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($displayLabel) ?>" data-ms-display-kind="<?= h((string)($formatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($formatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($formatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($formatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($imageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($imageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($softRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($softRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($softRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><button type="button" class="ms-col-view-button" data-ms-column-view title="Display settings for <?= h($header) ?>" aria-label="Display settings for <?= h($header) ?>"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i></button><span class="ms-col-header-name" title="Database field: <?= h($header) ?> · Right-click for column settings"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   foreach($rows as $row){
@@ -3708,18 +3735,17 @@ function page_select(mysqli $db): void {
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
   <?php if(!$aggregated){ ?>
-  <form method="post" id="ms-column-hide-form" class="d-none"><input type="hidden" name="action" value="column_view_hide"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value=""><?= csrf_field() ?></form>
-  <div id="ms-column-context-menu" class="ms-column-context-menu shadow" hidden>
-    <button type="button" class="dropdown-item" data-ms-column-action="view"><i class="fa-solid fa-pen-to-square fa-fw me-2"></i>Display settings…</button>
-    <button type="button" class="dropdown-item" data-ms-column-action="hide"><i class="fa-solid fa-eye-slash fa-fw me-2"></i>Hide</button>
-  </div>
-
   <div class="modal fade" id="ms-column-view-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg"><div class="modal-content"><form method="post" id="ms-column-view-form">
       <input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value=""><?= csrf_field() ?>
       <div class="modal-header"><h2 class="modal-title fs-5"><i class="fa-solid fa-table-columns me-2"></i>Column display settings</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body">
-        <div class="mb-3"><div class="small text-body-secondary">Column</div><div class="fw-semibold code" data-ms-modal-column></div></div>
+        <div class="mb-3"><div class="small text-body-secondary">Database field</div><div class="fw-semibold code" data-ms-modal-column></div></div>
+        <div class="border rounded p-3 mb-3 d-flex flex-wrap justify-content-between align-items-center gap-3">
+          <div><div class="fw-semibold"><i class="fa-solid fa-eye-slash me-2"></i>Hide column</div><div class="small text-body-secondary">Hide this field only from the table browse view. The MySQL column is not changed.</div></div>
+          <div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-hide-column" name="hide_column" value="1"><label class="form-check-label" for="ms-hide-column"><span data-ms-hide-label>Visible</span></label></div>
+        </div>
+        <div class="mb-3"><label class="form-label" for="ms-display-label">Custom field name</label><input class="form-control" id="ms-display-label" name="display_label" maxlength="200" placeholder="Leave blank to use the database field name"><div class="form-text">Display-only alias. It does not rename the MySQL column.</div></div>
         <label class="form-label" for="ms-display-style">Viewing style</label>
         <select class="form-select" id="ms-display-style" name="display_style">
           <option value="default">Default / raw database value</option>
@@ -3774,17 +3800,18 @@ function page_select(mysqli $db): void {
           <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>This is display-only. MySQL referential integrity is not changed.</div>
         </div>
       </div>
-      <div class="modal-footer justify-content-between"><button class="btn btn-outline-danger" type="submit" name="action" value="column_view_display_clear" data-confirm="Remove the display customization for this column?"><i class="fa-solid fa-eraser me-1"></i>Reset to default</button><div><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-primary" type="submit" name="action" value="column_view_display_save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
+      <div class="modal-footer justify-content-between"><button class="btn btn-outline-danger" type="submit" name="action" value="column_view_display_clear" data-confirm="Reset this column to its default display name, raw value, and visible state?"><i class="fa-solid fa-eraser me-1"></i>Reset to default</button><div><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-primary" type="submit" name="action" value="column_view_display_save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
     </form></div></div>
   </div>
   <script>
   document.addEventListener('DOMContentLoaded',()=>{
     'use strict';
-    const menu=document.getElementById('ms-column-context-menu');
-    const hideForm=document.getElementById('ms-column-hide-form');
     const viewForm=document.getElementById('ms-column-view-form');
     const viewModal=document.getElementById('ms-column-view-modal');
     const displayStyle=document.getElementById('ms-display-style');
+    const displayLabel=document.getElementById('ms-display-label');
+    const hideColumn=document.getElementById('ms-hide-column');
+    const hideLabel=document.querySelector('[data-ms-hide-label]');
     const dateFormat=document.getElementById('ms-date-format');
     const datetimeFormat=document.getElementById('ms-datetime-format');
     const moneyCurrency=document.getElementById('ms-money-currency');
@@ -3796,7 +3823,6 @@ function page_select(mysqli $db): void {
     const softValue=document.getElementById('ms-soft-fk-value');
     const sections=Array.from(viewModal.querySelectorAll('[data-ms-display-section]'));
     let currentHeader=null;
-    const closeMenu=()=>{if(menu)menu.hidden=true;};
     const setColumnLabels=column=>viewModal.querySelectorAll('[data-ms-modal-column]').forEach(el=>el.textContent=column);
     const fillColumnSelect=(select,columns,selected)=>{select.innerHTML='<option value="">Choose…</option>';columns.forEach(column=>{const option=document.createElement('option');option.value=column;option.textContent=column;if(column===selected)option.selected=true;select.appendChild(option);});select.disabled=false;};
     const loadSoftColumns=async(table,idSelected='',valueSelected='')=>{
@@ -3813,11 +3839,14 @@ function page_select(mysqli $db): void {
       const style=displayStyle.value;
       sections.forEach(section=>section.hidden=section.dataset.msDisplaySection!==style);
     };
+    const updateHideLabel=()=>{if(hideLabel)hideLabel.textContent=hideColumn&&hideColumn.checked?'Hidden':'Visible';};
     const openViewSettings=async header=>{
       if(!header)return;
       currentHeader=header;
       const column=header.dataset.msColumn||'';
       viewForm.elements.config_column.value=column;setColumnLabels(column);
+      displayLabel.value=header.dataset.msDisplayLabel||'';
+      hideColumn.checked=header.dataset.msHidden==='1';updateHideLabel();
       let style=header.dataset.msDisplayKind||'';
       if(header.dataset.msImageBase)style='image';
       else if(header.dataset.msSoftTable)style='soft_fk';
@@ -3839,17 +3868,9 @@ function page_select(mysqli $db): void {
     document.querySelectorAll('[data-ms-column-view]').forEach(button=>button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();openViewSettings(button.closest('th[data-ms-column]'));}));
     document.querySelectorAll('th[data-ms-column-context]').forEach(header=>header.addEventListener('contextmenu',event=>{
       if(event.target instanceof Element&&event.target.closest('[data-ms-col-resizer]'))return;
-      event.preventDefault();event.stopPropagation();currentHeader=header;menu.hidden=false;
-      const width=menu.offsetWidth||190,height=menu.offsetHeight||90;
-      menu.style.left=`${Math.max(4,Math.min(window.innerWidth-width-4,event.clientX))}px`;menu.style.top=`${Math.max(4,Math.min(window.innerHeight-height-4,event.clientY))}px`;
+      event.preventDefault();event.stopPropagation();openViewSettings(header);
     },true));
-    document.addEventListener('click',event=>{if(menu&&!menu.contains(event.target))closeMenu();});
-    window.addEventListener('blur',closeMenu);window.addEventListener('resize',closeMenu);document.addEventListener('scroll',closeMenu,true);
-    menu.querySelectorAll('[data-ms-column-action]').forEach(button=>button.addEventListener('click',()=>{
-      if(!currentHeader)return;const column=currentHeader.dataset.msColumn||'';const action=button.dataset.msColumnAction;closeMenu();
-      if(action==='hide'){if(confirm(`Hide column “${column}” from this table view? You can restore it from Settings.`)){hideForm.elements.config_column.value=column;hideForm.submit();}return;}
-      if(action==='view')openViewSettings(currentHeader);
-    }));
+    hideColumn.addEventListener('change',updateHideLabel);
     displayStyle.addEventListener('change',()=>{updateSections();if(displayStyle.value==='soft_fk')loadSoftColumns(softTable.value,softId.dataset.selected||'',softValue.dataset.selected||'');});
     softTable.addEventListener('change',()=>{softId.dataset.selected='';softValue.dataset.selected='';loadSoftColumns(softTable.value);});
   });
@@ -4637,19 +4658,21 @@ function render_column_display_settings(): void {
   $database = selected_db();
   ?><section class="card mt-4 mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
   if ($database === '') {
-    ?><div class="alert alert-info mb-0">Choose a database first to manage hidden columns, image displays and soft foreign keys.</div><?php
+    ?><div class="alert alert-info mb-0">Choose a database first to manage hidden columns, custom field names, formatting, image displays and soft foreign keys.</div><?php
   } else {
     $databaseConfig = ms_column_view_database_config($database);
     $tables = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
-    $hidden = []; $images = []; $softFks = [];
+    $hidden = []; $labels = []; $images = []; $softFks = [];
     foreach ($tables as $table => $tableConfig) {
       if (!is_array($tableConfig)) continue;
       foreach ((array)($tableConfig['hidden'] ?? []) as $column => $enabled) if ($enabled) $hidden[] = [(string)$table, (string)$column];
+      foreach ((array)($tableConfig['labels'] ?? []) as $column => $label) if ((string)$label !== '') $labels[] = [(string)$table, (string)$column, (string)$label];
       foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
       foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
     }
     ?><p class="text-body-secondary">These rules are stored server-side in <code><?= h(ms_column_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
     <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
   }
