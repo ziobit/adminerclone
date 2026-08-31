@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.13';
+const MS_VERSION = '1.11.14';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1917,6 +1917,65 @@ try {
   if (!empty($_SESSION['ms_login'])) {
     $db = connect_db(false);
 
+    if (g('ajax') === 'select_more') {
+      header('Content-Type: application/json; charset=UTF-8');
+      try {
+        if (selected_db() === '' || !$db->select_db(selected_db())) {
+          throw new RuntimeException('Choose a database first.');
+        }
+        $table = g('table');
+        if ($table === '' || !table_exists($db, $table)) {
+          throw new RuntimeException('Table or view not found.');
+        }
+        $columns = table_columns($db, $table);
+        $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+        $editable = ($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE';
+        $offset = max(0, (int)g('offset', '0'));
+        $count = max(1, min(5000, (int)g('count', (string)browser_setting_int('mysqlStudioSelectRows', MS_ROWS_PER_PAGE, 1, 500))));
+        [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll] = build_select_query($db, $table, $columns, $offset, $count);
+        if ($showAll) {
+          throw new RuntimeException('Show more is not available while Show all rows is enabled.');
+        }
+        $rows = db_all($db, $sql);
+        $totalRow = db_one($db, $countSql);
+        $total = (int)($totalRow['n'] ?? 0);
+        $emptyViewConfig = ['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
+        $storedViewConfig = $aggregated ? $emptyViewConfig : ms_column_view_table_config(selected_db(), $table);
+        $viewConfig = (!$aggregated && ms_raw_db_view()) ? $emptyViewConfig : $storedViewConfig;
+        $hiddenColumns = is_array($viewConfig['hidden'] ?? null) ? $viewConfig['hidden'] : [];
+        $imageColumns = is_array($viewConfig['images'] ?? null) ? $viewConfig['images'] : [];
+        $softFkRules = is_array($viewConfig['soft_fk'] ?? null) ? $viewConfig['soft_fk'] : [];
+        $formatRules = is_array($viewConfig['formats'] ?? null) ? $viewConfig['formats'] : [];
+        $softFkMaps = $aggregated ? [] : ms_soft_fk_maps($db, $rows, $softFkRules);
+        $relations = [];
+        if (!$aggregated) {
+          foreach (db_all($db, "SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=" . qs($db,$table) . " AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation) {
+            $relations[$relation['COLUMN_NAME']] = $relation;
+          }
+        }
+        $returnQuery = ms_navigation_query($_GET);
+        unset($returnQuery['offset'], $returnQuery['count'], $returnQuery['single_id']);
+        if (!$returnQuery) {
+          $returnQuery = ['page'=>'select','table'=>$table];
+        }
+        $returnToken = ms_encode_navigation($returnQuery);
+        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$relations,$returnQuery,$returnToken);
+        $nextOffset = $offset + count($rows);
+        echo json_encode([
+          'ok' => true,
+          'html' => $html,
+          'returned' => count($rows),
+          'next_offset' => $nextOffset,
+          'has_more' => $nextOffset < $total,
+          'total' => $total
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      } catch (Throwable $ajaxError) {
+        http_response_code(400);
+        echo json_encode(['ok'=>false,'error'=>$ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      exit;
+    }
+
     if (g('ajax') === 'soft_fk_columns') {
       header('Content-Type: application/json; charset=UTF-8');
       try {
@@ -2319,6 +2378,11 @@ try {
         $expressions = isset($_POST['expression']) && is_array($_POST['expression']) ? $_POST['expression'] : [];
         $keepBlobs = isset($_POST['keep_blob']) && is_array($_POST['keep_blob']) ? $_POST['keep_blob'] : [];
         $identity = decode_identity(p('identity'));
+        $cloneSourceIdentity = decode_identity(p('clone_source'));
+        $cloneSourceRow = null;
+        if (!is_array($identity) && is_array($cloneSourceIdentity)) {
+          $cloneSourceRow = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . row_identity_where($db, $columns, $cloneSourceIdentity) . ' LIMIT 1');
+        }
         $returnQuery = ms_decode_navigation(p('return_to'));
         if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
           $returnQuery = ['page' => 'select', 'table' => $table];
@@ -2331,6 +2395,11 @@ try {
           }
           $hasUpload = isset($_FILES['upload']['tmp_name'][$name]) && (string)$_FILES['upload']['tmp_name'][$name] !== '';
           if (is_array($identity) && isset($keepBlobs[$name]) && !$hasUpload) {
+            continue;
+          }
+          if (!is_array($identity) && is_array($cloneSourceRow) && isset($keepBlobs[$name]) && !$hasUpload) {
+            $sourceValue = $cloneSourceRow[$name] ?? null;
+            $assignments[$name] = $sourceValue === null ? 'NULL' : qs($db, $sourceValue);
             continue;
           }
           if (!is_array($identity) && strpos((string)$column['EXTRA'], 'auto_increment') !== false && (string)($input[$name] ?? '') === '' && !isset($nulls[$name]) && empty($expressions[$name]) && !$hasUpload) {
@@ -2489,6 +2558,25 @@ try {
         }
         unset($_SESSION['ms_clone_rows']);
         go(['page' => 'select', 'table' => $table], $cloned . ' row(s) cloned.');
+      } elseif ($action === 'delete_row') {
+        $table = g('table');
+        if (!table_exists($db, $table)) {
+          throw new RuntimeException('Table not found.');
+        }
+        $columns = table_columns($db, $table);
+        $identity = decode_identity(g('single_id', p('single_id')));
+        if (!is_array($identity)) {
+          throw new RuntimeException('Invalid row identity.');
+        }
+        $returnQuery = ms_decode_navigation(p('return_to'));
+        if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
+          $returnQuery = ['page' => 'select', 'table' => $table];
+        }
+        $sql = 'DELETE FROM ' . qi($table) . ' WHERE ' . row_identity_where($db, $columns, $identity) . ' LIMIT 1';
+        if (!$db->query($sql)) {
+          throw new RuntimeException($db->error);
+        }
+        ms_go_to_query($returnQuery, $db->affected_rows === 1 ? 'Row deleted.' : 'The row was not found.', $db->affected_rows === 1 ? 'success' : 'warning');
       } elseif ($action === 'delete_rows') {
         $table = g('table');
         $columns = table_columns($db, $table);
@@ -2797,7 +2885,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-scheme="contrast"]{--ms-accent:#111827;--ms-accent-hover:#000;--ms-accent-rgb:17,24,39;--ms-accent-text:#fff;--ms-link:#111827}
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
-    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;padding:.38rem .5rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg)}.ms-raw-db-switch .form-check{min-height:0}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.ms-raw-db-switch.is-active{border-color:var(--bs-warning);background:var(--bs-warning-bg-subtle)}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:context-menu;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
+    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;padding:.38rem .5rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg)}.ms-raw-db-switch .form-check{min-height:0}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.ms-raw-db-switch.is-active{border-color:var(--bs-warning);background:var(--bs-warning-bg-subtle)}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{cursor:context-menu;user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-col-view-button{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:0 .12rem;margin-right:.25rem;opacity:.52;line-height:1;cursor:pointer}.ms-layout-table th[data-ms-column]:hover .ms-col-view-button,.ms-col-view-button:focus{opacity:1;color:var(--ms-accent)}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -2844,6 +2932,7 @@ function page_head(string $title, bool $authenticated): void {
 
 function page_foot(): void {
   ?></main>
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 (() => {
@@ -2851,6 +2940,28 @@ function page_foot(): void {
   document.querySelectorAll('[data-confirm]').forEach(el => el.addEventListener('click', e => {
     if (!confirm(el.dataset.confirm || 'Are you sure?')) e.preventDefault();
   }));
+  document.addEventListener('click', async event => {
+    const target = event.target instanceof Element ? event.target.closest('[data-ms-delete-single]') : null;
+    if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!window.Swal || typeof window.Swal.fire !== 'function') return;
+    const result = await window.Swal.fire({
+      title: 'Delete this row?',
+      text: 'This operation cannot be undone.',
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: 'Delete',
+      cancelButtonText: 'Cancel',
+      confirmButtonColor: '#dc3545',
+      focusCancel: true,
+      reverseButtons: true
+    });
+    if (result.isConfirmed && target.form) {
+      if (typeof window.msShowPageLoader === 'function') window.msShowPageLoader('Deleting row...');
+      target.form.requestSubmit(target);
+    }
+  });
   document.addEventListener('click', event => {
     if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     const target = event.target instanceof Element ? event.target : null;
@@ -3659,7 +3770,7 @@ function render_table_settings(mysqli $db,string $table,?array $status): void {
   <div class="card danger-zone"><div class="card-body"><h3 class="h5 text-danger">Danger zone</h3><div class="d-flex flex-wrap gap-2"><form method="post"><input type="hidden" name="action" value="truncate_table"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete every row but keep the table?">Empty table</button></form><form method="post" class="d-flex gap-2"><input type="hidden" name="action" value="drop_table"><?= csrf_field() ?><input class="form-control" name="confirm_name" placeholder="Type <?= h($table) ?>" required><button class="btn btn-danger text-nowrap" data-confirm="Permanently drop this table?">Drop table</button></form></div></div></div><?php
 }
 
-function build_select_query(mysqli $db,string $table,array $columns): array {
+function build_select_query(mysqli $db,string $table,array $columns,?int $overrideOffset=null,?int $overrideLimit=null): array {
   $allowed=array_column($columns,'COLUMN_NAME');
   $where=[]; $filterCols=$_GET['filter_col']??[]; $filterOps=$_GET['filter_op']??[]; $filterValues=$_GET['filter_val']??[];
   if(!is_array($filterCols))$filterCols=[]; if(!is_array($filterOps))$filterOps=[]; if(!is_array($filterValues))$filterValues=[];
@@ -3669,9 +3780,9 @@ function build_select_query(mysqli $db,string $table,array $columns): array {
   $select='*';$group='';
   if(in_array($aggregate,$validAgg,true)&&in_array($aggregateColumn,$allowed,true)){$select=($groupColumn!==''&&in_array($groupColumn,$allowed,true)?qi($groupColumn).', ':'').$aggregate.'('.qi($aggregateColumn).') AS '.qi(strtolower($aggregate).'_'.$aggregateColumn);if($groupColumn!==''&&in_array($groupColumn,$allowed,true))$group=' GROUP BY '.qi($groupColumn);}
   $orderParts=[];$orderCols=$_GET['order_col']??[];$orderDirs=$_GET['order_dir']??[];if(!is_array($orderCols))$orderCols=[];if(!is_array($orderDirs))$orderDirs=[];foreach($orderCols as $i=>$column){if(in_array($column,$allowed,true))$orderParts[]=qi((string)$column).' '.(strtoupper((string)($orderDirs[$i]??'ASC'))==='DESC'?'DESC':'ASC');}
-  $defaultLimit=browser_setting_int('mysqlStudioSelectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=($page-1)*$limit;
+  $defaultLimit=browser_setting_int('mysqlStudioSelectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
   $from=' FROM '.qi($table).($where?' WHERE '.implode(' AND ',$where):'');
-  $sql='SELECT '.$select.$from.$group.($orderParts?' ORDER BY '.implode(', ',$orderParts):'').($showAll?'':' LIMIT '.$offset.','.$limit);
+  $sql='SELECT '.$select.$from.$group.($orderParts?' ORDER BY '.implode(', ',$orderParts):'').($showAll?'':' LIMIT '.$offset.','.$queryLimit);
   $countSql=$group!==''?'SELECT COUNT(*) AS n FROM (SELECT 1'.$from.$group.') ms_groups':'SELECT COUNT(*) AS n'.$from;
   return [$sql,$countSql,$limit,$page,$where,$aggregate!==''&&in_array($aggregate,$validAgg,true),$showAll];
 }
@@ -3704,10 +3815,73 @@ function render_select_pagination(int $page, int $pages, string $position): void
   ?></ul></nav><?php
 }
 
+function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $relations,array $returnQuery,string $returnToken): string {
+  $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
+  $columnMap = [];
+  foreach ($columns as $column) {
+    $columnMap[(string)$column['COLUMN_NAME']] = $column;
+  }
+  ob_start();
+  foreach ($rows as $row) {
+    $identity = [];
+    foreach ($primary as $key) {
+      $identity[(string)$key] = $row[$key] ?? null;
+    }
+    $encoded = encode_identity($identity);
+    $viewUrl = '?' . http_build_query(['page'=>'row','mode'=>'view','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
+    $editUrl = '?' . http_build_query(['page'=>'row','mode'=>'edit','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
+    $cloneUrl = '?' . http_build_query(['page'=>'row','mode'=>'clone','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
+    $deleteQuery = $returnQuery;
+    $deleteQuery['single_id'] = $encoded;
+    $deleteUrl = '?' . http_build_query($deleteQuery);
+    ?><tr><?php if (!$aggregated) { ?>
+      <?php if ($editable) { ?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><?php } ?>
+      <td class="ms-row-actions-cell" data-ms-static-column="actions"><span class="ms-row-actions">
+        <a class="ms-row-action" href="<?= h($viewUrl) ?>" title="View row" aria-label="View row"><i class="fa-solid fa-eye"></i></a>
+        <?php if ($editable) { ?>
+          <a class="ms-row-action" href="<?= h($editUrl) ?>" title="Edit row" aria-label="Edit row"><i class="fa-solid fa-pen"></i></a>
+          <a class="ms-row-action" href="<?= h($cloneUrl) ?>" title="Clone row" aria-label="Clone row"><i class="fa-solid fa-clone"></i></a>
+          <button class="ms-row-action ms-row-delete" type="submit" name="action" value="delete_row" formaction="<?= h($deleteUrl) ?>" data-ms-delete-single title="Delete row" aria-label="Delete row"><i class="fa-solid fa-trash"></i></button>
+        <?php } ?>
+      </span></td>
+    <?php }
+    foreach ($row as $name => $value) {
+      $name = (string)$name;
+      if (!$aggregated && !empty($hiddenColumns[$name])) continue;
+      $colMeta = $columnMap[$name] ?? null;
+      ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>"<?php } ?>><?php
+      if (!$aggregated && isset($formatRules[$name]) && is_array($formatRules[$name])) {
+        echo ms_render_formatted_value($value, $formatRules[$name]);
+      } elseif (!$aggregated && isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
+        echo ms_render_image_value($value, $imageColumns[$name]);
+      } elseif (!$aggregated && isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
+        $soft = $softFkRules[$name];
+        $map = $softFkMaps[$name] ?? [];
+        $key = (string)$value;
+        $found = array_key_exists($key, $map);
+        $display = $found ? $map[$key] : $value;
+        $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
+      } elseif ($colMeta && preg_match('/blob|binary/i', (string)$colMeta['DATA_TYPE']) && $value !== null) {
+        ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
+      } elseif (isset($relations[$name]) && $value !== null) {
+        $rel = $relations[$name];
+        $relUrl = '?' . http_build_query(['page'=>'select','table'=>$rel['REFERENCED_TABLE_NAME'],'filter_col'=>[$rel['REFERENCED_COLUMN_NAME']],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Open referenced row"><?= render_value($value) ?> <i class="fa-solid fa-arrow-up-right-from-square small"></i></a><?php
+      } else {
+        echo render_value($value);
+      }
+      ?></td><?php
+    }
+    ?></tr><?php
+  }
+  return (string)ob_get_clean();
+}
+
 function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
-  [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));
+  [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=browser_setting_int('mysqlStudioSelectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
@@ -3725,8 +3899,8 @@ function page_select(mysqli $db): void {
   title_bar($table,number_format($total).' result(s)',$actions);
   ?><div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body"><form method="get"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
-  <form method="post"><input type="hidden" name="action" value="delete_rows"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-layout-key="<?= h($layoutKey) ?>" data-ms-server="<?= h($layoutServer) ?>" data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>"<?php } ?>><thead><tr><?php
-    if($editable&&!$aggregated){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><th data-ms-static-column="actions">Actions</th><?php }
+  <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-layout-key="<?= h($layoutKey) ?>" data-ms-server="<?= h($layoutServer) ?>" data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>"<?php } ?>><thead><tr><?php
+    if(!$aggregated){if($editable){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><?php }?><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php }
     foreach($headers as $header){
       $header=(string)$header;
       $imageRule=is_array($imageColumns[$header]??null)?$imageColumns[$header]:[];
@@ -3740,34 +3914,16 @@ function page_select(mysqli $db): void {
       ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-column-context="1" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><button type="button" class="ms-col-view-button" data-ms-column-view title="Display settings for <?= h($header) ?>" aria-label="Display settings for <?= h($header) ?>"><i class="fa-solid fa-pen-to-square" aria-hidden="true"></i></button><span class="ms-col-header-name" title="Database field: <?= h($header) ?> · Right-click for column settings"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
-  foreach($rows as $row){
-    $identity=[];foreach(primary_columns($db,$table)?:array_column($columns,'COLUMN_NAME') as $key)$identity[$key]=$row[$key]??null;$encoded=encode_identity($identity);
-    ?><tr><?php if($editable&&!$aggregated){?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><td class="text-nowrap" data-ms-static-column="actions"><a class="btn btn-secondary btn-sm" href="?page=row&amp;mode=edit&amp;table=<?= urlencode($table) ?>&amp;id=<?= urlencode($encoded) ?>&amp;return_to=<?= urlencode($returnToken) ?>"><i class="fa-solid fa-pen"></i></a></td><?php }
-    foreach($row as $name=>$value){
-      $name=(string)$name;
-      if(!$aggregated&&!empty($hiddenColumns[$name]))continue;
-      $colMeta=null;foreach($columns as $c)if($c['COLUMN_NAME']===$name){$colMeta=$c;break;}
-      ?><td<?php if(!$aggregated){ ?> data-ms-column="<?= h($name) ?>"<?php } ?>><?php
-      if(!$aggregated&&isset($formatRules[$name])&&is_array($formatRules[$name])){
-        echo ms_render_formatted_value($value,$formatRules[$name]);
-      }elseif(!$aggregated&&isset($imageColumns[$name])&&is_array($imageColumns[$name])){
-        echo ms_render_image_value($value,$imageColumns[$name]);
-      }elseif(!$aggregated&&isset($softFkRules[$name])&&is_array($softFkRules[$name])&&$value!==null){
-        $soft=$softFkRules[$name];$map=$softFkMaps[$name]??[];$key=(string)$value;$found=array_key_exists($key,$map);$display=$found?$map[$key]:$value;
-        $relUrl='?'.http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
-      }elseif($colMeta&&preg_match('/blob|binary/i',(string)$colMeta['DATA_TYPE'])&&$value!==null){
-        ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
-      }elseif(isset($relations[$name])&&$value!==null){
-        $rel=$relations[$name];$relUrl='?'.http_build_query(['page'=>'select','table'=>$rel['REFERENCED_TABLE_NAME'],'filter_col'=>[$rel['REFERENCED_COLUMN_NAME']],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a href="<?= h($relUrl) ?>" title="Open referenced row"><?= render_value($value) ?> <i class="fa-solid fa-arrow-up-right-from-square small"></i></a><?php
-      }else{echo render_value($value);}
-      ?></td><?php
-    }
-    ?></tr><?php
-  }
+  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$relations,$returnQuery,$returnToken);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
-  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if($hasMoreRows){ ?><div class="d-flex justify-content-center mt-2 no-print" data-ms-show-more data-next-offset="<?= h((string)$nextOffset) ?>" data-total="<?= h((string)$total) ?>">
+    <div class="input-group input-group-sm" style="max-width:22rem">
+      <button class="btn btn-outline-primary" type="button" data-ms-show-more-button><i class="fa-solid fa-angles-down me-1"></i>Show</button>
+      <input class="form-control text-center" type="number" min="1" max="5000" step="1" value="<?= h((string)$moreRowsDefault) ?>" data-ms-show-more-count aria-label="Rows to show">
+      <span class="input-group-text">more rows</span>
+    </div>
+  </div><?php } ?>
   <?php if(!$aggregated){ ?>
   <div class="modal fade" id="ms-column-view-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg"><div class="modal-content"><form method="post" id="ms-column-view-form">
@@ -3956,6 +4112,68 @@ function page_select(mysqli $db): void {
   });
   </script>
   <?php } ?>
+  <script>
+  (()=>{
+    'use strict';
+    const wrap=document.querySelector('[data-ms-show-more]');
+    if(!wrap)return;
+    const button=wrap.querySelector('[data-ms-show-more-button]');
+    const input=wrap.querySelector('[data-ms-show-more-count]');
+    const table=document.querySelector('#ms-select-row-form .ms-data-table');
+    const tbody=table?table.querySelector('tbody'):null;
+    if(!button||!input||!table||!tbody)return;
+    let nextOffset=Math.max(0,Number.parseInt(wrap.dataset.nextOffset||'0',10)||0);
+    const total=Math.max(0,Number.parseInt(wrap.dataset.total||'0',10)||0);
+    const applyCurrentLayout=rows=>{
+      const headerMap=new Map(Array.from(table.querySelectorAll('thead th[data-ms-column]')).map(th=>[th.dataset.msColumn||'',th]));
+      const headerColumns=Array.from(headerMap.keys()).filter(Boolean);
+      rows.forEach(row=>{
+        const cells=new Map(Array.from(row.children).filter(cell=>cell.dataset&&cell.dataset.msColumn).map(cell=>[cell.dataset.msColumn,cell]));
+        headerColumns.forEach(column=>{const cell=cells.get(column);if(cell)row.appendChild(cell);});
+        headerColumns.forEach(column=>{
+          const header=headerMap.get(column);
+          const cell=cells.get(column);
+          if(!header||!cell)return;
+          if(header.style.width)cell.style.width=header.style.width;
+          if(header.style.minWidth)cell.style.minWidth=header.style.minWidth;
+          if(header.style.maxWidth)cell.style.maxWidth=header.style.maxWidth;
+        });
+      });
+    };
+    button.addEventListener('click',async()=>{
+      let count=Number.parseInt(input.value,10);
+      if(!Number.isFinite(count))count=1;
+      count=Math.max(1,Math.min(5000,count));
+      input.value=String(count);
+      const original=button.innerHTML;
+      button.disabled=true;input.disabled=true;
+      button.innerHTML='<i class="fa-solid fa-spinner fa-spin me-1"></i>Loading';
+      try{
+        const destination=new URL(window.location.href);
+        destination.searchParams.set('ajax','select_more');
+        destination.searchParams.set('offset',String(nextOffset));
+        destination.searchParams.set('count',String(count));
+        destination.searchParams.delete('single_id');
+        const response=await fetch(destination.toString(),{credentials:'same-origin',headers:{'Accept':'application/json'}});
+        const data=await response.json();
+        if(!response.ok||!data.ok)throw new Error(data.error||'Unable to load more rows.');
+        const holder=document.createElement('tbody');
+        holder.innerHTML=String(data.html||'');
+        const newRows=Array.from(holder.children);
+        newRows.forEach(row=>tbody.appendChild(row));
+        applyCurrentLayout(newRows);
+        nextOffset=Math.max(nextOffset,Number.parseInt(data.next_offset,10)||nextOffset);
+        wrap.dataset.nextOffset=String(nextOffset);
+        if(!data.has_more||!newRows.length)wrap.remove();
+      }catch(error){
+        if(window.Swal&&typeof window.Swal.fire==='function')window.Swal.fire({icon:'error',title:'Unable to show more rows',text:error.message||'The additional rows could not be loaded.'});
+        else alert(error.message||'Unable to show more rows.');
+      }finally{
+        if(document.body.contains(button)){button.disabled=false;input.disabled=false;button.innerHTML=original;}
+      }
+    });
+  })();
+  </script>
   <?php if($showAll){?><div class="alert alert-info mt-3 mb-0 no-print"><i class="fa-solid fa-list me-1"></i>All <?= h(number_format($total)) ?> result(s) are displayed. <a href="<?= h(url(['show_all'=>null,'p'=>null,'limit'=>null])) ?>">Return to paginated view</a>.</div><?php }else{render_select_pagination($page,$pages,'bottom');}?><div class="small text-body-secondary code mt-2">Query: <?= h($sql) ?></div><?php
 }
 
@@ -4039,7 +4257,12 @@ function page_row(mysqli $db): void {
     throw new RuntimeException('Table not found.');
   }
   $columns = table_columns($db, $table);
+  $tableMeta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+  $isBaseTable = ($tableMeta['TABLE_TYPE'] ?? '') === 'BASE TABLE';
   $mode = g('mode', 'insert');
+  if (!in_array($mode, ['insert','edit','view','clone'], true)) {
+    $mode = 'insert';
+  }
   $returnQuery = ms_decode_navigation(g('return_to'));
   if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
     $returnQuery = ['page' => 'select', 'table' => $table];
@@ -4047,13 +4270,32 @@ function page_row(mysqli $db): void {
   $returnToken = ms_encode_navigation($returnQuery);
   $returnUrl = '?' . http_build_query($returnQuery);
   $identity = null;
+  $sourceIdentity = null;
   $values = [];
-  if ($mode === 'edit') {
-    $identity = decode_identity(g('id'));
-    if (!is_array($identity)) {
+  if (in_array($mode, ['edit','view','clone'], true)) {
+    $sourceIdentity = decode_identity(g('id'));
+    if (!is_array($sourceIdentity)) {
       throw new RuntimeException('Invalid row identity.');
     }
-    $values = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . row_identity_where($db, $columns, $identity) . ' LIMIT 1') ?? [];
+    $values = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . row_identity_where($db, $columns, $sourceIdentity) . ' LIMIT 1') ?? [];
+    if (!$values) {
+      throw new RuntimeException('Row not found.');
+    }
+    if ($mode === 'edit') {
+      if (!$isBaseTable) {
+        throw new RuntimeException('This view is not directly editable.');
+      }
+      $identity = $sourceIdentity;
+    } elseif ($mode === 'clone') {
+      if (!$isBaseTable) {
+        throw new RuntimeException('This view cannot be cloned as a table row.');
+      }
+      foreach ($columns as $column) {
+        if (strpos((string)$column['EXTRA'], 'auto_increment') !== false) {
+          $values[$column['COLUMN_NAME']] = '';
+        }
+      }
+    }
   } elseif (!empty($_SESSION['ms_clone'])) {
     $values = $_SESSION['ms_clone'];
     unset($_SESSION['ms_clone']);
@@ -4063,10 +4305,75 @@ function page_row(mysqli $db): void {
       }
     }
   }
-  title_bar(($mode === 'edit' ? 'Edit' : 'Insert') . ' row: ' . $table, 'Literal values are validated according to their MySQL type. Enable SQL expression to enter raw SQL.');
+
+  if ($mode === 'view') {
+    $emptyViewConfig = ['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
+    $storedViewConfig = ms_column_view_table_config(selected_db(), $table);
+    $viewConfig = ms_raw_db_view() ? $emptyViewConfig : $storedViewConfig;
+    $hiddenColumns = is_array($viewConfig['hidden'] ?? null) ? $viewConfig['hidden'] : [];
+    $imageColumns = is_array($viewConfig['images'] ?? null) ? $viewConfig['images'] : [];
+    $softFkRules = is_array($viewConfig['soft_fk'] ?? null) ? $viewConfig['soft_fk'] : [];
+    $formatRules = is_array($viewConfig['formats'] ?? null) ? $viewConfig['formats'] : [];
+    $labelRules = is_array($viewConfig['labels'] ?? null) ? $viewConfig['labels'] : [];
+    $softFkMaps = ms_soft_fk_maps($db, [$values], $softFkRules);
+    $relations = [];
+    foreach (db_all($db, "SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=" . qs($db,$table) . " AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation) {
+      $relations[$relation['COLUMN_NAME']] = $relation;
+    }
+    $encoded = encode_identity($sourceIdentity);
+    $actions = '<a class="btn btn-secondary" href="' . h($returnUrl) . '"><i class="fa-solid fa-arrow-left me-1"></i>Back</a>';
+    if ($isBaseTable) {
+      $actions .= ' <a class="btn btn-primary" href="?' . h(http_build_query(['page'=>'row','mode'=>'edit','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken])) . '"><i class="fa-solid fa-pen me-1"></i>Edit</a>';
+      $actions .= ' <a class="btn btn-secondary" href="?' . h(http_build_query(['page'=>'row','mode'=>'clone','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken])) . '"><i class="fa-solid fa-clone me-1"></i>Clone</a>';
+    }
+    title_bar('View row: ' . $table, ms_raw_db_view() ? 'Raw database values are being shown.' : 'Saved column viewing rules are applied.', $actions);
+    ?><div class="card"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th style="width:24%">Field</th><th>Value</th><th style="width:18%">Type</th></tr></thead><tbody><?php
+    $shown = 0;
+    foreach ($columns as $column) {
+      $name = (string)$column['COLUMN_NAME'];
+      if (!empty($hiddenColumns[$name])) continue;
+      $shown++;
+      $value = $values[$name] ?? null;
+      $customLabel = trim((string)($labelRules[$name] ?? ''));
+      $visibleLabel = $customLabel !== '' ? $customLabel : $name;
+      ?><tr><th><div><?= h($visibleLabel) ?></div><?php if ($customLabel !== '') { ?><div class="small text-body-secondary code"><?= h($name) ?></div><?php } ?></th><td><?php
+      if (isset($formatRules[$name]) && is_array($formatRules[$name])) {
+        echo ms_render_formatted_value($value, $formatRules[$name]);
+      } elseif (isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
+        echo ms_render_image_value($value, $imageColumns[$name]);
+      } elseif (isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
+        $soft = $softFkRules[$name];
+        $map = $softFkMaps[$name] ?? [];
+        $key = (string)$value;
+        $found = array_key_exists($key, $map);
+        $display = $found ? $map[$key] : $value;
+        $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Virtual foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display, MS_MAX_CELL_BYTES) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
+      } elseif (preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) && $value !== null) {
+        ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
+      } elseif (isset($relations[$name]) && $value !== null) {
+        $rel = $relations[$name];
+        $relUrl = '?' . http_build_query(['page'=>'select','table'=>$rel['REFERENCED_TABLE_NAME'],'filter_col'=>[$rel['REFERENCED_COLUMN_NAME']],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
+        ?><a href="<?= h($relUrl) ?>" title="Open referenced row"><?= render_value($value, MS_MAX_CELL_BYTES) ?> <i class="fa-solid fa-arrow-up-right-from-square small"></i></a><?php
+      } else {
+        echo render_value($value, MS_MAX_CELL_BYTES);
+      }
+      ?></td><td class="code small text-body-secondary"><?= h((string)$column['COLUMN_TYPE']) ?></td></tr><?php
+    }
+    if ($shown === 0) { ?><tr><td colspan="3" class="text-center text-body-secondary p-4">Every column is hidden by the current viewing rules. Enable Raw DB view to see the complete row.</td></tr><?php }
+    ?></tbody></table></div></div><?php
+    return;
+  }
+
+  $titleVerb = $mode === 'edit' ? 'Edit' : ($mode === 'clone' ? 'Clone' : 'Insert');
+  $subtitle = $mode === 'clone'
+    ? 'Review the copied values before creating the new row. Auto-increment fields are cleared.'
+    : 'Literal values are validated according to their MySQL type. Enable SQL expression to enter raw SQL.';
+  title_bar($titleVerb . ' row: ' . $table, $subtitle);
   ?><form method="post" enctype="multipart/form-data" data-ms-row-form>
     <input type="hidden" name="action" value="save_row">
     <input type="hidden" name="identity" value="<?= h($identity === null ? '' : encode_identity($identity)) ?>">
+    <?php if ($mode === 'clone' && is_array($sourceIdentity)) { ?><input type="hidden" name="clone_source" value="<?= h(encode_identity($sourceIdentity)) ?>"><?php } ?>
     <input type="hidden" name="return_to" value="<?= h($returnToken) ?>">
     <?= csrf_field() ?>
     <div class="card"><div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Column</th><th>Type</th><th>Value</th><th>Options</th></tr></thead><tbody>
@@ -4075,12 +4382,12 @@ function page_row(mysqli $db): void {
       $generated = strpos((string)$column['EXTRA'], 'GENERATED') !== false;
       $binary = preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) === 1;
       $spec = ms_column_edit_spec($column);
-      $currentIsNull = $mode === 'edit' && array_key_exists($name, $values) && $values[$name] === null;
+      $currentIsNull = in_array($mode, ['edit','clone'], true) && array_key_exists($name, $values) && $values[$name] === null;
       ?><tr data-ms-field-row><td><strong><?= h($name) ?></strong><?php if ($column['COLUMN_KEY']) { ?><span class="badge text-bg-primary ms-1"><?= h($column['COLUMN_KEY']) ?></span><?php } ?></td><td class="code small"><?= h($column['COLUMN_TYPE']) ?></td><td>
       <?php if ($generated) { ?>
         <span class="text-body-secondary">Generated automatically</span>
       <?php } elseif ($binary) { ?>
-        <?php if ($mode === 'edit' && array_key_exists($name, $values) && $values[$name] !== null) { ?><div class="small mb-1"><?= h(strlen((string)$values[$name])) ?> existing bytes</div><?php } ?>
+        <?php if (in_array($mode, ['edit','clone'], true) && array_key_exists($name, $values) && $values[$name] !== null) { ?><div class="small mb-1"><?= h(strlen((string)$values[$name])) ?> existing bytes</div><?php } ?>
         <input class="form-control mb-1" type="file" name="upload[<?= h($name) ?>]">
         <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="2" placeholder="Or enter textual bytes"></textarea>
       <?php } elseif (in_array($column['DATA_TYPE'], ['text','mediumtext','longtext'], true)) { ?>
@@ -4104,13 +4411,12 @@ function page_row(mysqli $db): void {
       <?php } ?></td><td><?php if (!$generated) { ?>
         <label class="d-block"><input class="form-check-input" type="checkbox" name="is_null[<?= h($name) ?>]" data-ms-null<?= $currentIsNull ? ' checked' : '' ?>> NULL</label>
         <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]" data-ms-expression> SQL expression</label>
-        <?php if ($binary && $mode === 'edit') { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]" checked> Keep existing</label><?php } ?>
+        <?php if ($binary && in_array($mode, ['edit','clone'], true)) { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]" checked> <?= $mode === 'clone' ? 'Copy existing BLOB' : 'Keep existing' ?></label><?php } ?>
       <?php } ?></td></tr>
     <?php } ?>
     </tbody></table></div></div>
     <div class="mt-3 d-flex gap-2"><button class="btn btn-primary">Save row</button><a class="btn btn-secondary" href="<?= h($returnUrl) ?>">Cancel</a></div>
   </form>
-  <?php if ($mode === 'edit') { ?><form method="post" class="mt-2"><input type="hidden" name="action" value="clone_row"><input type="hidden" name="identity" value="<?= h(encode_identity($identity)) ?>"><?= csrf_field() ?><button class="btn btn-secondary">Clone row</button></form><?php } ?>
   <script>
   (() => {
     'use strict';
