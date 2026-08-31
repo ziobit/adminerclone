@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.5';
+const MS_VERSION = '1.11.6';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -98,6 +98,100 @@ function go(array $changes = [], string $flash = '', string $type = 'success'): 
     $_SESSION['ms_flash'] = [$type, $flash];
   }
   header('Location: ' . url($changes));
+  exit;
+}
+
+function ms_allowed_pages(): array {
+  return ['databases','database','create_table','structure','select','clone_rows','row','sql','export','schema','views','routines','triggers','events','processes','users','variables','settings'];
+}
+
+function ms_clean_navigation_value($value, int $depth = 0) {
+  if ($depth > 4) {
+    return null;
+  }
+  if (is_scalar($value) || $value === null) {
+    return $value === null ? '' : (string)$value;
+  }
+  if (!is_array($value)) {
+    return null;
+  }
+  $clean = [];
+  foreach ($value as $key => $item) {
+    if (!is_int($key) && !is_string($key)) {
+      continue;
+    }
+    $cleaned = ms_clean_navigation_value($item, $depth + 1);
+    if ($cleaned !== null) {
+      $clean[$key] = $cleaned;
+    }
+  }
+  return $clean;
+}
+
+function ms_navigation_query(array $source): array {
+  $page = isset($source['page']) && !is_array($source['page']) ? (string)$source['page'] : '';
+  if ($page === '' || !in_array($page, ms_allowed_pages(), true)) {
+    return [];
+  }
+
+  $clean = [];
+  foreach ($source as $key => $value) {
+    $key = (string)$key;
+    if ($key === '' || in_array($key, ['download', 'ajax', 'ms_check_update'], true)) {
+      continue;
+    }
+    $cleaned = ms_clean_navigation_value($value);
+    if ($cleaned !== null) {
+      $clean[$key] = $cleaned;
+    }
+  }
+  $clean['page'] = $page;
+  return $clean;
+}
+
+function ms_encode_navigation(array $query): string {
+  $query = ms_navigation_query($query);
+  if (!$query) {
+    return '';
+  }
+  $json = json_encode($query, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+  if (!is_string($json) || $json === '') {
+    return '';
+  }
+  return rtrim(strtr(base64_encode($json), '+/', '-_'), '=');
+}
+
+function ms_decode_navigation(string $encoded): array {
+  $encoded = trim($encoded);
+  if ($encoded === '' || strlen($encoded) > 32768 || preg_match('/^[A-Za-z0-9_-]+$/', $encoded) !== 1) {
+    return [];
+  }
+  $padding = strlen($encoded) % 4;
+  if ($padding !== 0) {
+    $encoded .= str_repeat('=', 4 - $padding);
+  }
+  $json = base64_decode(strtr($encoded, '-_', '+/'), true);
+  if (!is_string($json) || $json === '') {
+    return [];
+  }
+  $decoded = json_decode($json, true);
+  return is_array($decoded) ? ms_navigation_query($decoded) : [];
+}
+
+function ms_navigation_requires_database(array $query): bool {
+  $page = isset($query['page']) && !is_array($query['page']) ? (string)$query['page'] : '';
+  return $page !== '' && !in_array($page, ['databases','processes','users','variables','settings'], true);
+}
+
+function ms_go_to_query(array $query, string $flash = '', string $type = 'success'): void {
+  $query = ms_navigation_query($query);
+  if (!$query) {
+    $query = ['page' => 'databases'];
+  }
+  if ($flash !== '') {
+    $_SESSION['ms_flash'] = [$type, $flash];
+  }
+  header('Location: ?' . http_build_query($query));
   exit;
 }
 
@@ -1721,11 +1815,20 @@ try {
       throw new RuntimeException('Connection failed: ' . $test->connect_error);
     }
     $test->close();
+    $returnQuery = ms_decode_navigation(p('return_to'));
     session_regenerate_id(true);
     $_SESSION['ms_login'] = compact('host', 'port', 'user', 'password', 'socket');
     $_SESSION['ms_attempts'] = 0;
     $_SESSION['ms_csrf'] = bin2hex(random_bytes(32));
-    go(['page' => 'databases'], 'Connected successfully.');
+    if ($returnQuery) {
+      $_SESSION['ms_pending_navigation'] = $returnQuery;
+      if (!ms_navigation_requires_database($returnQuery) || selected_db() !== '') {
+        unset($_SESSION['ms_pending_navigation']);
+        ms_go_to_query($returnQuery, 'Connected successfully.');
+      }
+      ms_go_to_query(['page' => 'databases'], 'Connected successfully. Choose a database to continue the requested operation.', 'info');
+    }
+    ms_go_to_query(['page' => 'databases'], 'Connected successfully.');
   }
 
   if (p('action') === 'logout') {
@@ -1824,7 +1927,14 @@ try {
           throw new RuntimeException('Database is not available.');
         }
         $_SESSION['ms_db'] = $database;
-        go(['page' => 'database', 'table' => null], 'Database selected.');
+        $pendingNavigation = isset($_SESSION['ms_pending_navigation']) && is_array($_SESSION['ms_pending_navigation'])
+          ? ms_navigation_query($_SESSION['ms_pending_navigation'])
+          : [];
+        if ($pendingNavigation) {
+          unset($_SESSION['ms_pending_navigation']);
+          ms_go_to_query($pendingNavigation, 'Database selected. Continuing the requested operation.');
+        }
+        ms_go_to_query(['page' => 'database'], 'Database selected.');
       }
 
       if ($action === 'create_database') {
@@ -2067,6 +2177,10 @@ try {
         $expressions = isset($_POST['expression']) && is_array($_POST['expression']) ? $_POST['expression'] : [];
         $keepBlobs = isset($_POST['keep_blob']) && is_array($_POST['keep_blob']) ? $_POST['keep_blob'] : [];
         $identity = decode_identity(p('identity'));
+        $returnQuery = ms_decode_navigation(p('return_to'));
+        if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
+          $returnQuery = ['page' => 'select', 'table' => $table];
+        }
         $assignments = [];
         foreach ($columns as $column) {
           $name = (string)$column['COLUMN_NAME'];
@@ -2102,7 +2216,7 @@ try {
             $set[] = qi($name) . ' = ' . $value;
           }
           if (!$set) {
-            go(['page' => 'select'], 'Nothing changed.', 'info');
+            ms_go_to_query($returnQuery, 'Nothing changed.', 'info');
           }
           $sql = 'UPDATE ' . qi($table) . ' SET ' . implode(', ', $set) . ' WHERE ' . row_identity_where($db, $columns, $identity) . ' LIMIT 1';
         } else {
@@ -2111,7 +2225,7 @@ try {
         if (!$db->query($sql)) {
           throw new RuntimeException($db->error);
         }
-        go(['page' => 'select'], is_array($identity) ? 'Row updated.' : 'Row inserted.');
+        ms_go_to_query($returnQuery, is_array($identity) ? 'Row updated.' : 'Row inserted.');
       } elseif ($action === 'clone_row') {
         $table = g('table');
         $columns = table_columns($db, $table);
@@ -2984,10 +3098,15 @@ function column_form_fields(mysqli $db, array $values = [], string $prefix = '')
 }
 
 function page_login(string $error): void {
+  $returnQuery = ms_decode_navigation(p('return_to'));
+  if (!$returnQuery) {
+    $returnQuery = ms_navigation_query($_GET);
+  }
+  $returnToken = ms_encode_navigation($returnQuery);
   page_head('Connect', false);
   ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
   <?php if ($error !== '') { ?><div class="alert alert-danger"><?= h($error) ?></div><?php } ?>
-  <div class="card shadow-sm"><div class="card-body p-4"><form method="post" autocomplete="off"><input type="hidden" name="action" value="login"><?= csrf_field() ?>
+  <div class="card shadow-sm"><div class="card-body p-4"><form method="post" autocomplete="off"><input type="hidden" name="action" value="login"><?php if ($returnToken !== '') { ?><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?php } ?><?= csrf_field() ?>
     <div class="row g-3"><div class="col-8"><label class="form-label">Server</label><input class="form-control" name="host" value="<?= h(p('host','localhost')) ?>" required autofocus></div><div class="col-4"><label class="form-label">Port</label><input class="form-control" type="number" name="port" value="<?= h(p('port','3306')) ?>" min="1" max="65535" required></div>
     <div class="col-12"><label class="form-label">Unix socket <span class="text-body-secondary">(optional)</span></label><input class="form-control" name="socket" value="<?= h(p('socket')) ?>"></div>
     <div class="col-12"><label class="form-label">Username</label><input class="form-control" name="user" value="<?= h(p('user')) ?>" required></div>
@@ -3431,9 +3550,10 @@ function page_select(mysqli $db): void {
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
   $layoutColumns=$allColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
+  $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
   $actions='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
-  if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
+  if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   title_bar($table,number_format($total).' result(s)',$actions);
   ?><div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body"><form method="get"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
@@ -3448,7 +3568,7 @@ function page_select(mysqli $db): void {
   ?></tr></thead><tbody><?php
   foreach($rows as $row){
     $identity=[];foreach(primary_columns($db,$table)?:array_column($columns,'COLUMN_NAME') as $key)$identity[$key]=$row[$key]??null;$encoded=encode_identity($identity);
-    ?><tr><?php if($editable&&!$aggregated){?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><td class="text-nowrap" data-ms-static-column="actions"><a class="btn btn-secondary btn-sm" href="?page=row&amp;mode=edit&amp;table=<?= urlencode($table) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-pen"></i></a></td><?php }
+    ?><tr><?php if($editable&&!$aggregated){?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><td class="text-nowrap" data-ms-static-column="actions"><a class="btn btn-secondary btn-sm" href="?page=row&amp;mode=edit&amp;table=<?= urlencode($table) ?>&amp;id=<?= urlencode($encoded) ?>&amp;return_to=<?= urlencode($returnToken) ?>"><i class="fa-solid fa-pen"></i></a></td><?php }
     foreach($row as $name=>$value){
       $name=(string)$name;
       if(!$aggregated&&!empty($hiddenColumns[$name]))continue;
@@ -3637,6 +3757,12 @@ function page_row(mysqli $db): void {
   }
   $columns = table_columns($db, $table);
   $mode = g('mode', 'insert');
+  $returnQuery = ms_decode_navigation(g('return_to'));
+  if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
+    $returnQuery = ['page' => 'select', 'table' => $table];
+  }
+  $returnToken = ms_encode_navigation($returnQuery);
+  $returnUrl = '?' . http_build_query($returnQuery);
   $identity = null;
   $values = [];
   if ($mode === 'edit') {
@@ -3658,6 +3784,7 @@ function page_row(mysqli $db): void {
   ?><form method="post" enctype="multipart/form-data" data-ms-row-form>
     <input type="hidden" name="action" value="save_row">
     <input type="hidden" name="identity" value="<?= h($identity === null ? '' : encode_identity($identity)) ?>">
+    <input type="hidden" name="return_to" value="<?= h($returnToken) ?>">
     <?= csrf_field() ?>
     <div class="card"><div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Column</th><th>Type</th><th>Value</th><th>Options</th></tr></thead><tbody>
     <?php foreach ($columns as $column) {
@@ -3698,7 +3825,7 @@ function page_row(mysqli $db): void {
       <?php } ?></td></tr>
     <?php } ?>
     </tbody></table></div></div>
-    <div class="mt-3 d-flex gap-2"><button class="btn btn-primary">Save row</button><a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Cancel</a></div>
+    <div class="mt-3 d-flex gap-2"><button class="btn btn-primary">Save row</button><a class="btn btn-secondary" href="<?= h($returnUrl) ?>">Cancel</a></div>
   </form>
   <?php if ($mode === 'edit') { ?><form method="post" class="mt-2"><input type="hidden" name="action" value="clone_row"><input type="hidden" name="identity" value="<?= h(encode_identity($identity)) ?>"><?= csrf_field() ?><button class="btn btn-secondary">Clone row</button></form><?php } ?>
   <script>
@@ -4240,7 +4367,7 @@ if (empty($_SESSION['ms_login'])) {
 try {
   $db = connect_db(false);
   $page = g('page', selected_db() !== '' ? 'database' : 'databases');
-  $allowedPages = ['databases','database','create_table','structure','select','clone_rows','row','sql','export','schema','views','routines','triggers','events','processes','users','variables','settings'];
+  $allowedPages = ms_allowed_pages();
   if (!in_array($page, $allowedPages, true)) {
     $page = selected_db() !== '' ? 'database' : 'databases';
   }
