@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.7';
+const MS_VERSION = '1.11.8';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1909,6 +1909,8 @@ try {
         download_headers($tables[0] . '.' . $format, $contentType);
         echo "\xEF\xBB\xBF";
         csv_export($db, $tables[0], $delimiter);
+      } elseif ($format === 'xls') {
+        throw new RuntimeException('XLS export is generated in the browser from the Export page.');
       } else {
         download_headers((selected_db() ?: 'database') . '-' . gmdate('Ymd-His') . '.sql', 'application/sql; charset=UTF-8');
         dump_database($db, $tables, g('structure', '1') === '1', g('data', '1') === '1', g('drop', '1') === '1');
@@ -4201,7 +4203,165 @@ function page_sql(mysqli $db,?array $results,float $time): void {
 
 function page_export(mysqli $db): void {
   $tables=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');title_bar('Export',selected_db());
-  ?><div class="card"><div class="card-body"><form method="get"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV and TSV require exactly one selection.</div></div><div class="col-12 d-flex gap-4"><label><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col"><button class="btn btn-primary"><i class="fa-solid fa-download me-1"></i>Download export</button></div></div></form></div></div><?php
+  $databaseJson=json_encode(selected_db(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'"database"';
+  ?><div class="card"><div class="card-body"><form method="get" id="msExportForm"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script>
+  (()=>{
+    'use strict';
+    const form=document.getElementById('msExportForm');
+    const format=document.getElementById('msExportFormat');
+    const tables=document.getElementById('msExportTables');
+    const download=document.getElementById('msExportDownload');
+    const copyCsv=document.getElementById('msCopyCsv');
+    const copyTsv=document.getElementById('msCopyTsv');
+    const status=document.getElementById('msExportStatus');
+    const database=<?= $databaseJson ?> || 'database';
+    if(!form||!format||!tables||!download||!copyCsv||!copyTsv||!status)return;
+
+    const selectedTables=()=>Array.from(tables.selectedOptions).map(option=>option.value);
+    const setStatus=(message,type='secondary')=>{
+      status.className='small text-'+type;
+      status.textContent=message||'';
+    };
+    const setBusy=busy=>{
+      [download,copyCsv,copyTsv].forEach(button=>button.disabled=busy);
+      tables.disabled=busy;
+      format.disabled=busy;
+    };
+    const exportUrl=(table,exportFormat)=>{
+      const params=new URLSearchParams();
+      params.set('download','export');
+      params.set('format',exportFormat);
+      params.append('tables[]',table);
+      return '?'+params.toString();
+    };
+    const fetchText=async(table,exportFormat)=>{
+      const response=await fetch(exportUrl(table,exportFormat),{credentials:'same-origin'});
+      if(!response.ok){
+        const text=await response.text();
+        throw new Error(text.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim()||('HTTP '+response.status));
+      }
+      return (await response.text()).replace(/^\uFEFF/, '');
+    };
+    const copyText=async text=>{
+      if(navigator.clipboard&&window.isSecureContext){
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const textarea=document.createElement('textarea');
+      textarea.value=text;
+      textarea.setAttribute('readonly','');
+      textarea.style.position='fixed';
+      textarea.style.left='-9999px';
+      textarea.style.top='0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied=document.execCommand('copy');
+      textarea.remove();
+      if(!copied)throw new Error('The browser refused clipboard access.');
+    };
+    const safeFileName=value=>String(value||'database').replace(/[\\/:*?"<>|\x00-\x1F]+/g,'_').replace(/[. ]+$/g,'')||'database';
+    const safeSheetBase=value=>String(value||'Sheet').replace(/[\\/?*\[\]:]/g,'_').slice(0,31)||'Sheet';
+    const uniqueSheetName=(value,used)=>{
+      const base=safeSheetBase(value);
+      let name=base;
+      let n=2;
+      while(used.has(name.toLowerCase())){
+        const suffix='_'+n++;
+        name=base.slice(0,31-suffix.length)+suffix;
+      }
+      used.add(name.toLowerCase());
+      return name;
+    };
+    const refresh=()=>{
+      const count=selectedTables().length;
+      copyCsv.disabled=count!==1;
+      copyTsv.disabled=count!==1;
+      const isXls=format.value==='xls';
+      download.querySelector('span').textContent=isXls?'Download XLS':'Download export';
+      download.querySelector('i').className=isXls?'fa-solid fa-file-excel me-1':'fa-solid fa-download me-1';
+      if(isXls){
+        form.querySelectorAll('input[name="structure"],input[name="drop"]').forEach(input=>input.disabled=true);
+      }else{
+        form.querySelectorAll('input[name="structure"],input[name="drop"]').forEach(input=>input.disabled=false);
+      }
+    };
+
+    const copyFormat=async exportFormat=>{
+      const selected=selectedTables();
+      if(selected.length!==1){
+        setStatus('Select exactly one object first.','danger');
+        return;
+      }
+      setBusy(true);
+      setStatus('Preparing '+exportFormat.toUpperCase()+'...');
+      try{
+        const text=await fetchText(selected[0],exportFormat);
+        await copyText(text);
+        setStatus(exportFormat.toUpperCase()+' copied to clipboard.','success');
+      }catch(error){
+        setStatus(error instanceof Error?error.message:String(error),'danger');
+      }finally{
+        setBusy(false);
+        refresh();
+      }
+    };
+
+    const downloadXls=async()=>{
+      const selected=selectedTables();
+      if(!selected.length){
+        setStatus('Select at least one object first.','danger');
+        return;
+      }
+      if(typeof XLSX==='undefined'){
+        setStatus('The XLS library could not be loaded from the CDN.','danger');
+        return;
+      }
+      setBusy(true);
+      setStatus('Building XLS workbook...');
+      try{
+        const workbook=XLSX.utils.book_new();
+        const used=new Set();
+        for(let i=0;i<selected.length;i++){
+          const table=selected[i];
+          setStatus('Loading '+table+' ('+(i+1)+'/'+selected.length+')...');
+          const csv=await fetchText(table,'csv');
+          const parsed=XLSX.read(csv,{type:'string',raw:true});
+          const sourceName=parsed.SheetNames[0];
+          const worksheet=parsed.Sheets[sourceName];
+          XLSX.utils.book_append_sheet(workbook,worksheet,uniqueSheetName(table,used));
+        }
+        const stamp=new Date().toISOString().replace(/[-:]/g,'').replace(/T/,'-').replace(/\..+$/,'');
+        XLSX.writeFile(workbook,safeFileName(database)+'-'+stamp+'.xls',{bookType:'xls',compression:true});
+        setStatus('XLS export created.','success');
+      }catch(error){
+        setStatus(error instanceof Error?error.message:String(error),'danger');
+      }finally{
+        setBusy(false);
+        refresh();
+      }
+    };
+
+    copyCsv.addEventListener('click',()=>copyFormat('csv'));
+    copyTsv.addEventListener('click',()=>copyFormat('tsv'));
+    tables.addEventListener('change',refresh);
+    format.addEventListener('change',refresh);
+    form.addEventListener('submit',event=>{
+      const selected=selectedTables();
+      if(format.value==='xls'){
+        event.preventDefault();
+        downloadXls();
+        return;
+      }
+      if((format.value==='csv'||format.value==='tsv')&&selected.length!==1){
+        event.preventDefault();
+        setStatus(format.value.toUpperCase()+' export requires exactly one selected object.','danger');
+      }
+    });
+    refresh();
+  })();
+  </script><?php
 }
 
 function page_schema(mysqli $db): void {
