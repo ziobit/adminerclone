@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.15';
+const MS_VERSION = '1.11.16';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2084,6 +2084,28 @@ try {
       exit;
     }
 
+    if (g('download') === 'table_structure_sql') {
+      if (selected_db() === '' || !$db->select_db(selected_db())) {
+        throw new RuntimeException('Choose a database first.');
+      }
+      $table = g('table');
+      if ($table === '' || !table_exists($db, $table)) {
+        throw new RuntimeException('Table not found.');
+      }
+      $create = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
+      $statement = (string)($create['Create Table'] ?? '');
+      if ($statement === '') {
+        throw new RuntimeException('Unable to read the CREATE TABLE statement.');
+      }
+      download_headers($table . '.sql', 'application/sql; charset=UTF-8');
+      echo "-- MySQL Studio table structure export\n";
+      echo '-- Database: ' . str_replace(["\r", "\n"], ' ', selected_db()) . "\n";
+      echo '-- Table: ' . str_replace(["\r", "\n"], ' ', $table) . "\n";
+      echo '-- Generated: ' . gmdate('Y-m-d H:i:s') . " UTC\n\n";
+      echo $statement . ";\n";
+      exit;
+    }
+
     if (g('download') === 'blob') {
       $table = g('table');
       $column = g('column');
@@ -3902,6 +3924,10 @@ function render_column_statistics(mysqli $db, string $table, array $column, bool
 function page_structure(mysqli $db): void {
   $table=g('table'); if(!table_exists($db,$table)) throw new RuntimeException('Table not found.');
   $columns=table_columns($db,$table); $status=db_one($db,'SHOW TABLE STATUS LIKE '.qs($db,$table));
+  $createRow=db_one($db,'SHOW CREATE TABLE '.qi($table));
+  $createSql=(string)($createRow['Create Table']??'');
+  if($createSql==='') throw new RuntimeException('Unable to read the CREATE TABLE statement.');
+  $createSql=rtrim($createSql,"; \t\r\n").';';
   $indexes=db_all($db,'SHOW INDEX FROM '.qi($table));
   $foreign=db_all($db,"SELECT CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,ORDINAL_POSITION FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME,ORDINAL_POSITION");
   $checks=db_all($db,"SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=DATABASE() AND tc.TABLE_NAME=".qs($db,$table)." AND tc.CONSTRAINT_TYPE='CHECK'");
@@ -3910,7 +3936,13 @@ function page_structure(mysqli $db): void {
   $columnNames=array_map('strval',array_column($columns,'COLUMN_NAME'));
   if($statsColumn!==''&&!in_array($statsColumn,$columnNames,true)) $statsColumn='';
   $expandDistinct=$statsColumn!==''&&g('distinct')==='all';
-  title_bar('Structure: '.$table, $status['Comment']??'', '<a class="btn btn-primary" href="?page=select&amp;table='.urlencode($table).'">Browse data</a>');
+  $structureActions='<div class="d-flex flex-wrap gap-2">' .
+    '<a class="btn btn-primary" href="?page=select&amp;table='.urlencode($table).'">Browse data</a>' .
+    '<a class="btn btn-secondary" href="?download=table_structure_sql&amp;table='.urlencode($table).'" title="Download the exact CREATE TABLE statement"><i class="fa-solid fa-download me-1"></i>Download SQL</a>' .
+    '<button class="btn btn-secondary" type="button" id="msCopyCreateTableSql" title="Copy the exact CREATE TABLE statement to the clipboard"><i class="fa-solid fa-copy me-1"></i>Copy SQL</button>' .
+    '</div>';
+  title_bar('Structure: '.$table, $status['Comment']??'', $structureActions);
+  ?><textarea id="msCreateTableSql" class="visually-hidden" tabindex="-1" aria-hidden="true"><?= h($createSql) ?></textarea>
   ?><style>
     .ms-structure-column-handle{cursor:grab;touch-action:none;min-width:2.5rem;border:0;border-right:1px solid var(--bs-border-color);background:transparent;color:var(--bs-secondary-color)}
     .ms-structure-column-handle:active{cursor:grabbing}.ms-structure-column.ms-structure-dragging{opacity:.45}.ms-structure-column.ms-structure-drop-before{box-shadow:inset 0 3px 0 var(--ms-accent)}.ms-structure-column.ms-structure-drop-after{box-shadow:inset 0 -3px 0 var(--ms-accent)}
@@ -3944,6 +3976,48 @@ function page_structure(mysqli $db): void {
   <script>
   (()=>{
     'use strict';
+    const copyButton=document.getElementById('msCopyCreateTableSql');
+    const sqlSource=document.getElementById('msCreateTableSql');
+    if(copyButton&&sqlSource){
+      copyButton.addEventListener('click',async()=>{
+        const sql=sqlSource.value;
+        const original=copyButton.innerHTML;
+        let copied=false;
+        try{
+          if(navigator.clipboard&&window.isSecureContext){
+            await navigator.clipboard.writeText(sql);
+            copied=true;
+          }
+        }catch(error){}
+        if(!copied){
+          const helper=document.createElement('textarea');
+          helper.value=sql;
+          helper.setAttribute('readonly','');
+          helper.style.position='fixed';
+          helper.style.opacity='0';
+          helper.style.pointerEvents='none';
+          document.body.appendChild(helper);
+          helper.select();
+          helper.setSelectionRange(0,helper.value.length);
+          try{copied=document.execCommand('copy');}catch(error){copied=false;}
+          helper.remove();
+        }
+        if(copied){
+          copyButton.innerHTML='<i class="fa-solid fa-check me-1"></i>Copied';
+          copyButton.classList.remove('btn-secondary');
+          copyButton.classList.add('btn-success');
+          window.setTimeout(()=>{
+            copyButton.innerHTML=original;
+            copyButton.classList.remove('btn-success');
+            copyButton.classList.add('btn-secondary');
+          },1800);
+        }else if(window.Swal&&typeof window.Swal.fire==='function'){
+          window.Swal.fire({icon:'error',title:'Copy failed',text:'The browser did not allow clipboard access.'});
+        }else{
+          alert('The browser did not allow clipboard access.');
+        }
+      });
+    }
     const list=document.querySelector('[data-ms-structure-columns]');
     const form=document.getElementById('msColumnReorderForm');
     if(!list||!form)return;
