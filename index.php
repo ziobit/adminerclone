@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.14';
+const MS_VERSION = '1.11.15';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1043,48 +1043,137 @@ function build_column_sql(mysqli $db, array $source, bool $includeName = true): 
   if (!in_array($type, sql_type_options(), true)) {
     throw new RuntimeException('Unsupported column type.');
   }
+  if ($includeName && $name === '') {
+    throw new RuntimeException('Column name is required.');
+  }
+
   $length = trim((string)($source['length'] ?? ''));
   $sql = $includeName ? qi($name) . ' ' : '';
   $sql .= $type;
-  if ($length !== '') {
-    if (in_array($type, ['ENUM', 'SET'], true)) {
-      $values = preg_split('/\r\n|\r|\n/', $length);
-      $sql .= '(' . implode(', ', array_map(static function ($v) use ($db) { return qs($db, trim((string)$v)); }, array_filter($values, 'strlen'))) . ')';
-    } elseif (preg_match('/^[0-9]+(?:\s*,\s*[0-9]+)?$/', $length)) {
+
+  // Only emit a type parameter when that datatype actually supports one.
+  // This deliberately ignores stale UI lengths for types such as FLOAT, INT,
+  // DATE, TEXT and BLOB instead of producing invalid SQL such as FLOAT(255).
+  if (in_array($type, ['ENUM', 'SET'], true)) {
+    $values = preg_split('/\r\n|\r|\n/', $length);
+    $values = array_values(array_filter(array_map('trim', is_array($values) ? $values : []), 'strlen'));
+    if (!$values) {
+      throw new RuntimeException($type . ' requires at least one value, one per line.');
+    }
+    $sql .= '(' . implode(', ', array_map(static function ($v) use ($db) { return qs($db, $v); }, $values)) . ')';
+  } elseif (in_array($type, ['VARCHAR', 'VARBINARY'], true)) {
+    if (preg_match('/^[1-9][0-9]*$/', $length) !== 1) {
+      throw new RuntimeException($type . ' requires a positive length.');
+    }
+    $sql .= '(' . $length . ')';
+  } elseif (in_array($type, ['CHAR', 'BINARY'], true)) {
+    if ($length !== '') {
+      if (preg_match('/^[1-9][0-9]*$/', $length) !== 1) {
+        throw new RuntimeException($type . ' length must be a positive integer.');
+      }
       $sql .= '(' . $length . ')';
     }
+  } elseif (in_array($type, ['DECIMAL', 'DEC', 'NUMERIC', 'FIXED'], true)) {
+    if ($length !== '') {
+      if (preg_match('/^([0-9]+)(?:\s*,\s*([0-9]+))?$/', $length, $match) !== 1) {
+        throw new RuntimeException($type . ' precision must be written as M or M,D.');
+      }
+      $precision = (int)$match[1];
+      $scale = isset($match[2]) && $match[2] !== '' ? (int)$match[2] : null;
+      if ($precision < 1 || $precision > 65) {
+        throw new RuntimeException($type . ' precision must be between 1 and 65.');
+      }
+      if ($scale !== null && ($scale < 0 || $scale > 30 || $scale > $precision)) {
+        throw new RuntimeException($type . ' scale must be between 0 and 30 and cannot exceed the precision.');
+      }
+      $sql .= '(' . $precision . ($scale !== null ? ',' . $scale : '') . ')';
+    }
+  } elseif ($type === 'BIT') {
+    if ($length !== '') {
+      if (ctype_digit($length) !== true || (int)$length < 1 || (int)$length > 64) {
+        throw new RuntimeException('BIT length must be between 1 and 64.');
+      }
+      $sql .= '(' . (int)$length . ')';
+    }
+  } elseif (in_array($type, ['DATETIME', 'TIMESTAMP', 'TIME'], true)) {
+    if ($length !== '') {
+      if (ctype_digit($length) !== true || (int)$length < 0 || (int)$length > 6) {
+        throw new RuntimeException($type . ' fractional-second precision must be between 0 and 6.');
+      }
+      $sql .= '(' . (int)$length . ')';
+    }
+  } elseif ($type === 'VECTOR') {
+    if (preg_match('/^[1-9][0-9]*$/', $length) !== 1) {
+      throw new RuntimeException('VECTOR requires a positive dimension in Length.');
+    }
+    $sql .= '(' . $length . ')';
   }
-  if (!empty($source['unsigned']) && in_array($type, ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'DEC', 'NUMERIC', 'FIXED', 'FLOAT', 'DOUBLE', 'DOUBLE PRECISION', 'REAL'], true)) {
+
+  $integerTypes = ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT'];
+  $unsignedTypes = array_merge($integerTypes, ['DECIMAL', 'DEC', 'NUMERIC', 'FIXED', 'FLOAT', 'DOUBLE', 'DOUBLE PRECISION', 'REAL']);
+  if (!empty($source['unsigned']) && in_array($type, $unsignedTypes, true)) {
     $sql .= ' UNSIGNED';
   }
-  $charset = trim((string)($source['charset'] ?? ''));
-  $collation = trim((string)($source['collation'] ?? ''));
-  if ($charset !== '' && preg_match('/^[a-zA-Z0-9_]+$/', $charset)) {
-    $sql .= ' CHARACTER SET ' . $charset;
+
+  $characterTypes = ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET'];
+  if (in_array($type, $characterTypes, true)) {
+    $charset = trim((string)($source['charset'] ?? ''));
+    $collation = trim((string)($source['collation'] ?? ''));
+    if ($charset !== '') {
+      if (preg_match('/^[a-zA-Z0-9_]+$/', $charset) !== 1) {
+        throw new RuntimeException('Invalid character set name.');
+      }
+      $sql .= ' CHARACTER SET ' . $charset;
+    }
+    if ($collation !== '') {
+      if (preg_match('/^[a-zA-Z0-9_]+$/', $collation) !== 1) {
+        throw new RuntimeException('Invalid collation name.');
+      }
+      $sql .= ' COLLATE ' . $collation;
+    }
   }
-  if ($collation !== '' && preg_match('/^[a-zA-Z0-9_]+$/', $collation)) {
-    $sql .= ' COLLATE ' . $collation;
-  }
+
   $generated = trim((string)($source['generated'] ?? ''));
+  $autoIncrement = !empty($source['auto_increment']);
   if ($generated !== '') {
+    if ($autoIncrement) {
+      throw new RuntimeException('A generated column cannot also be AUTO_INCREMENT.');
+    }
     $sql .= ' GENERATED ALWAYS AS (' . $generated . ') ' . (!empty($source['stored']) ? 'STORED' : 'VIRTUAL');
   } else {
-    $sql .= !empty($source['nullable']) ? ' NULL' : ' NOT NULL';
+    if ($autoIncrement && !in_array($type, $integerTypes, true)) {
+      throw new RuntimeException('AUTO_INCREMENT is only allowed here for integer column types.');
+    }
+
+    // AUTO_INCREMENT columns are always NOT NULL. This also prevents a checked
+    // Nullable box from generating a contradictory definition.
+    $sql .= ($autoIncrement || empty($source['nullable'])) ? ' NOT NULL' : ' NULL';
+
     if (!empty($source['default_set'])) {
+      if ($autoIncrement) {
+        throw new RuntimeException('AUTO_INCREMENT columns cannot have an explicit default value.');
+      }
       $default = (string)($source['default'] ?? '');
       if (!empty($source['default_expression'])) {
+        if (trim($default) === '') {
+          throw new RuntimeException('Default expression cannot be empty.');
+        }
         $sql .= ' DEFAULT ' . $default;
       } else {
         $sql .= ' DEFAULT ' . qs($db, $default);
       }
     }
-    if (!empty($source['auto_increment'])) {
+    if ($autoIncrement) {
       $sql .= ' AUTO_INCREMENT';
     }
     if (!empty($source['on_update'])) {
+      if (!in_array($type, ['TIMESTAMP', 'DATETIME'], true)) {
+        throw new RuntimeException('ON UPDATE CURRENT_TIMESTAMP is only valid for TIMESTAMP or DATETIME columns.');
+      }
       $sql .= ' ON UPDATE CURRENT_TIMESTAMP';
     }
   }
+
   $comment = trim((string)($source['comment'] ?? ''));
   if ($comment !== '') {
     $sql .= ' COMMENT ' . qs($db, $comment);
@@ -2256,15 +2345,65 @@ try {
       } elseif ($action === 'create_table') {
         $name = trim(p('name'));
         $columns = isset($_POST['columns']) && is_array($_POST['columns']) ? $_POST['columns'] : [];
-        $definitions = [];
-        foreach ($columns as $column) {
-          if (is_array($column) && trim((string)($column['name'] ?? '')) !== '') {
-            $definitions[] = build_column_sql($db, $column);
-          }
-        }
-        if ($name === '' || !$definitions) {
+        if ($name === '' || !$columns) {
           throw new RuntimeException('A table name and at least one column are required.');
         }
+
+        $definitions = [];
+        $primaryColumns = [];
+        $secondaryDefinitions = [];
+        $seenColumnNames = [];
+        $autoIncrementColumns = [];
+
+        foreach ($columns as $column) {
+          if (!is_array($column)) {
+            continue;
+          }
+          $columnName = trim((string)($column['name'] ?? ''));
+          if ($columnName === '') {
+            continue;
+          }
+          $nameKey = strtolower($columnName);
+          if (isset($seenColumnNames[$nameKey])) {
+            throw new RuntimeException('Duplicate column name: ' . $columnName . '.');
+          }
+          $seenColumnNames[$nameKey] = true;
+
+          $definitions[] = build_column_sql($db, $column);
+
+          $key = strtoupper(trim((string)($column['index'] ?? '')));
+          if (!in_array($key, ['', 'PRIMARY', 'INDEX', 'UNIQUE'], true)) {
+            throw new RuntimeException('Invalid index type for column ' . $columnName . '.');
+          }
+          if (!empty($column['auto_increment'])) {
+            $autoIncrementColumns[] = $columnName;
+            // Never send an unindexed AUTO_INCREMENT to MySQL. If the user
+            // explicitly turned the key selector off, create a normal index.
+            if ($key === '') {
+              $key = 'INDEX';
+            }
+          }
+
+          if ($key === 'PRIMARY') {
+            $primaryColumns[] = qi($columnName);
+          } elseif ($key === 'UNIQUE') {
+            $secondaryDefinitions[] = 'UNIQUE KEY (' . qi($columnName) . ')';
+          } elseif ($key === 'INDEX') {
+            $secondaryDefinitions[] = 'KEY (' . qi($columnName) . ')';
+          }
+        }
+
+        if (!$definitions) {
+          throw new RuntimeException('A table name and at least one named column are required.');
+        }
+        if (count($autoIncrementColumns) > 1) {
+          throw new RuntimeException('MySQL permits only one AUTO_INCREMENT column per table.');
+        }
+        if ($primaryColumns) {
+          $definitions[] = 'PRIMARY KEY (' . implode(', ', $primaryColumns) . ')';
+        }
+        $definitions = array_merge($definitions, $secondaryDefinitions);
+
         $engine = preg_match('/^[A-Za-z0-9_]+$/', p('engine')) ? p('engine') : 'InnoDB';
         $collation = preg_match('/^[A-Za-z0-9_]+$/', p('collation')) ? p('collation') : 'utf8mb4_unicode_ci';
         $sql = 'CREATE TABLE ' . qi($name) . ' (' . implode(', ', $definitions) . ') ENGINE=' . $engine . ' COLLATE=' . $collation;
@@ -2272,7 +2411,7 @@ try {
           $sql .= ' COMMENT=' . qs($db, p('comment'));
         }
         if (!$db->query($sql)) {
-          throw new RuntimeException($db->error);
+          throw new RuntimeException('MySQL #' . $db->errno . ': ' . $db->error . ' | SQL: ' . $sql);
         }
         go(['page' => 'structure', 'table' => $name], 'Table created.');
       } elseif ($action === 'alter_table') {
@@ -3353,21 +3492,23 @@ function render_sql_results(array $results, float $time): void {
   }
 }
 
-function column_form_fields(mysqli $db, array $values = [], string $prefix = ''): void {
+function column_form_fields(mysqli $db, array $values = [], string $prefix = '', bool $showIndex = false): void {
   $name = (string)($values['name'] ?? '');
   $type = strtoupper((string)($values['type'] ?? 'VARCHAR'));
+  $index = strtoupper((string)($values['index'] ?? ''));
   $field = static function (string $key) use ($prefix): string {
     return $prefix === '' ? $key : $prefix . $key . ']';
   };
-  ?><div class="row g-2">
-    <div class="col-md-2"><label class="form-label">Name</label><input class="form-control" name="<?= h($field('name')) ?>" value="<?= h($name) ?>"></div>
-    <div class="col-md-2"><label class="form-label">Type</label><select class="form-select" name="<?= h($field('type')) ?>"><?php foreach (sql_type_options() as $option) { ?><option<?= $option===$type?' selected':'' ?>><?= h($option) ?></option><?php } ?></select></div>
-    <div class="col-md-2"><label class="form-label">Length / ENUM lines</label><input class="form-control" name="<?= h($field('length')) ?>" value="<?= h($values['length'] ?? '') ?>"></div>
+  ?><div class="row g-2" data-ms-column-fields>
+    <div class="col-md-2"><label class="form-label">Name</label><input class="form-control" name="<?= h($field('name')) ?>" value="<?= h($name) ?>" data-ms-column-name></div>
+    <div class="col-md-2"><label class="form-label">Type</label><select class="form-select" name="<?= h($field('type')) ?>" data-ms-column-type><?php foreach (sql_type_options() as $option) { ?><option<?= $option===$type?' selected':'' ?>><?= h($option) ?></option><?php } ?></select></div>
+    <div class="col-md-2"><label class="form-label">Length / ENUM lines</label><input class="form-control" name="<?= h($field('length')) ?>" value="<?= h($values['length'] ?? '') ?>" data-ms-column-length></div>
     <div class="col-md-2"><label class="form-label">Default</label><input class="form-control" name="<?= h($field('default')) ?>" value="<?= h($values['default'] ?? '') ?>"></div>
     <div class="col-md-2"><label class="form-label">Collation</label><input class="form-control" name="<?= h($field('collation')) ?>" value="<?= h($values['collation'] ?? '') ?>"></div>
     <div class="col-md-2"><label class="form-label">Comment</label><input class="form-control" name="<?= h($field('comment')) ?>" value="<?= h($values['comment'] ?? '') ?>"></div>
+    <?php if ($showIndex) { ?><div class="col-md-2"><label class="form-label">Index</label><select class="form-select" name="<?= h($field('index')) ?>" data-ms-column-index><option value=""<?= $index===''?' selected':'' ?>>None</option><option value="PRIMARY"<?= $index==='PRIMARY'?' selected':'' ?>>PRIMARY</option><option value="INDEX"<?= $index==='INDEX'?' selected':'' ?>>INDEX</option><option value="UNIQUE"<?= $index==='UNIQUE'?' selected':'' ?>>UNIQUE</option></select></div><?php } ?>
     <div class="col-12 d-flex flex-wrap gap-3 small">
-      <?php foreach ([['nullable','Nullable'],['default_set','Use default'],['default_expression','Default is expression'],['unsigned','Unsigned'],['auto_increment','Auto increment'],['on_update','ON UPDATE timestamp'],['invisible','Invisible'],['stored','Generated stored']] as [$key,$label]) { ?><label><input class="form-check-input" type="checkbox" name="<?= h($field($key)) ?>" value="1"<?= !empty($values[$key])?' checked':'' ?>> <?= h($label) ?></label><?php } ?>
+      <?php foreach ([['nullable','Nullable'],['default_set','Use default'],['default_expression','Default is expression'],['unsigned','Unsigned'],['auto_increment','Auto increment'],['on_update','ON UPDATE timestamp'],['invisible','Invisible'],['stored','Generated stored']] as [$key,$label]) { ?><label><input class="form-check-input" type="checkbox" name="<?= h($field($key)) ?>" value="1"<?= !empty($values[$key])?' checked':'' ?><?= $key==='nullable'?' data-ms-column-nullable':'' ?><?= $key==='auto_increment'?' data-ms-column-auto-increment':'' ?>> <?= h($label) ?></label><?php } ?>
     </div>
     <div class="col-md-8"><label class="form-label">Generated expression (leave empty for a normal column)</label><input class="form-control code" name="<?= h($field('generated')) ?>" value="<?= h($values['generated'] ?? '') ?>"></div>
   </div><?php
@@ -3409,9 +3550,129 @@ function page_database(mysqli $db): void {
 
 function page_create_table(mysqli $db): void {
   title_bar('Create table', selected_db());
-  ?><form method="post"><input type="hidden" name="action" value="create_table"><?= csrf_field() ?><div class="card mb-3"><div class="card-body"><div class="row g-3"><div class="col-md-4"><label class="form-label">Table name</label><input class="form-control" name="name" required></div><div class="col-md-3"><label class="form-label">Engine</label><input class="form-control" name="engine" value="InnoDB"></div><div class="col-md-3"><label class="form-label">Collation</label><input class="form-control" name="collation" value="utf8mb4_unicode_ci"></div><div class="col-md-2"><label class="form-label">Comment</label><input class="form-control" name="comment"></div></div></div></div>
-  <?php for ($i=0;$i<6;$i++) { ?><div class="card mb-2"><div class="card-body"><?php column_form_fields($db, ['type'=>$i===0?'INT':'VARCHAR','length'=>$i===0?'11':'255','nullable'=>$i!==0,'auto_increment'=>$i===0], 'columns['.$i.']['); ?></div></div><?php } ?>
-  <button class="btn btn-primary mt-2">Create table</button></form><?php
+
+  $isRetry = p('action') === 'create_table';
+  $tableName = $isRetry ? p('name') : '';
+  $engine = $isRetry ? p('engine', 'InnoDB') : 'InnoDB';
+  $collation = $isRetry ? p('collation', 'utf8mb4_unicode_ci') : 'utf8mb4_unicode_ci';
+  $comment = $isRetry ? p('comment') : '';
+  $postedColumns = $isRetry && isset($_POST['columns']) && is_array($_POST['columns']) ? $_POST['columns'] : [];
+
+  if ($postedColumns) {
+    $rows = array_values(array_filter($postedColumns, 'is_array'));
+  } else {
+    $rows = [
+      ['name'=>'id', 'type'=>'INT', 'length'=>'', 'nullable'=>false, 'auto_increment'=>true, 'index'=>'PRIMARY'],
+      ['name'=>'', 'type'=>'VARCHAR', 'length'=>'255', 'nullable'=>true, 'index'=>''],
+      ['name'=>'', 'type'=>'VARCHAR', 'length'=>'255', 'nullable'=>true, 'index'=>''],
+      ['name'=>'', 'type'=>'VARCHAR', 'length'=>'255', 'nullable'=>true, 'index'=>''],
+      ['name'=>'', 'type'=>'VARCHAR', 'length'=>'255', 'nullable'=>true, 'index'=>''],
+      ['name'=>'', 'type'=>'VARCHAR', 'length'=>'255', 'nullable'=>true, 'index'=>'']
+    ];
+  }
+  if (!$rows) {
+    $rows[] = ['name'=>'id', 'type'=>'INT', 'length'=>'', 'nullable'=>false, 'auto_increment'=>true, 'index'=>'PRIMARY'];
+  }
+  ?><form method="post" id="msCreateTableForm">
+    <input type="hidden" name="action" value="create_table"><?= csrf_field() ?>
+    <div class="card mb-3"><div class="card-body"><div class="row g-3">
+      <div class="col-md-4"><label class="form-label">Table name</label><input class="form-control" name="name" value="<?= h($tableName) ?>" required autofocus></div>
+      <div class="col-md-3"><label class="form-label">Engine</label><input class="form-control" name="engine" value="<?= h($engine) ?>"></div>
+      <div class="col-md-3"><label class="form-label">Collation</label><input class="form-control" name="collation" value="<?= h($collation) ?>"></div>
+      <div class="col-md-2"><label class="form-label">Comment</label><input class="form-control" name="comment" value="<?= h($comment) ?>"></div>
+    </div></div></div>
+
+    <div class="alert alert-info py-2 small"><i class="fa-solid fa-circle-info me-2"></i>The first field is ready as <code>id INT NOT NULL AUTO_INCREMENT PRIMARY KEY</code>. The Index selector is part of table creation, so AUTO_INCREMENT fields are never sent to MySQL without a key.</div>
+
+    <div id="msCreateTableColumns"><?php foreach ($rows as $i => $row) { ?>
+      <div class="card mb-2" data-ms-create-column><div class="card-header py-2 d-flex justify-content-between align-items-center"><strong data-ms-column-title>Field <?= h((string)($i + 1)) ?></strong><button class="btn btn-outline-danger btn-sm" type="button" data-ms-remove-column title="Remove this field"><i class="fa-solid fa-xmark"></i></button></div><div class="card-body"><?php column_form_fields($db, $row, 'columns['.$i.'][', true); ?></div></div>
+    <?php } ?></div>
+
+    <div class="d-flex flex-wrap gap-2 mt-3"><button class="btn btn-secondary" type="button" id="msAddCreateColumn"><i class="fa-solid fa-plus me-1"></i>Add field</button><button class="btn btn-primary" type="submit"><i class="fa-solid fa-table me-1"></i>Create table</button></div>
+  </form>
+
+  <template id="msCreateColumnTemplate"><div class="card mb-2" data-ms-create-column><div class="card-header py-2 d-flex justify-content-between align-items-center"><strong data-ms-column-title>Field</strong><button class="btn btn-outline-danger btn-sm" type="button" data-ms-remove-column title="Remove this field"><i class="fa-solid fa-xmark"></i></button></div><div class="card-body"><?php column_form_fields($db, ['name'=>'','type'=>'VARCHAR','length'=>'255','nullable'=>true,'index'=>''], 'columns[__INDEX__][', true); ?></div></div></template>
+  <script>
+  (()=>{
+    'use strict';
+    const container=document.getElementById('msCreateTableColumns');
+    const addButton=document.getElementById('msAddCreateColumn');
+    const template=document.getElementById('msCreateColumnTemplate');
+    if(!container||!addButton||!template)return;
+
+    let nextIndex=0;
+    container.querySelectorAll('[name]').forEach(el=>{
+      const match=(el.getAttribute('name')||'').match(/^columns\[(\d+)\]/);
+      if(match)nextIndex=Math.max(nextIndex,Number(match[1])+1);
+    });
+
+    const lengthDefaults={VARCHAR:'255',VARBINARY:'255',CHAR:'1',BINARY:'1',DECIMAL:'10,2',DEC:'10,2',NUMERIC:'10,2',FIXED:'10,2',BIT:'1',VECTOR:'3'};
+    const parameterTypes=new Set(['VARCHAR','VARBINARY','CHAR','BINARY','DECIMAL','DEC','NUMERIC','FIXED','BIT','ENUM','SET','DATETIME','TIMESTAMP','TIME','VECTOR']);
+
+    const syncType=card=>{
+      const type=card.querySelector('[data-ms-column-type]');
+      const length=card.querySelector('[data-ms-column-length]');
+      if(!type||!length)return;
+      const value=String(type.value||'').toUpperCase();
+      if(value==='ENUM'||value==='SET'){
+        length.value='';
+        length.placeholder='one value per line';
+      }else if(parameterTypes.has(value)){
+        length.placeholder=value==='DATETIME'||value==='TIMESTAMP'||value==='TIME'?'0-6':'';
+        length.value=Object.prototype.hasOwnProperty.call(lengthDefaults,value)?lengthDefaults[value]:'';
+      }else{
+        length.value='';
+        length.placeholder='';
+      }
+    };
+
+    const enforceAutoIncrement=card=>{
+      const auto=card.querySelector('[data-ms-column-auto-increment]');
+      const nullable=card.querySelector('[data-ms-column-nullable]');
+      const index=card.querySelector('[data-ms-column-index]');
+      if(!auto||!auto.checked)return;
+      if(nullable)nullable.checked=false;
+      if(index&&index.value==='')index.value='INDEX';
+    };
+
+    const renumber=()=>{
+      const cards=Array.from(container.querySelectorAll('[data-ms-create-column]'));
+      cards.forEach((card,i)=>{
+        const title=card.querySelector('[data-ms-column-title]');
+        if(title)title.textContent='Field '+(i+1);
+      });
+      cards.forEach(card=>{
+        const remove=card.querySelector('[data-ms-remove-column]');
+        if(remove)remove.disabled=cards.length<=1;
+      });
+    };
+
+    const bind=card=>{
+      const type=card.querySelector('[data-ms-column-type]');
+      const auto=card.querySelector('[data-ms-column-auto-increment]');
+      if(type)type.addEventListener('change',()=>syncType(card));
+      if(auto)auto.addEventListener('change',()=>enforceAutoIncrement(card));
+      const remove=card.querySelector('[data-ms-remove-column]');
+      if(remove)remove.addEventListener('click',()=>{card.remove();renumber();});
+      enforceAutoIncrement(card);
+    };
+
+    container.querySelectorAll('[data-ms-create-column]').forEach(bind);
+    addButton.addEventListener('click',()=>{
+      const html=template.innerHTML.replaceAll('__INDEX__',String(nextIndex++));
+      const holder=document.createElement('div');
+      holder.innerHTML=html.trim();
+      const card=holder.firstElementChild;
+      if(!card)return;
+      container.appendChild(card);
+      bind(card);
+      renumber();
+      const input=card.querySelector('[data-ms-column-name]');
+      if(input)input.focus();
+    });
+    renumber();
+  })();
+  </script><?php
 }
 
 function exact_column_definition(mysqli $db, string $table, string $columnName): string {
