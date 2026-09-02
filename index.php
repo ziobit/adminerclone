@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.12.6';
+const MS_VERSION = '1.12.7';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -3547,11 +3547,20 @@ function page_head(string $title, bool $authenticated): void {
         document.querySelectorAll('[data-ms-menu]').forEach(item => {
           item.hidden = settings.menu && settings.menu[item.dataset.msMenu] === false;
         });
-        const dbTools=document.getElementById('ms-db-tools-nav');
+        const sectionContainer=document.getElementById('ms-sidebar-primary-sections');
+        const dbBlock=document.getElementById('ms-sidebar-db-block');
         const objectBlock=document.getElementById('ms-sidebar-objects-block');
-        if(dbTools&&objectBlock&&dbTools.parentNode===objectBlock.parentNode){
-          if(settings.displayObjectsBeforeDb!==false)dbTools.parentNode.insertBefore(objectBlock,dbTools);
-          else dbTools.parentNode.insertBefore(objectBlock,dbTools.nextSibling);
+        const sectionDivider=document.getElementById('ms-sidebar-section-divider');
+        if(sectionContainer&&dbBlock&&objectBlock&&sectionDivider){
+          if(settings.displayObjectsBeforeDb!==false){
+            sectionContainer.appendChild(objectBlock);
+            sectionContainer.appendChild(sectionDivider);
+            sectionContainer.appendChild(dbBlock);
+          }else{
+            sectionContainer.appendChild(dbBlock);
+            sectionContainer.appendChild(sectionDivider);
+            sectionContainer.appendChild(objectBlock);
+          }
         }
         const hiddenSidebarObjects = settings.hiddenSidebarObjects && typeof settings.hiddenSidebarObjects === 'object' && !Array.isArray(settings.hiddenSidebarObjects) ? settings.hiddenSidebarObjects : {};
         const rawDbView = root.getAttribute('data-raw-db-view') === 'true';
@@ -4049,24 +4058,26 @@ function render_sidebar(): void {
       } catch (Throwable $ignored) {}
     };
     $renderDatabaseTools = static function () use ($items, $page, $dbName): void {
-      ?><div class="small text-uppercase text-body-secondary mb-1">Databases</div>
+      ?><div id="ms-sidebar-db-block"><div class="small text-uppercase text-body-secondary mb-1">Databases</div>
       <nav class="nav nav-pills flex-column ms-db-tools small" id="ms-db-tools-nav">
         <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables'], true)) continue; ?>
           <a class="nav-link <?= $page === $key ? 'active' : 'text-body' ?>" data-ms-menu="<?= h($key) ?>" href="?page=<?= h($key) ?>"><i class="fa-solid <?= h($icon) ?> fa-fw me-2"></i><?= h($label) ?></a>
         <?php } ?>
-      </nav><?php
+      </nav></div><?php
     };
+    ?><div id="ms-sidebar-primary-sections"><?php
     if ($objectsBeforeDb && $dbName !== '') {
       $renderSidebarObjects();
-      echo '<hr class="ms-sidebar-section-divider">';
+      echo '<hr class="ms-sidebar-section-divider" id="ms-sidebar-section-divider">';
       $renderDatabaseTools();
     } else {
       $renderDatabaseTools();
       if ($dbName !== '') {
-        echo '<hr class="ms-sidebar-section-divider">';
+        echo '<hr class="ms-sidebar-section-divider" id="ms-sidebar-section-divider">';
         $renderSidebarObjects();
       }
     }
+    ?></div><?php
     ?>
     <hr><a class="nav-link mb-2 <?= $page === 'settings' ? 'active' : 'text-body' ?>" href="?page=settings"><i class="fa-solid fa-gear fa-fw me-2"></i>Settings</a>
     <div class="mb-3 ps-2">
