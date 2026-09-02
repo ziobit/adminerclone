@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.12.1';
+const MS_VERSION = '1.12.2';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -276,6 +276,7 @@ function ms_profile_default_settings(): array {
     'truncateCells' => false,
     'rawDbView' => false,
     'schemaColumnWidth' => 3,
+    'displayObjectsBeforeDb' => true,
     'menu' => [
       'databases' => true,
       'database' => true,
@@ -314,6 +315,7 @@ function ms_profile_normalize_settings(array $source): array {
   $settings['rawDbView'] = !empty($source['rawDbView']);
   $schemaWidth = (int)($source['schemaColumnWidth'] ?? $defaults['schemaColumnWidth']);
   $settings['schemaColumnWidth'] = in_array($schemaWidth, [2,3,4,6,12], true) ? $schemaWidth : $defaults['schemaColumnWidth'];
+  $settings['displayObjectsBeforeDb'] = !array_key_exists('displayObjectsBeforeDb', $source) || $source['displayObjectsBeforeDb'] !== false;
   $sourceMenu = isset($source['menu']) && is_array($source['menu']) ? $source['menu'] : [];
   foreach ($defaults['menu'] as $key => $enabled) {
     $settings['menu'][$key] = !array_key_exists($key, $sourceMenu) || $sourceMenu[$key] !== false;
@@ -725,7 +727,7 @@ function ms_profile_delete_search(string $database, string $table, string $name)
 
 function ms_column_view_table_config(string $database, string $table): array {
   $tableConfig = ms_profile_table_config($database, $table);
-  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
+  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) {
     if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) $tableConfig[$key] = [];
   }
   return $tableConfig;
@@ -737,11 +739,11 @@ function ms_column_view_database_config(string $database): array {
 
 function ms_column_view_update_table(string $database, string $table, callable $mutator): void {
   ms_profile_update_table($database, $table, static function (array $current) use ($mutator): array {
-    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) {
       if (!isset($current[$key]) || !is_array($current[$key])) $current[$key] = [];
     }
     $current = $mutator($current);
-    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) if (empty($current[$key])) unset($current[$key]);
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) if (empty($current[$key])) unset($current[$key]);
     return $current;
   });
 }
@@ -802,6 +804,26 @@ function ms_column_view_set_label(string $database, string $table, string $colum
 function ms_column_view_clear_display(string $database, string $table, string $column): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column): array {
     unset($config['formats'][$column], $config['images'][$column], $config['soft_fk'][$column]);
+    return $config;
+  });
+}
+
+function ms_column_view_set_presentation(string $database, string $table, string $column, string $alignment, bool $fixedFont): void {
+  if (!in_array($alignment, ['left', 'center', 'right'], true)) {
+    $alignment = 'left';
+  }
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $alignment, $fixedFont): array {
+    if ($alignment === 'left') unset($config['alignments'][$column]);
+    else $config['alignments'][$column] = $alignment;
+    if ($fixedFont) $config['fixed_fonts'][$column] = true;
+    else unset($config['fixed_fonts'][$column]);
+    return $config;
+  });
+}
+
+function ms_column_view_clear_presentation(string $database, string $table, string $column): void {
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column): array {
+    unset($config['alignments'][$column], $config['fixed_fonts'][$column]);
     return $config;
   });
 }
@@ -2431,13 +2453,15 @@ try {
         $rows = db_all($db, $sql);
         $totalRow = db_one($db, $countSql);
         $total = (int)($totalRow['n'] ?? 0);
-        $emptyViewConfig = ['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
+        $emptyViewConfig = ['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
         $storedViewConfig = $aggregated ? $emptyViewConfig : ms_column_view_table_config(selected_db(), $table);
         $viewConfig = (!$aggregated && ms_raw_db_view()) ? $emptyViewConfig : $storedViewConfig;
         $hiddenColumns = is_array($viewConfig['hidden'] ?? null) ? $viewConfig['hidden'] : [];
         $imageColumns = is_array($viewConfig['images'] ?? null) ? $viewConfig['images'] : [];
         $softFkRules = is_array($viewConfig['soft_fk'] ?? null) ? $viewConfig['soft_fk'] : [];
         $formatRules = is_array($viewConfig['formats'] ?? null) ? $viewConfig['formats'] : [];
+        $alignmentRules = is_array($viewConfig['alignments'] ?? null) ? $viewConfig['alignments'] : [];
+        $fixedFontRules = is_array($viewConfig['fixed_fonts'] ?? null) ? $viewConfig['fixed_fonts'] : [];
         $softFkMaps = $aggregated ? [] : ms_soft_fk_maps($db, $rows, $softFkRules);
         $relations = [];
         if (!$aggregated) {
@@ -2451,7 +2475,7 @@ try {
           $returnQuery = ['page'=>'select','table'=>$table];
         }
         $returnToken = ms_encode_navigation($returnQuery);
-        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$relations,$returnQuery,$returnToken);
+        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$relations,$returnQuery,$returnToken);
         $nextOffset = $offset + count($rows);
         echo json_encode([
           'ok' => true,
@@ -2602,6 +2626,7 @@ try {
           'truncateCells' => p('truncateCells') === '1',
           'rawDbView' => !empty($current['rawDbView']),
           'schemaColumnWidth' => (int)($current['schemaColumnWidth'] ?? 3),
+          'displayObjectsBeforeDb' => p('displayObjectsBeforeDb') === '1',
           'menu' => $menu
         ];
         ms_profile_update_settings($settings);
@@ -2715,6 +2740,7 @@ try {
           go([], 'Soft foreign key removed from ' . $configTable . '.' . $configColumn . '.');
         } elseif ($action === 'column_view_display_clear') {
           ms_column_view_clear_display($database, $configTable, $configColumn);
+          ms_column_view_clear_presentation($database, $configTable, $configColumn);
           ms_column_view_set_label($database, $configTable, $configColumn, null);
           ms_column_view_hide($database, $configTable, $configColumn, false);
           go([], 'Display customization removed and ' . $configTable . '.' . $configColumn . ' is visible again.');
@@ -2725,6 +2751,11 @@ try {
             throw new RuntimeException('The custom field name must be valid UTF-8 and 200 characters or fewer.');
           }
           ms_column_view_set_label($database, $configTable, $configColumn, $displayLabel !== '' ? $displayLabel : null);
+          $alignment = p('alignment', 'left');
+          if (!in_array($alignment, ['left', 'center', 'right'], true)) {
+            throw new RuntimeException('Choose a valid column alignment.');
+          }
+          ms_column_view_set_presentation($database, $configTable, $configColumn, $alignment, p('fixed_font') === '1');
           $hideColumn = p('hide_column') === '1';
           $style = p('display_style');
           if ($style === '' || $style === 'default') {
@@ -3516,6 +3547,12 @@ function page_head(string $title, bool $authenticated): void {
         document.querySelectorAll('[data-ms-menu]').forEach(item => {
           item.hidden = settings.menu && settings.menu[item.dataset.msMenu] === false;
         });
+        const dbTools=document.getElementById('ms-db-tools-nav');
+        const objectBlock=document.getElementById('ms-sidebar-objects-block');
+        if(dbTools&&objectBlock&&dbTools.parentNode===objectBlock.parentNode){
+          if(settings.displayObjectsBeforeDb!==false)dbTools.parentNode.insertBefore(objectBlock,dbTools);
+          else dbTools.parentNode.insertBefore(objectBlock,dbTools.nextSibling);
+        }
         const hiddenSidebarObjects = settings.hiddenSidebarObjects && typeof settings.hiddenSidebarObjects === 'object' && !Array.isArray(settings.hiddenSidebarObjects) ? settings.hiddenSidebarObjects : {};
         const rawDbView = root.getAttribute('data-raw-db-view') === 'true';
         document.querySelectorAll('[data-ms-sidebar-object-key]').forEach(item => {
@@ -3810,6 +3847,7 @@ function page_foot(): void {
       settingsForm.elements.sqlRows.value=settings.sqlRows;
       settingsForm.elements.selectRows.value=settings.selectRows;
       settingsForm.elements.truncateCells.checked=!!settings.truncateCells;
+      settingsForm.elements.displayObjectsBeforeDb.checked=settings.displayObjectsBeforeDb!==false;
       window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=!settings.menu||settings.menu[key]!==false;});
     };
     selectCurrent();
@@ -3848,7 +3886,7 @@ function page_foot(): void {
     });
     renderHiddenSidebarSettings();
     settingsForm.addEventListener('change',()=>{
-      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,rawDbView:settings.rawDbView,menu:{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
+      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,rawDbView:settings.rawDbView,displayObjectsBeforeDb:settingsForm.elements.displayObjectsBeforeDb.checked,menu:{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
       window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);preview.menu[key]=!!(input&&input.checked);});
       window.msApplySettings(preview);
     });
@@ -3974,6 +4012,8 @@ function render_sidebar(): void {
   $rawDbView = ms_raw_db_view();
   $profileNames = ms_profile_names();
   $activeProfile = ms_active_profile_name();
+  $profileSettings = ms_profile_settings();
+  $objectsBeforeDb = !empty($profileSettings['displayObjectsBeforeDb']);
   $hiddenSidebar = $dbName !== '' ? ms_profile_hidden_sidebar($dbName) : [];
   ?><aside class="sidebar p-3">
     <div class="mb-3">
@@ -3983,20 +4023,16 @@ function render_sidebar(): void {
           <input class="form-check-input m-0" type="checkbox" role="switch" id="ms-raw-db-view"<?= $rawDbView ? ' checked' : '' ?>>
           <label class="form-check-label small fw-semibold flex-grow-1" for="ms-raw-db-view"><i class="fa-solid fa-database me-1"></i>Raw DB view</label>
         </div>
-        <div class="small text-body-secondary mt-1">Show all objects and ignore custom column views</div>
       </div>
     </div>
     <?php if ($dbName !== '') { ?><div class="small text-body-secondary mb-2 text-truncate" title="<?= h($dbName) ?>">Database: <strong><?= h($dbName) ?></strong></div><?php } ?>
-    <nav class="nav nav-pills flex-column ms-db-tools small">
-      <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables'], true)) continue; ?>
-        <a class="nav-link <?= $page === $key ? 'active' : 'text-body' ?>" data-ms-menu="<?= h($key) ?>" href="?page=<?= h($key) ?>"><i class="fa-solid <?= h($icon) ?> fa-fw me-2"></i><?= h($label) ?></a>
-      <?php } ?>
-    </nav>
-    <?php if ($dbName !== '') {
+    <?php
+    $renderSidebarObjects = static function () use ($dbName, $rawDbView, $hiddenSidebar): void {
+      if ($dbName === '') return;
       try {
         $sideDb = connect_db();
         $tables = db_all($sideDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
-        ?><hr><div class="small text-uppercase text-body-secondary mb-2">Objects</div><div class="list-group list-group-flush small">
+        ?><div id="ms-sidebar-objects-block"><hr><div class="small text-uppercase text-body-secondary mb-2">Objects</div><div class="list-group list-group-flush small">
         <?php foreach ($tables as $t) {
           $name=(string)$t['TABLE_NAME'];
           $isBaseTable=(string)$t['TABLE_TYPE']==='BASE TABLE';
@@ -4009,14 +4045,22 @@ function render_sidebar(): void {
             </span>
           </div><?php
         } ?>
-        </div><?php
+        </div></div><?php
       } catch (Throwable $ignored) {}
-    } ?>
+    };
+    if ($objectsBeforeDb) $renderSidebarObjects();
+    ?>
+    <nav class="nav nav-pills flex-column ms-db-tools small" id="ms-db-tools-nav">
+      <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables'], true)) continue; ?>
+        <a class="nav-link <?= $page === $key ? 'active' : 'text-body' ?>" data-ms-menu="<?= h($key) ?>" href="?page=<?= h($key) ?>"><i class="fa-solid <?= h($icon) ?> fa-fw me-2"></i><?= h($label) ?></a>
+      <?php } ?>
+    </nav>
+    <?php if (!$objectsBeforeDb) $renderSidebarObjects(); ?>
     <hr><a class="nav-link mb-2 <?= $page === 'settings' ? 'active' : 'text-body' ?>" href="?page=settings"><i class="fa-solid fa-gear fa-fw me-2"></i>Settings</a>
     <div class="mb-3 ps-2">
       <?php if (count($profileNames) > 1) { ?>
-        <form method="post" class="m-0"><input type="hidden" name="action" value="switch_profile"><?= csrf_field() ?><label class="form-label small text-body-secondary mb-1" for="ms-sidebar-profile">Profile</label><select class="form-select form-select-sm" id="ms-sidebar-profile" name="profile" onchange="this.form.submit()"><?php foreach($profileNames as $profileName){?><option value="<?= h($profileName) ?>"<?= $profileName===$activeProfile?' selected':'' ?>><?= h($profileName) ?></option><?php }?></select></form>
-      <?php } else { ?><div class="small text-body-secondary">Profile: <strong class="text-body">Default</strong></div><?php } ?>
+        <form method="post" class="m-0"><input type="hidden" name="action" value="switch_profile"><?= csrf_field() ?><select aria-label="Profile" class="form-select form-select-sm" id="ms-sidebar-profile" name="profile" onchange="this.form.submit()"><?php foreach($profileNames as $profileName){?><option value="<?= h($profileName) ?>"<?= $profileName===$activeProfile?' selected':'' ?>><?= h($profileName) ?></option><?php }?></select></form>
+      <?php } else { ?><div class="small"><strong class="text-body">Default</strong></div><?php } ?>
     </div>
     <form method="post"><input type="hidden" name="action" value="logout"><?= csrf_field() ?><button class="btn btn-secondary btn-sm w-100"><i class="fa-solid fa-right-from-bracket me-1"></i>Log out</button></form>
     <div class="small text-body-secondary mt-3"><a class="text-body-secondary text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a> · PHP 7.4+</div>
@@ -4710,7 +4754,7 @@ function render_select_pagination(int $page, int $pages, string $position): void
   ?></ul></nav><?php
 }
 
-function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $relations,array $returnQuery,string $returnToken): string {
+function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,array $relations,array $returnQuery,string $returnToken): string {
   $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
   $columnMap = [];
   foreach ($columns as $column) {
@@ -4744,7 +4788,15 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
       $name = (string)$name;
       if (!$aggregated && !empty($hiddenColumns[$name])) continue;
       $colMeta = $columnMap[$name] ?? null;
-      ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>"<?php } ?>><?php
+      $cellClasses = [];
+      if (!$aggregated) {
+        $alignment = (string)($alignmentRules[$name] ?? 'left');
+        if ($alignment === 'center') $cellClasses[] = 'text-center';
+        elseif ($alignment === 'right') $cellClasses[] = 'text-end';
+        else $cellClasses[] = 'text-start';
+        if (!empty($fixedFontRules[$name])) $cellClasses[] = 'font-monospace';
+      }
+      ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>"<?php } ?><?= $cellClasses ? ' class="'.h(implode(' ', $cellClasses)).'"' : '' ?>><?php
       if (!$aggregated && isset($formatRules[$name]) && is_array($formatRules[$name])) {
         echo ms_render_formatted_value($value, $formatRules[$name]);
       } elseif (!$aggregated && isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
@@ -4777,11 +4829,11 @@ function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
-  $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
+  $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
-  $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];
-  $storedHiddenColumns=is_array($storedViewConfig['hidden']??null)?$storedViewConfig['hidden']:[];$storedImageColumns=is_array($storedViewConfig['images']??null)?$storedViewConfig['images']:[];$storedSoftFkRules=is_array($storedViewConfig['soft_fk']??null)?$storedViewConfig['soft_fk']:[];$storedFormatRules=is_array($storedViewConfig['formats']??null)?$storedViewConfig['formats']:[];$storedLabelRules=is_array($storedViewConfig['labels']??null)?$storedViewConfig['labels']:[];
+  $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];$alignmentRules=is_array($viewConfig['alignments']??null)?$viewConfig['alignments']:[];$fixedFontRules=is_array($viewConfig['fixed_fonts']??null)?$viewConfig['fixed_fonts']:[];
+  $storedHiddenColumns=is_array($storedViewConfig['hidden']??null)?$storedViewConfig['hidden']:[];$storedImageColumns=is_array($storedViewConfig['images']??null)?$storedViewConfig['images']:[];$storedSoftFkRules=is_array($storedViewConfig['soft_fk']??null)?$storedViewConfig['soft_fk']:[];$storedFormatRules=is_array($storedViewConfig['formats']??null)?$storedViewConfig['formats']:[];$storedLabelRules=is_array($storedViewConfig['labels']??null)?$storedViewConfig['labels']:[];$storedAlignmentRules=is_array($storedViewConfig['alignments']??null)?$storedViewConfig['alignments']:[];$storedFixedFontRules=is_array($storedViewConfig['fixed_fonts']??null)?$storedViewConfig['fixed_fonts']:[];
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
@@ -4814,10 +4866,12 @@ function page_select(mysqli $db): void {
       $storedSoftRule=is_array($storedSoftFkRules[$header]??null)?$storedSoftFkRules[$header]:[];
       $storedFormatRule=is_array($storedFormatRules[$header]??null)?$storedFormatRules[$header]:[];
       $storedDisplayLabel=trim((string)($storedLabelRules[$header]??''));
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>"<?php } ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      $alignment=(string)($alignmentRules[$header]??'left');$headerClasses=[];if($alignment==='center')$headerClasses[]='text-center';elseif($alignment==='right')$headerClasses[]='text-end';else $headerClasses[]='text-start';if(!empty($fixedFontRules[$header]))$headerClasses[]='font-monospace';
+      $storedAlignment=(string)($storedAlignmentRules[$header]??'left');if(!in_array($storedAlignment,['left','center','right'],true))$storedAlignment='left';
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
-  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$relations,$returnQuery,$returnToken);
+  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$relations,$returnQuery,$returnToken);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
   <?php if($hasMoreRows){ ?><div class="d-flex justify-content-center mt-2 no-print" data-ms-show-more data-next-offset="<?= h((string)$nextOffset) ?>" data-total="<?= h((string)$total) ?>">
@@ -4839,6 +4893,10 @@ function page_select(mysqli $db): void {
           <div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-hide-column" name="hide_column" value="1"><label class="form-check-label" for="ms-hide-column"><span data-ms-hide-label>Visible</span></label></div>
         </div>
         <div class="mb-3"><label class="form-label" for="ms-display-label">Custom field name</label><input class="form-control" id="ms-display-label" name="display_label" maxlength="200" placeholder="Leave blank to use the database field name"><div class="form-text">Display-only alias. It does not rename the MySQL column.</div></div>
+        <div class="row g-3 mb-3">
+          <div class="col-md-7"><label class="form-label d-block">Alignment</label><div class="btn-group" role="group" aria-label="Column alignment"><input class="btn-check" type="radio" name="alignment" id="ms-align-left" value="left" checked><label class="btn btn-outline-secondary" for="ms-align-left"><i class="fa-solid fa-align-left me-1"></i>Left</label><input class="btn-check" type="radio" name="alignment" id="ms-align-center" value="center"><label class="btn btn-outline-secondary" for="ms-align-center"><i class="fa-solid fa-align-center me-1"></i>Center</label><input class="btn-check" type="radio" name="alignment" id="ms-align-right" value="right"><label class="btn btn-outline-secondary" for="ms-align-right"><i class="fa-solid fa-align-right me-1"></i>Right</label></div></div>
+          <div class="col-md-5"><label class="form-label d-block">Font</label><div class="border rounded px-3 py-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-fixed-font" name="fixed_font" value="1"><label class="form-check-label" for="ms-fixed-font">Display as fixed font</label></div></div></div>
+        </div>
         <label class="form-label" for="ms-display-style">Viewing style</label>
         <select class="form-select" id="ms-display-style" name="display_style">
           <option value="default">Default / raw database value</option>
@@ -4950,6 +5008,8 @@ function page_select(mysqli $db): void {
     const displayStyle=document.getElementById('ms-display-style');
     const displayLabel=document.getElementById('ms-display-label');
     const hideColumn=document.getElementById('ms-hide-column');
+    const alignmentInputs=Array.from(viewForm.querySelectorAll('input[name="alignment"]'));
+    const fixedFont=document.getElementById('ms-fixed-font');
     const hideLabel=document.querySelector('[data-ms-hide-label]');
     const dateFormat=document.getElementById('ms-date-format');
     const datetimeFormat=document.getElementById('ms-datetime-format');
@@ -4987,6 +5047,8 @@ function page_select(mysqli $db): void {
       const column=header.dataset.msColumn||'';
       viewForm.elements.config_column.value=column;setColumnLabels(column);
       displayLabel.value=header.dataset.msDisplayLabel||'';
+      const alignment=header.dataset.msAlignment||'left';alignmentInputs.forEach(input=>input.checked=input.value===alignment);
+      fixedFont.checked=header.dataset.msFixedFont==='1';
       hideColumn.checked=header.dataset.msHidden==='1';updateHideLabel();
       let style=header.dataset.msDisplayKind||'';
       if(header.dataset.msImageBase)style='image';
@@ -5079,7 +5141,7 @@ function page_select(mysqli $db): void {
     });
   })();
   </script>
-  <?php if($showAll){?><div class="alert alert-info mt-3 mb-0 no-print"><i class="fa-solid fa-list me-1"></i>All <?= h(number_format($total)) ?> result(s) are displayed. <a href="<?= h(url(['show_all'=>null,'p'=>null,'limit'=>null])) ?>">Return to paginated view</a>.</div><?php }else{render_select_pagination($page,$pages,'bottom');}?><div class="small text-body-secondary code mt-2">Query: <?= h($sql) ?></div><?php
+  <?php if($showAll){?><div class="alert alert-info mt-3 mb-0 no-print"><i class="fa-solid fa-list me-1"></i>All <?= h(number_format($total)) ?> result(s) are displayed. <a href="<?= h(url(['show_all'=>null,'p'=>null,'limit'=>null])) ?>">Return to paginated view</a>.</div><?php }else{render_select_pagination($page,$pages,'bottom');}?><div class="d-flex flex-wrap align-items-center gap-2 small text-body-secondary mt-2"><span class="code flex-grow-1 text-break">Query: <?= h($sql) ?></span><button class="btn btn-outline-secondary btn-sm no-print" type="button" id="ms-copy-select-query"><i class="fa-solid fa-copy me-1"></i>Copy query</button></div><script>(()=>{'use strict';const button=document.getElementById('ms-copy-select-query');if(!button)return;const sql=<?= json_encode($sql,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) ?>;button.addEventListener('click',async()=>{let copied=false;try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(sql);copied=true;}else{const area=document.createElement('textarea');area.value=sql;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();copied=document.execCommand('copy');area.remove();}}catch(error){copied=false;}if(copied){const old=button.innerHTML;button.innerHTML='<i class="fa-solid fa-check me-1"></i>Copied';setTimeout(()=>{if(document.body.contains(button))button.innerHTML=old;},1200);}else alert('The browser did not allow clipboard access.');});})();</script><?php
 }
 
 function page_clone_rows(mysqli $db): void {
@@ -5953,17 +6015,19 @@ function render_column_display_settings(): void {
   } else {
     $databaseConfig = ms_column_view_database_config($database);
     $tables = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
-    $hidden = []; $labels = []; $images = []; $softFks = [];
+    $hidden = []; $labels = []; $images = []; $softFks = []; $presentations = [];
     foreach ($tables as $table => $tableConfig) {
       if (!is_array($tableConfig)) continue;
       foreach ((array)($tableConfig['hidden'] ?? []) as $column => $enabled) if ($enabled) $hidden[] = [(string)$table, (string)$column];
       foreach ((array)($tableConfig['labels'] ?? []) as $column => $label) if ((string)$label !== '') $labels[] = [(string)$table, (string)$column, (string)$label];
       foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
       foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
+      $alignmentMap=(array)($tableConfig['alignments']??[]);$fixedMap=(array)($tableConfig['fixed_fonts']??[]);$presentationColumns=array_values(array_unique(array_merge(array_keys($alignmentMap),array_keys($fixedMap))));foreach($presentationColumns as $column){$alignment=(string)($alignmentMap[$column]??'left');if(!in_array($alignment,['left','center','right'],true))$alignment='left';$presentations[]=[(string)$table,(string)$column,$alignment,!empty($fixedMap[$column])];}
     }
     ?><p class="text-body-secondary">These rules are stored inside the active profile in <code><?= h(ms_profile_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
     <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All columns use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
   }
@@ -6075,7 +6139,7 @@ function page_settings(): void {
 
     <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
       <div class="col-md-6 col-xl-4"><label class="border rounded p-3 d-flex align-items-center gap-3 h-100"><input class="form-check-input mt-0" type="checkbox" name="menu[<?= h($key) ?>]" value="1"><i class="fa-solid <?= h($icon) ?> fa-fw text-primary"></i><span><?= h($label) ?></span></label></div>
-    <?php } ?></div></div></section>
+    <?php } ?></div><div class="border rounded p-3 mt-3"><div class="form-check form-switch ms-ios-switch"><input class="form-check-input" type="checkbox" role="switch" name="displayObjectsBeforeDb" value="1" id="settings-objects-before-db"><label class="form-check-label fw-semibold" for="settings-objects-before-db">Display objects before DB</label></div><div class="form-text ms-4">Show the Tables/Views object list before the database-level navigation items in the left sidebar.</div></div></div></section>
 
     <section class="card mb-3" id="ms-hidden-sidebar-section"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-eye-slash me-2"></i>Hidden sidebar tables</h2><button class="btn btn-secondary btn-sm" type="button" id="ms-sidebar-show-all-hidden"><i class="fa-solid fa-eye me-1"></i>Show all</button></div><div class="card-body">
       <p class="text-body-secondary">Tables and views hidden from the normal left sidebar are listed here so they can be re-enabled individually. Raw DB view always shows every object regardless of this setting.</p>
