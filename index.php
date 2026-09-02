@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.18';
+const MS_VERSION = '1.11.19';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2514,6 +2514,58 @@ try {
           throw new RuntimeException($db->error);
         }
         go([], 'Column position updated.');
+      } elseif ($action === 'quick_clone_column') {
+        $table = g('table');
+        if ($table === '' || !table_exists($db, $table)) {
+          throw new RuntimeException('Table not found.');
+        }
+        $sourceName = p('column');
+        $columns = table_columns($db, $table);
+        $columnNames = array_map('strval', array_column($columns, 'COLUMN_NAME'));
+        if ($sourceName === '' || !in_array($sourceName, $columnNames, true)) {
+          throw new RuntimeException('Column not found.');
+        }
+        $suffix = 1;
+        do {
+          $newName = $sourceName . '-' . $suffix;
+          $suffix++;
+        } while (in_array($newName, $columnNames, true));
+        $definition = exact_column_definition($db, $table, $sourceName);
+        // A table can normally contain only one AUTO_INCREMENT column. Keep the
+        // cloned field definition otherwise identical, but do not duplicate that attribute.
+        $definition = preg_replace('/\s+AUTO_INCREMENT\b/i', '', $definition) ?? $definition;
+        $sql = 'ALTER TABLE ' . qi($table) . ' ADD COLUMN ' . qi($newName) . ' ' . $definition . ' AFTER ' . qi($sourceName);
+        if (!$db->query($sql)) {
+          throw new RuntimeException($db->error);
+        }
+        go([], 'Column cloned as ' . $newName . '.');
+      } elseif ($action === 'quick_rename_column') {
+        $table = g('table');
+        if ($table === '' || !table_exists($db, $table)) {
+          throw new RuntimeException('Table not found.');
+        }
+        $oldName = p('column');
+        $newName = trim(p('new_name'));
+        $columns = table_columns($db, $table);
+        $columnNames = array_map('strval', array_column($columns, 'COLUMN_NAME'));
+        if ($oldName === '' || !in_array($oldName, $columnNames, true)) {
+          throw new RuntimeException('Column not found.');
+        }
+        if ($newName === '') {
+          throw new RuntimeException('The new column name cannot be empty.');
+        }
+        if ($newName === $oldName) {
+          go([], 'Column name unchanged.', 'info');
+        }
+        if (in_array($newName, $columnNames, true)) {
+          throw new RuntimeException('A column named ' . $newName . ' already exists.');
+        }
+        $definition = exact_column_definition($db, $table, $oldName);
+        $sql = 'ALTER TABLE ' . qi($table) . ' CHANGE COLUMN ' . qi($oldName) . ' ' . qi($newName) . ' ' . $definition;
+        if (!$db->query($sql)) {
+          throw new RuntimeException($db->error);
+        }
+        go([], 'Column renamed to ' . $newName . '.');
       } elseif ($action === 'drop_column') {
         $sql = 'ALTER TABLE ' . qi(g('table')) . ' DROP COLUMN ' . qi(p('column'));
         if (!$db->query($sql)) {
@@ -3558,7 +3610,7 @@ function page_login(string $error): void {
 function page_databases(mysqli $db): void {
   $rows = db_all($db, "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME");
   title_bar('Databases', server_version($db), '<button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#createDatabase"><i class="fa-solid fa-plus me-1"></i>Create database</button>');
-  ?><div class="card"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Name</th><th>Character set</th><th>Collation</th><th></th></tr></thead><tbody><?php foreach ($rows as $row) { ?><tr><td><i class="fa-solid fa-database text-primary me-2"></i><?= h($row['SCHEMA_NAME']) ?></td><td><?= h($row['DEFAULT_CHARACTER_SET_NAME']) ?></td><td><?= h($row['DEFAULT_COLLATION_NAME']) ?></td><td class="text-end"><form method="post"><input type="hidden" name="action" value="select_db"><input type="hidden" name="database" value="<?= h($row['SCHEMA_NAME']) ?>"><?= csrf_field() ?><button class="btn btn-primary btn-sm">Open</button></form></td></tr><?php } ?></tbody></table></div></div>
+  ?><div class="card"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Name</th><th>Character set</th><th>Collation</th></tr></thead><tbody><?php foreach ($rows as $row) { ?><tr><td><form method="post" class="d-inline"><input type="hidden" name="action" value="select_db"><input type="hidden" name="database" value="<?= h($row['SCHEMA_NAME']) ?>"><?= csrf_field() ?><button class="btn btn-link p-0 border-0 align-baseline text-decoration-none fw-semibold" type="submit"><i class="fa-solid fa-database text-primary me-2"></i><?= h($row['SCHEMA_NAME']) ?></button></form></td><td><?= h($row['DEFAULT_CHARACTER_SET_NAME']) ?></td><td><?= h($row['DEFAULT_COLLATION_NAME']) ?></td></tr><?php } ?></tbody></table></div></div>
   <div class="modal fade" id="createDatabase" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="post"><div class="modal-header"><h2 class="modal-title fs-5">Create database</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" name="action" value="create_database"><?= csrf_field() ?><label class="form-label">Name</label><input class="form-control mb-3" name="name" required><label class="form-label">Collation</label><input class="form-control" name="collation" value="utf8mb4_unicode_ci" required></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Create</button></div></form></div></div></div><?php
 }
 
@@ -3942,11 +3994,11 @@ function page_structure(mysqli $db): void {
     '<button class="btn btn-secondary" type="button" id="msCopyCreateTableSql" title="Copy the exact CREATE TABLE statement to the clipboard"><i class="fa-solid fa-copy me-1"></i>Copy SQL</button>' .
     '</div>';
   title_bar('Structure: '.$table, $status['Comment']??'', $structureActions);
-  ?><textarea id="msCreateTableSql" class="visually-hidden" tabindex="-1" aria-hidden="true"><?= h($createSql) ?></textarea>
-  ?><style>
+  ?><textarea id="msCreateTableSql" class="visually-hidden" tabindex="-1" aria-hidden="true"><?= h($createSql) ?></textarea><style>
     .ms-structure-column-handle{cursor:grab;touch-action:none;min-width:2.5rem;border:0;border-right:1px solid var(--bs-border-color);background:transparent;color:var(--bs-secondary-color)}
     .ms-structure-column-handle:active{cursor:grabbing}.ms-structure-column.ms-structure-dragging{opacity:.45}.ms-structure-column.ms-structure-drop-before{box-shadow:inset 0 3px 0 var(--ms-accent)}.ms-structure-column.ms-structure-drop-after{box-shadow:inset 0 -3px 0 var(--ms-accent)}
-    .ms-structure-column{scroll-margin-top:.75rem}.ms-structure-column .accordion-button{min-width:0}.ms-column-statistics .sticky-top{z-index:1}
+    .ms-structure-column{scroll-margin-top:.75rem}.ms-structure-column .accordion-button{min-width:0;padding:var(--ms-table-pad-y) var(--ms-table-pad-x);font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height);min-height:0}.ms-structure-column .accordion-button::after{width:1rem;height:1rem;background-size:1rem}.ms-structure-column-handle{padding:var(--ms-table-pad-y) var(--ms-table-pad-x);font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.ms-column-statistics .sticky-top{z-index:1}
+    html[data-density="ultracompact"] .ms-structure-column-handle{min-width:1.8rem}html[data-density="compact"] .ms-structure-column-handle{min-width:2rem}html[data-density="standard"] .ms-structure-column-handle{min-width:2.5rem}html[data-density="large"] .ms-structure-column-handle{min-width:3rem}
   </style>
   <ul class="nav nav-tabs mb-3"><li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#columns">Columns</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#indexes">Indexes</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#foreign">Foreign keys</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#checks">Checks</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-triggers">Triggers</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#partitions">Partitions</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#table-settings">Table</button></li></ul>
   <div class="tab-content"><div class="tab-pane fade show active" id="columns">
@@ -3966,6 +4018,7 @@ function page_structure(mysqli $db): void {
       }
     ?></div>
     <div class="card mt-3"><div class="card-header">Add column</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_column"><?= csrf_field() ?><?php column_form_fields($db,['type'=>'VARCHAR','length'=>'255','nullable'=>true]); ?><div class="row mt-2"><div class="col-md-3"><select class="form-select" name="position"><option value="">At end</option><option value="FIRST">First</option><?php foreach($columns as $c){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col"><button class="btn btn-primary">Add column</button></div></div></form></div></div>
+    <div class="card mt-3" id="msQuickColumns"><div class="card-header d-flex align-items-center gap-2"><i class="fa-solid fa-bolt"></i><strong>Quick field operations</strong></div><div class="card-body"><p class="text-body-secondary small mb-2">This section is only for quick clone/delete operations and quick renaming. For the details and properties of each field, use the column properties above.</p><form method="post" id="msQuickRenameForm" class="d-none"><input type="hidden" name="action" value="quick_rename_column"><input type="hidden" name="column" value=""><input type="hidden" name="new_name" value=""><?= csrf_field() ?></form><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Field</th><th>Type</th><th class="text-end">Quick actions</th></tr></thead><tbody><?php foreach($columns as $column){$quickName=(string)$column['COLUMN_NAME'];?><tr><td><button type="button" class="btn btn-link p-0 border-0 text-decoration-none code" data-ms-quick-rename="<?= h($quickName) ?>" title="Click to rename"><?= h($quickName) ?></button></td><td><span class="code"><?= h((string)$column['COLUMN_TYPE']) ?></span></td><td class="text-end"><div class="d-inline-flex gap-1"><form method="post" class="d-inline"><input type="hidden" name="action" value="quick_clone_column"><input type="hidden" name="column" value="<?= h($quickName) ?>"><?= csrf_field() ?><button class="btn btn-outline-secondary btn-sm" type="submit" title="Clone <?= h($quickName) ?>" aria-label="Clone <?= h($quickName) ?>"><i class="fa-solid fa-clone"></i></button></form><form method="post" class="d-inline"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($quickName) ?>"><?= csrf_field() ?><button class="btn btn-outline-danger btn-sm" type="submit" data-confirm="Drop column <?= h($quickName) ?> and all its data?" title="Delete <?= h($quickName) ?>" aria-label="Delete <?= h($quickName) ?>"><i class="fa-solid fa-trash"></i></button></form></div></td></tr><?php }?></tbody></table></div></div></div>
   </div>
   <div class="tab-pane fade" id="indexes"><?php render_indexes($db,$table,$indexes,$columns); ?></div>
   <div class="tab-pane fade" id="foreign"><?php render_foreign_keys($db,$table,$foreign,$columns); ?></div>
@@ -4016,6 +4069,21 @@ function page_structure(mysqli $db): void {
         }else{
           alert('The browser did not allow clipboard access.');
         }
+      });
+    }
+    const quickRenameForm=document.getElementById('msQuickRenameForm');
+    if(quickRenameForm){
+      document.querySelectorAll('[data-ms-quick-rename]').forEach(button=>{
+        button.addEventListener('click',()=>{
+          const oldName=button.dataset.msQuickRename||'';
+          const newName=window.prompt('Rename column:',oldName);
+          if(newName===null)return;
+          const trimmed=newName.trim();
+          if(!trimmed||trimmed===oldName)return;
+          quickRenameForm.querySelector('input[name="column"]').value=oldName;
+          quickRenameForm.querySelector('input[name="new_name"]').value=trimmed;
+          quickRenameForm.submit();
+        });
       });
     }
     const list=document.querySelector('[data-ms-structure-columns]');
