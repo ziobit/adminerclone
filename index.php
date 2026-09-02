@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.21';
+const MS_VERSION = '1.11.22';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -3024,7 +3024,7 @@ try {
 
 function page_head(string $title, bool $authenticated): void {
   ?><!doctype html>
-<html lang="en" data-bs-theme="light" data-density="standard" data-scheme="ocean">
+<html lang="en" data-bs-theme="light" data-density="standard" data-scheme="ocean" data-raw-db-view="<?= ms_raw_db_view() ? 'true' : 'false' ?>">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3081,8 +3081,9 @@ function page_head(string $title, bool $authenticated): void {
           item.hidden = settings.menu[item.dataset.msMenu] === false;
         });
         const hiddenSidebarObjects = settings.hiddenSidebarObjects && typeof settings.hiddenSidebarObjects === 'object' && !Array.isArray(settings.hiddenSidebarObjects) ? settings.hiddenSidebarObjects : {};
+        const rawDbView = root.getAttribute('data-raw-db-view') === 'true';
         document.querySelectorAll('[data-ms-sidebar-object-key]').forEach(item => {
-          item.hidden = hiddenSidebarObjects[item.dataset.msSidebarObjectKey] === true;
+          item.hidden = rawDbView ? false : hiddenSidebarObjects[item.dataset.msSidebarObjectKey] === true;
         });
         document.querySelectorAll('[data-ms-sql-row-limit]').forEach(input => input.value = settings.sqlRows);
         document.querySelectorAll('[data-ms-sql-limit-label]').forEach(label => label.textContent = settings.sqlRows.toLocaleString());
@@ -3108,7 +3109,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-scheme="contrast"]{--ms-accent:#111827;--ms-accent-hover:#000;--ms-accent-rgb:17,24,39;--ms-accent-text:#fff;--ms-link:#111827}
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
-    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;padding:.38rem .5rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg)}.ms-raw-db-switch .form-check{min-height:0}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.ms-raw-db-switch.is-active{border-color:var(--bs-warning);background:var(--bs-warning-bg-subtle)}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.ms-col-header-name:hover,.ms-col-header-name:focus{color:var(--ms-accent);text-decoration:underline}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}
+    body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;padding:.38rem .5rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg)}.ms-raw-db-switch .form-check{min-height:0}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.ms-raw-db-switch.is-active{border-color:var(--bs-warning);background:var(--bs-warning-bg-subtle)}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.ms-col-header-name:hover,.ms-col-header-name:focus{color:var(--ms-accent);text-decoration:underline}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}.ms-sidebar-object-row{display:flex;align-items:center;gap:.2rem;padding:.08rem .12rem;border-bottom:1px solid rgba(var(--bs-secondary-rgb),.08)}.ms-sidebar-object-row:last-child{border-bottom:0}.ms-sidebar-object-name{display:flex;align-items:center;min-width:0;flex:1;padding:.18rem .2rem;color:var(--bs-body-color);text-decoration:none;border-radius:.25rem}.ms-sidebar-object-name:hover,.ms-sidebar-object-name:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-object-actions{display:inline-flex;flex:0 0 auto;align-items:center;gap:.05rem}.ms-sidebar-object-action{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;height:1.55rem;border-radius:.25rem;color:var(--bs-secondary-color);text-decoration:none}.ms-sidebar-object-action:hover,.ms-sidebar-object-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -3374,6 +3375,32 @@ function page_foot(): void {
       window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=settings.menu[key]!==false;});
     };
     selectCurrent();
+    const renderHiddenSidebarSettings=()=>{
+      const hidden=settings.hiddenSidebarObjects&&typeof settings.hiddenSidebarObjects==='object'&&!Array.isArray(settings.hiddenSidebarObjects)?settings.hiddenSidebarObjects:{};
+      const rows=Array.from(document.querySelectorAll('[data-ms-hidden-sidebar-row]'));
+      let shown=0;
+      rows.forEach(row=>{const isHidden=hidden[row.dataset.msHiddenSidebarKey]===true;row.hidden=!isHidden;if(isHidden)shown++;});
+      const empty=document.getElementById('ms-hidden-sidebar-empty');
+      const wrap=document.getElementById('ms-hidden-sidebar-table-wrap');
+      if(empty)empty.hidden=shown!==0;
+      if(wrap)wrap.hidden=shown===0;
+      const showAll=document.getElementById('ms-sidebar-show-all-hidden');
+      if(showAll)showAll.disabled=shown===0;
+    };
+    document.querySelectorAll('[data-ms-sidebar-restore]').forEach(button=>button.addEventListener('click',()=>{
+      const key=button.dataset.msSidebarRestore||'';
+      if(!key)return;
+      if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
+      delete settings.hiddenSidebarObjects[key];
+      window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();
+    }));
+    const showAllHidden=document.getElementById('ms-sidebar-show-all-hidden');
+    if(showAllHidden)showAllHidden.addEventListener('click',()=>{
+      if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
+      document.querySelectorAll('[data-ms-hidden-sidebar-row]').forEach(row=>delete settings.hiddenSidebarObjects[row.dataset.msHiddenSidebarKey]);
+      window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();
+    });
+    renderHiddenSidebarSettings();
     settingsForm.addEventListener('change',()=>{
       const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
       window.msSettingsMeta.menuKeys.forEach(key=>preview.menu[key]=settingsForm.querySelector(`[name="menu[${key}]"]`).checked);
@@ -3388,7 +3415,7 @@ function page_foot(): void {
     });
     document.getElementById('ms-menu-show-all').addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>settingsForm.querySelector(`[name="menu[${key}]"]`).checked=true);settingsForm.dispatchEvent(new Event('change'));});
     document.getElementById('ms-menu-hide-all').addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>settingsForm.querySelector(`[name="menu[${key}]"]`).checked=false);settingsForm.dispatchEvent(new Event('change'));});
-    document.getElementById('ms-settings-reset').addEventListener('click',()=>{settings=JSON.parse(JSON.stringify(window.msSettingsMeta.defaults));selectCurrent();window.msSaveSettings(settings);window.msApplySettings(settings);const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);});
+    document.getElementById('ms-settings-reset').addEventListener('click',()=>{settings=JSON.parse(JSON.stringify(window.msSettingsMeta.defaults));selectCurrent();window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);});
   }
   document.querySelectorAll('[data-ms-table-layout]').forEach(table=>{
     let nativeColumns=[];
@@ -3531,7 +3558,7 @@ function render_sidebar(): void {
           <input class="form-check-input m-0" type="checkbox" role="switch" id="ms-raw-db-view"<?= $rawDbView ? ' checked' : '' ?>>
           <label class="form-check-label small fw-semibold flex-grow-1" for="ms-raw-db-view"><i class="fa-solid fa-database me-1"></i>Raw DB view</label>
         </div>
-        <div class="small text-body-secondary mt-1">Ignore custom column views</div>
+        <div class="small text-body-secondary mt-1">Show all objects and ignore custom column views</div>
       </div>
     </div>
     <?php if ($dbName !== '') { ?><div class="small text-body-secondary mb-2 text-truncate" title="<?= h($dbName) ?>">Database: <strong><?= h($dbName) ?></strong></div><?php } ?>
@@ -3547,7 +3574,18 @@ function render_sidebar(): void {
         $login = is_array($_SESSION['ms_login'] ?? null) ? $_SESSION['ms_login'] : [];
         $sidebarServer = hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? '') . "\0" . (string)($login['user'] ?? ''));
         ?><hr><div class="small text-uppercase text-body-secondary mb-2">Objects</div><div class="list-group list-group-flush small">
-        <?php foreach ($tables as $t) { $name=(string)$t['TABLE_NAME']; $sidebarObjectKey=hash('sha256',$sidebarServer."\0".$dbName."\0".$name); ?><a class="list-group-item list-group-item-action bg-transparent px-1 text-truncate" data-ms-sidebar-object-key="<?= h($sidebarObjectKey) ?>" title="<?= h($name) ?>" href="?page=<?= $t['TABLE_TYPE']==='VIEW'?'select':'select' ?>&table=<?= urlencode($name) ?>"><i class="fa-solid <?= $t['TABLE_TYPE']==='VIEW'?'fa-eye':'fa-table' ?> fa-fw me-1"></i><?= h($name) ?></a><?php } ?>
+        <?php foreach ($tables as $t) {
+          $name=(string)$t['TABLE_NAME'];
+          $isBaseTable=(string)$t['TABLE_TYPE']==='BASE TABLE';
+          $sidebarObjectKey=hash('sha256',$sidebarServer."\0".$dbName."\0".$name);
+          ?><div class="ms-sidebar-object-row" data-ms-sidebar-object-key="<?= h($sidebarObjectKey) ?>">
+            <a class="ms-sidebar-object-name text-truncate" title="<?= h($name) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="fa-solid <?= $isBaseTable?'fa-table':'fa-eye' ?> fa-fw me-1"></i><span class="text-truncate"><?= h($name) ?></span></a>
+            <span class="ms-sidebar-object-actions">
+              <a class="ms-sidebar-object-action" href="?page=select&amp;table=<?= urlencode($name) ?>" title="Show content: <?= h($name) ?>" aria-label="Show content of <?= h($name) ?>"><i class="fa-solid fa-table-cells" aria-hidden="true"></i></a>
+              <?php if ($isBaseTable) { ?><a class="ms-sidebar-object-action" href="?page=structure&amp;table=<?= urlencode($name) ?>" title="Alter structure: <?= h($name) ?>" aria-label="Alter structure of <?= h($name) ?>"><i class="fa-solid fa-screwdriver-wrench" aria-hidden="true"></i></a><?php } ?>
+            </span>
+          </div><?php
+        } ?>
         </div><?php
       } catch (Throwable $ignored) {}
     } ?>
@@ -5527,6 +5565,24 @@ function page_settings(): void {
     'users' => ['fa-users-gear', 'Users & rights'],
     'variables' => ['fa-sliders', 'Variables']
   ];
+  $settingsSidebarObjects = [];
+  $settingsDbName = selected_db();
+  if ($settingsDbName !== '') {
+    try {
+      $settingsDb = connect_db();
+      $settingsTables = db_all($settingsDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
+      $login = is_array($_SESSION['ms_login'] ?? null) ? $_SESSION['ms_login'] : [];
+      $settingsSidebarServer = hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? '') . "\0" . (string)($login['user'] ?? ''));
+      foreach ($settingsTables as $settingsTable) {
+        $settingsName = (string)$settingsTable['TABLE_NAME'];
+        $settingsSidebarObjects[] = [
+          'name' => $settingsName,
+          'type' => (string)$settingsTable['TABLE_TYPE'],
+          'key' => hash('sha256', $settingsSidebarServer . "\0" . $settingsDbName . "\0" . $settingsName)
+        ];
+      }
+    } catch (Throwable $ignored) {}
+  }
   title_bar('Settings', 'Browser preferences plus server-side column display rules.');
   $updateCache = ms_update_cache_read();
   $updateCheckedAt = (int)($updateCache['checked_at'] ?? 0);
@@ -5577,6 +5633,16 @@ function page_settings(): void {
     <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
       <div class="col-md-6 col-xl-4"><label class="border rounded p-3 d-flex align-items-center gap-3 h-100"><input class="form-check-input mt-0" type="checkbox" name="menu[<?= h($key) ?>]" value="1"><i class="fa-solid <?= h($icon) ?> fa-fw text-primary"></i><span><?= h($label) ?></span></label></div>
     <?php } ?></div></div></section>
+
+    <section class="card mb-3" id="ms-hidden-sidebar-section"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-eye-slash me-2"></i>Hidden sidebar tables</h2><button class="btn btn-secondary btn-sm" type="button" id="ms-sidebar-show-all-hidden"><i class="fa-solid fa-eye me-1"></i>Show all</button></div><div class="card-body">
+      <p class="text-body-secondary">Tables and views hidden from the normal left sidebar are listed here so they can be re-enabled individually. Raw DB view always shows every object regardless of this setting.</p>
+      <?php if ($settingsDbName === '') { ?><div class="alert alert-secondary mb-0">Choose a database first to manage hidden sidebar tables.</div><?php } else { ?>
+        <div id="ms-hidden-sidebar-empty" class="alert alert-success mb-0"><i class="fa-solid fa-circle-check me-2"></i>No tables or views are hidden in <strong><?= h($settingsDbName) ?></strong>.</div>
+        <div class="table-responsive" id="ms-hidden-sidebar-table-wrap"><table class="table table-sm align-middle mb-0"><thead><tr><th>Name</th><th>Type</th><th class="text-end">Action</th></tr></thead><tbody><?php foreach ($settingsSidebarObjects as $settingsObject) { ?>
+          <tr data-ms-hidden-sidebar-row data-ms-hidden-sidebar-key="<?= h($settingsObject['key']) ?>" hidden><td><i class="fa-solid <?= $settingsObject['type']==='VIEW'?'fa-eye':'fa-table' ?> fa-fw me-2 text-body-secondary"></i><?= h($settingsObject['name']) ?></td><td><?= h($settingsObject['type']) ?></td><td class="text-end"><button class="btn btn-outline-primary btn-sm" type="button" data-ms-sidebar-restore="<?= h($settingsObject['key']) ?>"><i class="fa-solid fa-eye me-1"></i>Show</button></td></tr>
+        <?php } ?></tbody></table></div>
+      <?php } ?>
+    </div></section>
 
     <div class="d-flex flex-wrap gap-2"><button class="btn btn-primary" type="submit"><i class="fa-solid fa-floppy-disk me-1"></i>Save settings</button><button class="btn btn-secondary" type="button" id="ms-settings-reset"><i class="fa-solid fa-rotate-left me-1"></i>Restore defaults</button></div>
   </form><?php
