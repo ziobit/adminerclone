@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.19';
+const MS_VERSION = '1.11.20';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -3030,7 +3030,7 @@ function page_head(string $title, bool $authenticated): void {
       const menuKeys = ['databases','database','sql','export','schema','views','routines','triggers','events','processes','users','variables'];
       const defaultMenu = {};
       menuKeys.forEach(key => defaultMenu[key] = true);
-      const defaults = {theme:'light',density:'standard',scheme:'ocean',sqlRows:1000,selectRows:50,paginationPosition:'bottom',truncateCells:false,menu:defaultMenu,tableLayouts:{}};
+      const defaults = {theme:'light',density:'standard',scheme:'ocean',sqlRows:1000,selectRows:50,paginationPosition:'bottom',truncateCells:false,menu:defaultMenu,tableLayouts:{},hiddenSidebarObjects:{}};
       const storageKey = 'mysqlStudioSettings.v1';
       window.msSettingsMeta = {menuKeys,defaults,storageKey};
       const boundedInteger = (value, fallback, minimum, maximum) => {
@@ -3050,9 +3050,10 @@ function page_head(string $title, bool $authenticated): void {
         const paginationPosition = ['top','bottom','both'].includes(stored.paginationPosition) ? stored.paginationPosition : defaults.paginationPosition;
         const truncateCells = stored.truncateCells === true;
         const tableLayouts = stored.tableLayouts && typeof stored.tableLayouts === 'object' && !Array.isArray(stored.tableLayouts) ? stored.tableLayouts : {};
+        const hiddenSidebarObjects = stored.hiddenSidebarObjects && typeof stored.hiddenSidebarObjects === 'object' && !Array.isArray(stored.hiddenSidebarObjects) ? stored.hiddenSidebarObjects : {};
         const menu = {...defaultMenu};
         if (stored.menu && typeof stored.menu === 'object') menuKeys.forEach(key => menu[key] = stored.menu[key] !== false);
-        return {theme,density,scheme,sqlRows,selectRows,paginationPosition,truncateCells,menu,tableLayouts};
+        return {theme,density,scheme,sqlRows,selectRows,paginationPosition,truncateCells,menu,tableLayouts,hiddenSidebarObjects};
       };
       window.msSyncSettingsCookies = settings => {
         const secure = location.protocol === 'https:' ? '; Secure' : '';
@@ -3073,6 +3074,10 @@ function page_head(string $title, bool $authenticated): void {
         root.setAttribute('data-pagination-position', settings.paginationPosition);
         document.querySelectorAll('[data-ms-menu]').forEach(item => {
           item.hidden = settings.menu[item.dataset.msMenu] === false;
+        });
+        const hiddenSidebarObjects = settings.hiddenSidebarObjects && typeof settings.hiddenSidebarObjects === 'object' && !Array.isArray(settings.hiddenSidebarObjects) ? settings.hiddenSidebarObjects : {};
+        document.querySelectorAll('[data-ms-sidebar-object-key]').forEach(item => {
+          item.hidden = hiddenSidebarObjects[item.dataset.msSidebarObjectKey] === true;
         });
         document.querySelectorAll('[data-ms-sql-row-limit]').forEach(input => input.value = settings.sqlRows);
         document.querySelectorAll('[data-ms-sql-limit-label]').forEach(label => label.textContent = settings.sqlRows.toLocaleString());
@@ -3318,6 +3323,18 @@ function page_foot(): void {
   }));
   let settings=window.msLoadSettings();
   window.msApplySettings(settings);
+  document.querySelectorAll('[data-ms-sidebar-object-toggle]').forEach(toggle=>{
+    const key=toggle.dataset.msSidebarObjectToggle||'';
+    if(!key)return;
+    if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
+    toggle.checked=settings.hiddenSidebarObjects[key]!==true;
+    toggle.addEventListener('change',()=>{
+      if(toggle.checked)delete settings.hiddenSidebarObjects[key];
+      else settings.hiddenSidebarObjects[key]=true;
+      window.msSaveSettings(settings);
+      window.msApplySettings(settings);
+    });
+  });
   document.querySelectorAll('[data-ms-page-jump]').forEach(input => {
     const goToPage = () => {
       const max = Math.max(1, Number.parseInt(input.dataset.msPages || '1', 10) || 1);
@@ -3353,13 +3370,13 @@ function page_foot(): void {
     };
     selectCurrent();
     settingsForm.addEventListener('change',()=>{
-      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{}};
+      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
       window.msSettingsMeta.menuKeys.forEach(key=>preview.menu[key]=settingsForm.querySelector(`[name="menu[${key}]"]`).checked);
       window.msApplySettings(preview);
     });
     settingsForm.addEventListener('submit',event=>{
       event.preventDefault();
-      settings={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{}};
+      settings={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
       window.msSettingsMeta.menuKeys.forEach(key=>settings.menu[key]=settingsForm.querySelector(`[name="menu[${key}]"]`).checked);
       window.msSaveSettings(settings);window.msApplySettings(settings);
       const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);
@@ -3522,8 +3539,10 @@ function render_sidebar(): void {
       try {
         $sideDb = connect_db();
         $tables = db_all($sideDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
+        $login = is_array($_SESSION['ms_login'] ?? null) ? $_SESSION['ms_login'] : [];
+        $sidebarServer = hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? '') . "\0" . (string)($login['user'] ?? ''));
         ?><hr><div class="small text-uppercase text-body-secondary mb-2">Objects</div><div class="list-group list-group-flush small">
-        <?php foreach ($tables as $t) { $name=(string)$t['TABLE_NAME']; ?><a class="list-group-item list-group-item-action bg-transparent px-1 text-truncate" title="<?= h($name) ?>" href="?page=<?= $t['TABLE_TYPE']==='VIEW'?'select':'select' ?>&table=<?= urlencode($name) ?>"><i class="fa-solid <?= $t['TABLE_TYPE']==='VIEW'?'fa-eye':'fa-table' ?> fa-fw me-1"></i><?= h($name) ?></a><?php } ?>
+        <?php foreach ($tables as $t) { $name=(string)$t['TABLE_NAME']; $sidebarObjectKey=hash('sha256',$sidebarServer."\0".$dbName."\0".$name); ?><a class="list-group-item list-group-item-action bg-transparent px-1 text-truncate" data-ms-sidebar-object-key="<?= h($sidebarObjectKey) ?>" title="<?= h($name) ?>" href="?page=<?= $t['TABLE_TYPE']==='VIEW'?'select':'select' ?>&table=<?= urlencode($name) ?>"><i class="fa-solid <?= $t['TABLE_TYPE']==='VIEW'?'fa-eye':'fa-table' ?> fa-fw me-1"></i><?= h($name) ?></a><?php } ?>
         </div><?php
       } catch (Throwable $ignored) {}
     } ?>
@@ -4296,7 +4315,7 @@ function page_select(mysqli $db): void {
   $layoutColumns=$allColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
-  $actions='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
+  $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($layoutKey).'" checked><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> <a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   title_bar($table,number_format($total).' result(s)',$actions);
@@ -5547,7 +5566,7 @@ function page_settings(): void {
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
       <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
-      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order and widths are saved automatically for each server, database and table. A schema mismatch discards that table’s saved layout and restores its natural column layout.</div></div>
+      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order, widths, and per-table left-sidebar visibility are saved automatically for each server, database and table. Restore defaults also makes all tables visible in the sidebar again. A schema mismatch discards that table’s saved column layout and restores its natural column layout.</div></div>
     </div></div></section>
 
     <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
