@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.12.0';
+const MS_VERSION = '1.12.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -467,15 +467,24 @@ function ms_profile_update_settings(array $settings): void {
   });
 }
 
-function ms_profile_create(string $name): void {
+function ms_profile_create(string $name, bool $copyCurrent = true): void {
   $name = ms_profile_validate_name($name);
-  ms_profile_config_mutate(static function (array $config) use ($name): array {
+  $currentName = ms_active_profile_name();
+  ms_profile_config_mutate(static function (array $config) use ($name, $copyCurrent, $currentName): array {
     foreach (array_keys($config['profiles']) as $existing) {
       if (strcasecmp((string)$existing, $name) === 0) {
         throw new RuntimeException('A profile with that name already exists.');
       }
     }
-    $config['profiles'][$name] = ms_profile_default_data();
+
+    if ($copyCurrent && isset($config['profiles'][$currentName]) && is_array($config['profiles'][$currentName])) {
+      // Profiles are plain PHP arrays after JSON decoding, so this assignment is
+      // a complete independent copy: settings, server/table rules, widths,
+      // saved searches and every future profile-scoped value are duplicated.
+      $config['profiles'][$name] = $config['profiles'][$currentName];
+    } else {
+      $config['profiles'][$name] = ms_profile_default_data();
+    }
     return $config;
   });
   ms_set_active_profile($name);
@@ -2563,7 +2572,7 @@ try {
       }
 
       if ($action === 'create_profile') {
-        ms_profile_create(p('profile_name'));
+        ms_profile_create(p('profile_name'), p('copy_current') === '1');
         go(['page' => 'settings'], 'Profile created: ' . ms_active_profile_name() . '.');
       }
 
@@ -6038,9 +6047,9 @@ function page_settings(): void {
   </div></section>
   <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-user-gear me-2"></i>Profiles</h2></div><div class="card-body">
     <div class="row g-3 align-items-end"><div class="col-lg-4"><div class="small text-body-secondary">Active profile</div><div class="fs-5 fw-semibold"><?= h($activeProfile) ?></div><div class="form-text">Configuration file: <code><?= h(ms_profile_config_file()) ?></code></div></div>
-    <div class="col-lg-4"><form method="post" class="row g-2"><input type="hidden" name="action" value="create_profile"><?= csrf_field() ?><div class="col"><label class="form-label">New profile</label><input class="form-control" name="profile_name" maxlength="80" required></div><div class="col-auto align-self-end"><button class="btn btn-primary"><i class="fa-solid fa-plus me-1"></i>Create</button></div></form></div>
+    <div class="col-lg-4"><form method="post" class="row g-2"><input type="hidden" name="action" value="create_profile"><?= csrf_field() ?><div class="col-12"><label class="form-label">New profile</label><div class="input-group"><input class="form-control" name="profile_name" maxlength="80" required><button class="btn btn-primary"><i class="fa-solid fa-plus me-1"></i>Create</button></div></div><div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="copy_current" id="profile-copy-current" value="1" checked><label class="form-check-label" for="profile-copy-current">Copy current settings to new profile</label></div></div></form></div>
     <?php if($activeProfile!=='Default'){ ?><div class="col-lg-4"><div class="d-flex flex-wrap gap-2"><form method="post" class="d-flex gap-2 flex-grow-1"><input type="hidden" name="action" value="rename_profile"><?= csrf_field() ?><input class="form-control" name="profile_name" value="<?= h($activeProfile) ?>" maxlength="80" required><button class="btn btn-secondary text-nowrap"><i class="fa-solid fa-pen me-1"></i>Rename</button></form><form method="post"><input type="hidden" name="action" value="delete_profile"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete profile <?= h($activeProfile) ?> and all of its settings?"><i class="fa-solid fa-trash"></i></button></form></div></div><?php } ?>
-    </div><div class="form-text mt-3">Default always exists. New profiles start with clean defaults. No legacy configuration is imported.</div>
+    </div><div class="form-text mt-3">Default always exists. New profiles copy the complete active profile by default; turn the switch off to start from clean defaults. No legacy configuration is imported.</div>
   </div></section>
   <form id="ms-settings-form" method="post"><input type="hidden" name="action" value="save_profile_settings"><?= csrf_field() ?>
     <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-circle-half-stroke me-2"></i>Appearance mode</h2></div><div class="card-body"><div class="row g-3">
