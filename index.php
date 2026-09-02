@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.20';
+const MS_VERSION = '1.11.21';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2525,9 +2525,14 @@ try {
         if ($sourceName === '' || !in_array($sourceName, $columnNames, true)) {
           throw new RuntimeException('Column not found.');
         }
+        $cloneBaseName = $sourceName;
         $suffix = 1;
+        if (preg_match('/^(.*)-(\d+)$/', $sourceName, $cloneNameMatch) === 1 && (string)$cloneNameMatch[1] !== '') {
+          $cloneBaseName = (string)$cloneNameMatch[1];
+          $suffix = max(1, (int)$cloneNameMatch[2] + 1);
+        }
         do {
-          $newName = $sourceName . '-' . $suffix;
+          $newName = $cloneBaseName . '-' . $suffix;
           $suffix++;
         } while (in_array($newName, $columnNames, true));
         $definition = exact_column_definition($db, $table, $sourceName);
