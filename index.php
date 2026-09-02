@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.11.22';
+const MS_VERSION = '1.12.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -70,7 +70,8 @@ function browser_setting_int(string $cookie, int $default, int $minimum, int $ma
 }
 
 function ms_raw_db_view(): bool {
-  return isset($_COOKIE['mysqlStudioRawDbView']) && !is_array($_COOKIE['mysqlStudioRawDbView']) && (string)$_COOKIE['mysqlStudioRawDbView'] === '1';
+  $settings = ms_profile_settings();
+  return !empty($settings['rawDbView']);
 }
 
 function csrf_field(): string {
@@ -241,18 +242,17 @@ function ms_update_cache_write(array $cache): void {
 }
 
 /**
- * Server-side column display configuration.
+ * Profile-based configuration.
  *
- * This is intentionally stored in the system temporary directory, beside the
- * updater runtime files, so database/table display rules are not normally
- * web-accessible. Rules are separated by connection, database and table.
+ * This is a deliberately new format. No legacy configuration is imported or
+ * interpreted. Every configurable preference lives below a named profile.
  */
-function ms_column_config_file(): string {
-  return ms_update_runtime_file('column-display.json');
+function ms_profile_config_file(): string {
+  return ms_update_runtime_file('profiles.json');
 }
 
-function ms_column_config_lock_file(): string {
-  return ms_update_runtime_file('column-display.lock');
+function ms_profile_config_lock_file(): string {
+  return ms_update_runtime_file('profiles.lock');
 }
 
 function ms_server_config_key(): string {
@@ -265,55 +265,130 @@ function ms_server_config_key(): string {
   );
 }
 
-function ms_column_config_read(): array {
-  $raw = @file_get_contents(ms_column_config_file());
+function ms_profile_default_settings(): array {
+  return [
+    'theme' => 'light',
+    'density' => 'standard',
+    'scheme' => 'ocean',
+    'sqlRows' => 1000,
+    'selectRows' => 50,
+    'paginationPosition' => 'bottom',
+    'truncateCells' => false,
+    'rawDbView' => false,
+    'schemaColumnWidth' => 3,
+    'menu' => [
+      'databases' => true,
+      'database' => true,
+      'sql' => true,
+      'export' => true,
+      'schema' => true,
+      'views' => true,
+      'routines' => true,
+      'triggers' => true,
+      'events' => true,
+      'processes' => true,
+      'users' => true,
+      'variables' => true
+    ]
+  ];
+}
+
+function ms_profile_default_data(): array {
+  return ['settings' => ms_profile_default_settings(), 'servers' => []];
+}
+
+function ms_profile_normalize_settings(array $source): array {
+  $defaults = ms_profile_default_settings();
+  $themes = ['light', 'dark'];
+  $densities = ['ultracompact', 'compact', 'standard', 'large'];
+  $schemes = ['ocean','indigo','emerald','teal','ruby','amber','violet','rose','slate','contrast'];
+  $pagination = ['top','bottom','both'];
+  $settings = $defaults;
+  $settings['theme'] = in_array((string)($source['theme'] ?? ''), $themes, true) ? (string)$source['theme'] : $defaults['theme'];
+  $settings['density'] = in_array((string)($source['density'] ?? ''), $densities, true) ? (string)$source['density'] : $defaults['density'];
+  $settings['scheme'] = in_array((string)($source['scheme'] ?? ''), $schemes, true) ? (string)$source['scheme'] : $defaults['scheme'];
+  $settings['sqlRows'] = max(1, min(100000, (int)($source['sqlRows'] ?? $defaults['sqlRows'])));
+  $settings['selectRows'] = max(1, min(500, (int)($source['selectRows'] ?? $defaults['selectRows'])));
+  $settings['paginationPosition'] = in_array((string)($source['paginationPosition'] ?? ''), $pagination, true) ? (string)$source['paginationPosition'] : $defaults['paginationPosition'];
+  $settings['truncateCells'] = !empty($source['truncateCells']);
+  $settings['rawDbView'] = !empty($source['rawDbView']);
+  $schemaWidth = (int)($source['schemaColumnWidth'] ?? $defaults['schemaColumnWidth']);
+  $settings['schemaColumnWidth'] = in_array($schemaWidth, [2,3,4,6,12], true) ? $schemaWidth : $defaults['schemaColumnWidth'];
+  $sourceMenu = isset($source['menu']) && is_array($source['menu']) ? $source['menu'] : [];
+  foreach ($defaults['menu'] as $key => $enabled) {
+    $settings['menu'][$key] = !array_key_exists($key, $sourceMenu) || $sourceMenu[$key] !== false;
+  }
+  return $settings;
+}
+
+function ms_profile_config_read(): array {
+  $empty = ['version' => 2, 'profiles' => ['Default' => ms_profile_default_data()]];
+  $raw = @file_get_contents(ms_profile_config_file());
   if (!is_string($raw) || trim($raw) === '') {
-    return ['version' => 1, 'servers' => []];
+    return $empty;
   }
   $decoded = json_decode($raw, true);
-  if (!is_array($decoded)) {
-    return ['version' => 1, 'servers' => []];
+  if (!is_array($decoded) || (int)($decoded['version'] ?? 0) !== 2 || !isset($decoded['profiles']) || !is_array($decoded['profiles'])) {
+    return $empty;
   }
-  if (!isset($decoded['servers']) || !is_array($decoded['servers'])) {
-    $decoded['servers'] = [];
+  if (!isset($decoded['profiles']['Default']) || !is_array($decoded['profiles']['Default'])) {
+    $decoded['profiles']['Default'] = ms_profile_default_data();
   }
-  $decoded['version'] = 1;
+  foreach ($decoded['profiles'] as $name => $profile) {
+    if (!is_string($name) || $name === '' || !is_array($profile)) {
+      unset($decoded['profiles'][$name]);
+      continue;
+    }
+    $decoded['profiles'][$name]['settings'] = ms_profile_normalize_settings(isset($profile['settings']) && is_array($profile['settings']) ? $profile['settings'] : []);
+    if (!isset($decoded['profiles'][$name]['servers']) || !is_array($decoded['profiles'][$name]['servers'])) {
+      $decoded['profiles'][$name]['servers'] = [];
+    }
+  }
+  $decoded['version'] = 2;
   return $decoded;
 }
 
-function ms_column_config_mutate(callable $mutator): void {
-  $lock = @fopen(ms_column_config_lock_file(), 'c');
+function ms_profile_config_ensure(): void {
+  if (is_file(ms_profile_config_file())) return;
+  ms_profile_config_mutate(static function (array $config): array { return $config; });
+}
+
+function ms_profile_config_mutate(callable $mutator): void {
+  $lock = @fopen(ms_profile_config_lock_file(), 'c');
   if ($lock === false) {
-    throw new RuntimeException('Unable to open the column-display configuration lock file.');
+    throw new RuntimeException('Unable to open the profile configuration lock file.');
   }
   if (!@flock($lock, LOCK_EX)) {
     fclose($lock);
-    throw new RuntimeException('Unable to lock the column-display configuration.');
+    throw new RuntimeException('Unable to lock the profile configuration.');
   }
   try {
-    $config = ms_column_config_read();
+    $config = ms_profile_config_read();
     $updated = $mutator($config);
     if (!is_array($updated)) {
-      throw new RuntimeException('The column-display configuration update is invalid.');
+      throw new RuntimeException('The profile configuration update is invalid.');
     }
-    $updated['version'] = 1;
-    if (!isset($updated['servers']) || !is_array($updated['servers'])) {
-      $updated['servers'] = [];
+    $updated['version'] = 2;
+    if (!isset($updated['profiles']) || !is_array($updated['profiles'])) {
+      $updated['profiles'] = [];
+    }
+    if (!isset($updated['profiles']['Default']) || !is_array($updated['profiles']['Default'])) {
+      $updated['profiles']['Default'] = ms_profile_default_data();
     }
     $json = json_encode($updated, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) {
-      throw new RuntimeException('Unable to encode the column-display configuration.');
+      throw new RuntimeException('Unable to encode the profile configuration.');
     }
-    $path = ms_column_config_file();
+    $path = ms_profile_config_file();
     $temporary = $path . '.tmp-' . bin2hex(random_bytes(5));
     $written = @file_put_contents($temporary, $json . "\n", LOCK_EX);
     if ($written === false) {
       @unlink($temporary);
-      throw new RuntimeException('Unable to write the column-display configuration.');
+      throw new RuntimeException('Unable to write the profile configuration.');
     }
     if (!@rename($temporary, $path)) {
       @unlink($temporary);
-      throw new RuntimeException('Unable to replace the column-display configuration.');
+      throw new RuntimeException('Unable to replace the profile configuration.');
     }
   } finally {
     @flock($lock, LOCK_UN);
@@ -321,146 +396,396 @@ function ms_column_config_mutate(callable $mutator): void {
   }
 }
 
-function ms_column_view_table_config(string $database, string $table): array {
-  $config = ms_column_config_read();
-  $serverKey = ms_server_config_key();
-  $tableConfig = $config['servers'][$serverKey]['databases'][$database]['tables'][$table] ?? [];
-  if (!is_array($tableConfig)) {
-    return [];
+function ms_profile_names(): array {
+  $config = ms_profile_config_read();
+  $names = array_values(array_map('strval', array_keys($config['profiles'])));
+  usort($names, static function (string $a, string $b): int {
+    if ($a === 'Default') return -1;
+    if ($b === 'Default') return 1;
+    return strcasecmp($a, $b);
+  });
+  return $names;
+}
+
+function ms_profile_validate_name(string $name): string {
+  $name = trim($name);
+  if ($name === '' || preg_match('/[\x00-\x1F\x7F]/', $name) === 1) {
+    throw new RuntimeException('Profile name is required.');
   }
-  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
-    if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) {
-      $tableConfig[$key] = [];
+  $length = preg_match_all('/./us', $name, $chars);
+  if ($length === false || $length > 80) {
+    throw new RuntimeException('Profile name must be valid UTF-8 and 80 characters or fewer.');
+  }
+  return $name;
+}
+
+function ms_active_profile_name(): string {
+  $config = ms_profile_config_read();
+  $candidate = isset($_SESSION['ms_profile']) ? (string)$_SESSION['ms_profile'] : '';
+  if ($candidate === '' && isset($_COOKIE['mysqlStudioProfile']) && !is_array($_COOKIE['mysqlStudioProfile'])) {
+    $candidate = (string)$_COOKIE['mysqlStudioProfile'];
+  }
+  if ($candidate === '' || !isset($config['profiles'][$candidate])) {
+    $candidate = 'Default';
+  }
+  $_SESSION['ms_profile'] = $candidate;
+  return $candidate;
+}
+
+function ms_set_active_profile(string $name): void {
+  $name = ms_profile_validate_name($name);
+  $config = ms_profile_config_read();
+  if (!isset($config['profiles'][$name])) {
+    throw new RuntimeException('Profile not found.');
+  }
+  $_SESSION['ms_profile'] = $name;
+  $secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+  setcookie('mysqlStudioProfile', $name, time() + 31536000, '/', '', $secure, true);
+}
+
+function ms_profile_settings(): array {
+  $config = ms_profile_config_read();
+  $name = ms_active_profile_name();
+  $profile = isset($config['profiles'][$name]) && is_array($config['profiles'][$name]) ? $config['profiles'][$name] : ms_profile_default_data();
+  return ms_profile_normalize_settings(isset($profile['settings']) && is_array($profile['settings']) ? $profile['settings'] : []);
+}
+
+function ms_profile_setting_int(string $key, int $default, int $minimum, int $maximum): int {
+  $settings = ms_profile_settings();
+  return max($minimum, min($maximum, (int)($settings[$key] ?? $default)));
+}
+
+function ms_profile_update_settings(array $settings): void {
+  $name = ms_active_profile_name();
+  $normalized = ms_profile_normalize_settings($settings);
+  ms_profile_config_mutate(static function (array $config) use ($name, $normalized): array {
+    if (!isset($config['profiles'][$name]) || !is_array($config['profiles'][$name])) {
+      $config['profiles'][$name] = ms_profile_default_data();
     }
+    $config['profiles'][$name]['settings'] = $normalized;
+    return $config;
+  });
+}
+
+function ms_profile_create(string $name): void {
+  $name = ms_profile_validate_name($name);
+  ms_profile_config_mutate(static function (array $config) use ($name): array {
+    foreach (array_keys($config['profiles']) as $existing) {
+      if (strcasecmp((string)$existing, $name) === 0) {
+        throw new RuntimeException('A profile with that name already exists.');
+      }
+    }
+    $config['profiles'][$name] = ms_profile_default_data();
+    return $config;
+  });
+  ms_set_active_profile($name);
+}
+
+function ms_profile_rename(string $newName): void {
+  $oldName = ms_active_profile_name();
+  if ($oldName === 'Default') {
+    throw new RuntimeException('The Default profile cannot be renamed.');
+  }
+  $newName = ms_profile_validate_name($newName);
+  ms_profile_config_mutate(static function (array $config) use ($oldName, $newName): array {
+    foreach (array_keys($config['profiles']) as $existing) {
+      if ((string)$existing !== $oldName && strcasecmp((string)$existing, $newName) === 0) {
+        throw new RuntimeException('A profile with that name already exists.');
+      }
+    }
+    if (!isset($config['profiles'][$oldName])) {
+      throw new RuntimeException('Profile not found.');
+    }
+    $profile = $config['profiles'][$oldName];
+    unset($config['profiles'][$oldName]);
+    $config['profiles'][$newName] = $profile;
+    return $config;
+  });
+  ms_set_active_profile($newName);
+}
+
+function ms_profile_delete_active(): void {
+  $name = ms_active_profile_name();
+  if ($name === 'Default') {
+    throw new RuntimeException('The Default profile cannot be deleted.');
+  }
+  ms_profile_config_mutate(static function (array $config) use ($name): array {
+    unset($config['profiles'][$name]);
+    return $config;
+  });
+  ms_set_active_profile('Default');
+}
+
+function ms_profile_reset_active(): void {
+  $name = ms_active_profile_name();
+  ms_profile_config_mutate(static function (array $config) use ($name): array {
+    $config['profiles'][$name] = ms_profile_default_data();
+    return $config;
+  });
+}
+
+function ms_profile_database_config(string $database): array {
+  $config = ms_profile_config_read();
+  $profile = ms_active_profile_name();
+  $serverKey = ms_server_config_key();
+  $databaseConfig = $config['profiles'][$profile]['servers'][$serverKey]['databases'][$database] ?? [];
+  return is_array($databaseConfig) ? $databaseConfig : [];
+}
+
+function ms_profile_update_database(string $database, callable $mutator): void {
+  $profile = ms_active_profile_name();
+  ms_profile_config_mutate(static function (array $config) use ($profile, $database, $mutator): array {
+    $serverKey = ms_server_config_key();
+    if (!isset($config['profiles'][$profile]) || !is_array($config['profiles'][$profile])) {
+      $config['profiles'][$profile] = ms_profile_default_data();
+    }
+    if (!isset($config['profiles'][$profile]['servers'][$serverKey]) || !is_array($config['profiles'][$profile]['servers'][$serverKey])) {
+      $config['profiles'][$profile]['servers'][$serverKey] = ['databases' => []];
+    }
+    if (!isset($config['profiles'][$profile]['servers'][$serverKey]['databases']) || !is_array($config['profiles'][$profile]['servers'][$serverKey]['databases'])) {
+      $config['profiles'][$profile]['servers'][$serverKey]['databases'] = [];
+    }
+    $current = $config['profiles'][$profile]['servers'][$serverKey]['databases'][$database] ?? [];
+    if (!is_array($current)) $current = [];
+    if (!isset($current['tables']) || !is_array($current['tables'])) $current['tables'] = [];
+    if (!isset($current['hidden_sidebar']) || !is_array($current['hidden_sidebar'])) $current['hidden_sidebar'] = [];
+    $current = $mutator($current);
+    if (empty($current['tables'])) unset($current['tables']);
+    if (empty($current['hidden_sidebar'])) unset($current['hidden_sidebar']);
+    if ($current) {
+      $config['profiles'][$profile]['servers'][$serverKey]['databases'][$database] = $current;
+    } else {
+      unset($config['profiles'][$profile]['servers'][$serverKey]['databases'][$database]);
+    }
+    return $config;
+  });
+}
+
+function ms_profile_table_config(string $database, string $table): array {
+  $databaseConfig = ms_profile_database_config($database);
+  $tableConfig = $databaseConfig['tables'][$table] ?? [];
+  return is_array($tableConfig) ? $tableConfig : [];
+}
+
+function ms_profile_update_table(string $database, string $table, callable $mutator): void {
+  ms_profile_update_database($database, static function (array $databaseConfig) use ($table, $mutator): array {
+    $current = $databaseConfig['tables'][$table] ?? [];
+    if (!is_array($current)) $current = [];
+    $current = $mutator($current);
+    if ($current) $databaseConfig['tables'][$table] = $current;
+    else unset($databaseConfig['tables'][$table]);
+    return $databaseConfig;
+  });
+}
+
+function ms_profile_hidden_sidebar(string $database): array {
+  $databaseConfig = ms_profile_database_config($database);
+  $hidden = isset($databaseConfig['hidden_sidebar']) && is_array($databaseConfig['hidden_sidebar']) ? $databaseConfig['hidden_sidebar'] : [];
+  return array_filter($hidden, static function ($value): bool { return $value === true; });
+}
+
+function ms_profile_set_sidebar_visibility(string $database, string $table, bool $visible): void {
+  ms_profile_update_database($database, static function (array $databaseConfig) use ($table, $visible): array {
+    if (!isset($databaseConfig['hidden_sidebar']) || !is_array($databaseConfig['hidden_sidebar'])) $databaseConfig['hidden_sidebar'] = [];
+    if ($visible) unset($databaseConfig['hidden_sidebar'][$table]);
+    else $databaseConfig['hidden_sidebar'][$table] = true;
+    return $databaseConfig;
+  });
+}
+
+function ms_profile_table_layout(string $database, string $table): array {
+  $tableConfig = ms_profile_table_config($database, $table);
+  $layout = $tableConfig['layout'] ?? [];
+  return is_array($layout) ? $layout : [];
+}
+
+function ms_profile_set_table_order(string $database, string $table, array $order, array $columns): void {
+  $allowed = array_values(array_map('strval', $columns));
+  $clean = [];
+  foreach ($order as $column) {
+    $column = (string)$column;
+    if (in_array($column, $allowed, true) && !in_array($column, $clean, true)) $clean[] = $column;
+  }
+  foreach ($allowed as $column) if (!in_array($column, $clean, true)) $clean[] = $column;
+  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($clean): array {
+    $layout = isset($tableConfig['layout']) && is_array($tableConfig['layout']) ? $tableConfig['layout'] : [];
+    $layout['order'] = $clean;
+    $tableConfig['layout'] = $layout;
+    return $tableConfig;
+  });
+}
+
+function ms_profile_set_table_widths(string $database, string $table, array $widths, array $columns): void {
+  $allowed = array_values(array_map('strval', $columns));
+  $clean = [];
+  foreach ($widths as $column => $width) {
+    $column = (string)$column;
+    $numeric = (int)$width;
+    if (in_array($column, $allowed, true) && $numeric >= 48 && $numeric <= 1200) $clean[$column] = $numeric;
+  }
+  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($clean): array {
+    $layout = isset($tableConfig['layout']) && is_array($tableConfig['layout']) ? $tableConfig['layout'] : [];
+    $existing = isset($layout['widths']) && is_array($layout['widths']) ? $layout['widths'] : [];
+    foreach ($clean as $column => $width) $existing[$column] = $width;
+    $layout['widths'] = $existing;
+    $tableConfig['layout'] = $layout;
+    return $tableConfig;
+  });
+}
+
+function ms_profile_table_saved_searches(string $database, string $table): array {
+  $tableConfig = ms_profile_table_config($database, $table);
+  $searches = $tableConfig['saved_searches'] ?? [];
+  if (!is_array($searches)) return [];
+  uksort($searches, 'strnatcasecmp');
+  return $searches;
+}
+
+function ms_saved_search_name(string $name): string {
+  $name = trim($name);
+  $length = preg_match_all('/./us', $name, $chars);
+  if ($name === '' || $length === false || $length > 100) {
+    throw new RuntimeException('Saved search name is required and must be 100 characters or fewer.');
+  }
+  return $name;
+}
+
+function ms_saved_search_normalize(array $source, array $columnNames): array {
+  $allowed = array_values(array_map('strval', $columnNames));
+  $result = [];
+  $filterCols = isset($source['filter_col']) && is_array($source['filter_col']) ? array_slice($source['filter_col'], 0, 3) : [];
+  $filterOps = isset($source['filter_op']) && is_array($source['filter_op']) ? array_slice($source['filter_op'], 0, 3) : [];
+  $filterVals = isset($source['filter_val']) && is_array($source['filter_val']) ? array_slice($source['filter_val'], 0, 3) : [];
+  $validOps = ['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'];
+  $outCols = []; $outOps = []; $outVals = [];
+  for ($i = 0; $i < 3; $i++) {
+    $column = (string)($filterCols[$i] ?? '');
+    if ($column === '' || !in_array($column, $allowed, true)) continue;
+    $op = (string)($filterOps[$i] ?? '=');
+    if (!in_array($op, $validOps, true)) $op = '=';
+    $outCols[] = $column; $outOps[] = $op; $outVals[] = (string)($filterVals[$i] ?? '');
+  }
+  if ($outCols) {
+    $result['filter_col'] = $outCols; $result['filter_op'] = $outOps; $result['filter_val'] = $outVals;
+  }
+  $aggregate = strtoupper((string)($source['aggregate'] ?? ''));
+  if (in_array($aggregate, ['COUNT','SUM','AVG','MIN','MAX'], true)) {
+    $aggregateColumn = (string)($source['aggregate_column'] ?? '');
+    if (in_array($aggregateColumn, $allowed, true)) {
+      $result['aggregate'] = $aggregate;
+      $result['aggregate_column'] = $aggregateColumn;
+      $group = (string)($source['group_column'] ?? '');
+      if ($group !== '' && in_array($group, $allowed, true)) $result['group_column'] = $group;
+    }
+  }
+  $orderCols = isset($source['order_col']) && is_array($source['order_col']) ? array_slice($source['order_col'], 0, 2) : [];
+  $orderDirs = isset($source['order_dir']) && is_array($source['order_dir']) ? array_slice($source['order_dir'], 0, 2) : [];
+  $cleanOrderCols = []; $cleanOrderDirs = [];
+  foreach ($orderCols as $i => $column) {
+    $column = (string)$column;
+    if (!in_array($column, $allowed, true)) continue;
+    $cleanOrderCols[] = $column;
+    $cleanOrderDirs[] = strtoupper((string)($orderDirs[$i] ?? 'ASC')) === 'DESC' ? 'DESC' : 'ASC';
+  }
+  if ($cleanOrderCols) {
+    $result['order_col'] = $cleanOrderCols; $result['order_dir'] = $cleanOrderDirs;
+  }
+  $result['limit'] = max(1, min(500, (int)($source['limit'] ?? ms_profile_setting_int('selectRows', MS_ROWS_PER_PAGE, 1, 500))));
+  if (!empty($source['show_all']) && (string)$source['show_all'] === '1') $result['show_all'] = '1';
+  return $result;
+}
+
+function ms_profile_save_search(string $database, string $table, string $name, array $query): void {
+  $name = ms_saved_search_name($name);
+  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($name, $query): array {
+    if (!isset($tableConfig['saved_searches']) || !is_array($tableConfig['saved_searches'])) $tableConfig['saved_searches'] = [];
+    $tableConfig['saved_searches'][$name] = $query;
+    return $tableConfig;
+  });
+}
+
+function ms_profile_delete_search(string $database, string $table, string $name): void {
+  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($name): array {
+    if (isset($tableConfig['saved_searches']) && is_array($tableConfig['saved_searches'])) {
+      unset($tableConfig['saved_searches'][$name]);
+      if (!$tableConfig['saved_searches']) unset($tableConfig['saved_searches']);
+    }
+    return $tableConfig;
+  });
+}
+
+function ms_column_view_table_config(string $database, string $table): array {
+  $tableConfig = ms_profile_table_config($database, $table);
+  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
+    if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) $tableConfig[$key] = [];
   }
   return $tableConfig;
 }
 
 function ms_column_view_database_config(string $database): array {
-  $config = ms_column_config_read();
-  $serverKey = ms_server_config_key();
-  $databaseConfig = $config['servers'][$serverKey]['databases'][$database] ?? [];
-  return is_array($databaseConfig) ? $databaseConfig : [];
+  return ms_profile_database_config($database);
 }
 
 function ms_column_view_update_table(string $database, string $table, callable $mutator): void {
-  ms_column_config_mutate(static function (array $config) use ($database, $table, $mutator): array {
-    $serverKey = ms_server_config_key();
-    if (!isset($config['servers'][$serverKey]) || !is_array($config['servers'][$serverKey])) {
-      $config['servers'][$serverKey] = ['databases' => []];
-    }
-    if (!isset($config['servers'][$serverKey]['databases']) || !is_array($config['servers'][$serverKey]['databases'])) {
-      $config['servers'][$serverKey]['databases'] = [];
-    }
-    if (!isset($config['servers'][$serverKey]['databases'][$database]) || !is_array($config['servers'][$serverKey]['databases'][$database])) {
-      $config['servers'][$serverKey]['databases'][$database] = ['tables' => []];
-    }
-    if (!isset($config['servers'][$serverKey]['databases'][$database]['tables']) || !is_array($config['servers'][$serverKey]['databases'][$database]['tables'])) {
-      $config['servers'][$serverKey]['databases'][$database]['tables'] = [];
-    }
-    $current = $config['servers'][$serverKey]['databases'][$database]['tables'][$table] ?? [];
-    if (!is_array($current)) {
-      $current = [];
-    }
+  ms_profile_update_table($database, $table, static function (array $current) use ($mutator): array {
     foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
-      if (!isset($current[$key]) || !is_array($current[$key])) {
-        $current[$key] = [];
-      }
+      if (!isset($current[$key]) || !is_array($current[$key])) $current[$key] = [];
     }
     $current = $mutator($current);
-    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) {
-      if (empty($current[$key])) {
-        unset($current[$key]);
-      }
-    }
-    if ($current) {
-      $config['servers'][$serverKey]['databases'][$database]['tables'][$table] = $current;
-    } else {
-      unset($config['servers'][$serverKey]['databases'][$database]['tables'][$table]);
-    }
-    return $config;
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels'] as $key) if (empty($current[$key])) unset($current[$key]);
+    return $current;
   });
 }
 
 function ms_column_view_hide(string $database, string $table, string $column, bool $hidden): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column, $hidden): array {
-    if ($hidden) {
-      $config['hidden'][$column] = true;
-    } else {
-      unset($config['hidden'][$column]);
-    }
+    if ($hidden) $config['hidden'][$column] = true;
+    else unset($config['hidden'][$column]);
     return $config;
   });
 }
 
 function ms_column_view_show_all(string $database): void {
-  ms_column_config_mutate(static function (array $config) use ($database): array {
-    $serverKey = ms_server_config_key();
-    $tables = $config['servers'][$serverKey]['databases'][$database]['tables'] ?? [];
-    if (!is_array($tables)) {
-      return $config;
-    }
+  ms_profile_update_database($database, static function (array $databaseConfig): array {
+    $tables = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
     foreach ($tables as $table => $tableConfig) {
-      if (!is_array($tableConfig)) {
-        continue;
-      }
+      if (!is_array($tableConfig)) continue;
       unset($tableConfig['hidden']);
-      if ($tableConfig) {
-        $config['servers'][$serverKey]['databases'][$database]['tables'][$table] = $tableConfig;
-      } else {
-        unset($config['servers'][$serverKey]['databases'][$database]['tables'][$table]);
-      }
+      if ($tableConfig) $databaseConfig['tables'][$table] = $tableConfig;
+      else unset($databaseConfig['tables'][$table]);
     }
-    return $config;
+    return $databaseConfig;
   });
 }
 
 function ms_column_view_set_image(string $database, string $table, string $column, ?array $rule): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column, $rule): array {
-    if ($rule === null) {
-      unset($config['images'][$column]);
-    } else {
-      $config['images'][$column] = $rule;
-      // A column has one alternative display transformation at a time.
-      unset($config['soft_fk'][$column]);
-      unset($config['formats'][$column]);
-    }
+    if ($rule === null) unset($config['images'][$column]);
+    else { $config['images'][$column] = $rule; unset($config['soft_fk'][$column], $config['formats'][$column]); }
     return $config;
   });
 }
 
 function ms_column_view_set_soft_fk(string $database, string $table, string $column, ?array $rule): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column, $rule): array {
-    if ($rule === null) {
-      unset($config['soft_fk'][$column]);
-    } else {
-      $config['soft_fk'][$column] = $rule;
-      unset($config['images'][$column]);
-      unset($config['formats'][$column]);
-    }
+    if ($rule === null) unset($config['soft_fk'][$column]);
+    else { $config['soft_fk'][$column] = $rule; unset($config['images'][$column], $config['formats'][$column]); }
     return $config;
   });
 }
 
 function ms_column_view_set_format(string $database, string $table, string $column, ?array $rule): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column, $rule): array {
-    if ($rule === null) {
-      unset($config['formats'][$column]);
-    } else {
-      $config['formats'][$column] = $rule;
-      unset($config['images'][$column], $config['soft_fk'][$column]);
-    }
+    if ($rule === null) unset($config['formats'][$column]);
+    else { $config['formats'][$column] = $rule; unset($config['images'][$column], $config['soft_fk'][$column]); }
     return $config;
   });
 }
 
 function ms_column_view_set_label(string $database, string $table, string $column, ?string $label): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column, $label): array {
-    if ($label === null || $label === '') {
-      unset($config['labels'][$column]);
-    } else {
-      $config['labels'][$column] = $label;
-    }
+    if ($label === null || $label === '') unset($config['labels'][$column]);
+    else $config['labels'][$column] = $label;
     return $config;
   });
 }
@@ -2004,7 +2329,76 @@ try {
   }
 
   if (!empty($_SESSION['ms_login'])) {
+    ms_profile_config_ensure();
     $db = connect_db(false);
+
+    if (g('ajax') === 'profile_config') {
+      header('Content-Type: application/json; charset=UTF-8');
+      try {
+        require_csrf();
+        $configAction = p('action');
+        if ($configAction === 'raw_db_view') {
+          $settings = ms_profile_settings();
+          $settings['rawDbView'] = p('enabled') === '1';
+          ms_profile_update_settings($settings);
+        } elseif ($configAction === 'schema_width') {
+          $settings = ms_profile_settings();
+          $width = (int)p('width', '3');
+          if (!in_array($width, [2,3,4,6,12], true)) throw new RuntimeException('Invalid schema width.');
+          $settings['schemaColumnWidth'] = $width;
+          ms_profile_update_settings($settings);
+        } elseif ($configAction === 'sidebar_visibility') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          ms_profile_set_sidebar_visibility($database, $table, p('visible') === '1');
+        } elseif ($configAction === 'save_table_order') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+          $order = json_decode(p('order_json'), true);
+          if (!is_array($order)) throw new RuntimeException('Invalid column order.');
+          ms_profile_set_table_order($database, $table, $order, $columns);
+        } elseif ($configAction === 'save_table_widths') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+          $widths = json_decode(p('widths_json'), true);
+          if (!is_array($widths)) throw new RuntimeException('Invalid column widths.');
+          ms_profile_set_table_widths($database, $table, $widths, $columns);
+        } elseif ($configAction === 'save_search') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+          $rawSearch = json_decode(p('search_json'), true);
+          if (!is_array($rawSearch)) throw new RuntimeException('Invalid saved search.');
+          $query = ms_saved_search_normalize($rawSearch, $columns);
+          ms_profile_save_search($database, $table, p('name'), $query);
+        } elseif ($configAction === 'delete_search') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          ms_profile_delete_search($database, $table, p('name'));
+        } elseif ($configAction === 'reset_profile') {
+          ms_profile_reset_active();
+        } else {
+          throw new RuntimeException('Unknown profile configuration operation.');
+        }
+        echo json_encode(['ok' => true, 'profile' => ms_active_profile_name()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      } catch (Throwable $ajaxError) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      exit;
+    }
 
     if (g('ajax') === 'select_more') {
       header('Content-Type: application/json; charset=UTF-8');
@@ -2020,7 +2414,7 @@ try {
         $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
         $editable = ($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE';
         $offset = max(0, (int)g('offset', '0'));
-        $count = max(1, min(5000, (int)g('count', (string)browser_setting_int('mysqlStudioSelectRows', MS_ROWS_PER_PAGE, 1, 500))));
+        $count = max(1, min(5000, (int)g('count', (string)ms_profile_setting_int('selectRows', MS_ROWS_PER_PAGE, 1, 500))));
         [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll] = build_select_query($db, $table, $columns, $offset, $count);
         if ($showAll) {
           throw new RuntimeException('Show more is not available while Show all rows is enabled.');
@@ -2162,6 +2556,48 @@ try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && p('action') !== '') {
       require_csrf();
       $action = p('action');
+
+      if ($action === 'switch_profile') {
+        ms_set_active_profile(p('profile'));
+        go([], 'Profile changed to ' . ms_active_profile_name() . '.');
+      }
+
+      if ($action === 'create_profile') {
+        ms_profile_create(p('profile_name'));
+        go(['page' => 'settings'], 'Profile created: ' . ms_active_profile_name() . '.');
+      }
+
+      if ($action === 'rename_profile') {
+        ms_profile_rename(p('profile_name'));
+        go(['page' => 'settings'], 'Profile renamed to ' . ms_active_profile_name() . '.');
+      }
+
+      if ($action === 'delete_profile') {
+        $deleted = ms_active_profile_name();
+        ms_profile_delete_active();
+        go(['page' => 'settings'], 'Profile ' . $deleted . ' deleted. Default is now active.');
+      }
+
+      if ($action === 'save_profile_settings') {
+        $current = ms_profile_settings();
+        $menuPost = isset($_POST['menu']) && is_array($_POST['menu']) ? $_POST['menu'] : [];
+        $menu = [];
+        foreach (array_keys(ms_profile_default_settings()['menu']) as $key) $menu[$key] = isset($menuPost[$key]);
+        $settings = [
+          'theme' => p('theme'),
+          'density' => p('density'),
+          'scheme' => p('scheme'),
+          'sqlRows' => (int)p('sqlRows', '1000'),
+          'selectRows' => (int)p('selectRows', '50'),
+          'paginationPosition' => p('paginationPosition', 'bottom'),
+          'truncateCells' => p('truncateCells') === '1',
+          'rawDbView' => !empty($current['rawDbView']),
+          'schemaColumnWidth' => (int)($current['schemaColumnWidth'] ?? 3),
+          'menu' => $menu
+        ];
+        ms_profile_update_settings($settings);
+        go([], 'Settings saved for profile ' . ms_active_profile_name() . '.');
+      }
 
       if ($action === 'select_db') {
         $database = p('database');
@@ -2355,7 +2791,7 @@ try {
         if (trim($sql) === '') {
           throw new RuntimeException('Enter SQL or choose a SQL file.');
         }
-        $sqlDisplayLimit = max(1, min(100000, (int)p('row_limit', (string)browser_setting_int('mysqlStudioSqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000))));
+        $sqlDisplayLimit = max(1, min(100000, (int)p('row_limit', (string)ms_profile_setting_int('sqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000))));
         if (p('sql_submit') === 'explain') {
           [$sqlResults, $sqlTime] = explain_sql($db, $sql, $sqlDisplayLimit);
           $sqlExplainMode = true;
@@ -3023,6 +3459,11 @@ try {
 }
 
 function page_head(string $title, bool $authenticated): void {
+  $clientSettings = ms_profile_settings();
+  $clientSettings['hiddenSidebarObjects'] = selected_db() !== '' ? ms_profile_hidden_sidebar(selected_db()) : [];
+  $clientSettingsJson = json_encode($clientSettings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
+  $defaultSettingsJson = json_encode(ms_profile_default_settings(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
+  $csrfJson = json_encode((string)($_SESSION['ms_csrf'] ?? ''), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '""';
   ?><!doctype html>
 <html lang="en" data-bs-theme="light" data-density="standard" data-scheme="ocean" data-raw-db-view="<?= ms_raw_db_view() ? 'true' : 'false' ?>">
 <head>
@@ -3033,42 +3474,28 @@ function page_head(string $title, bool $authenticated): void {
     (() => {
       'use strict';
       const menuKeys = ['databases','database','sql','export','schema','views','routines','triggers','events','processes','users','variables'];
-      const defaultMenu = {};
-      menuKeys.forEach(key => defaultMenu[key] = true);
-      const defaults = {theme:'light',density:'standard',scheme:'ocean',sqlRows:1000,selectRows:50,paginationPosition:'bottom',truncateCells:false,menu:defaultMenu,tableLayouts:{},hiddenSidebarObjects:{}};
-      const storageKey = 'mysqlStudioSettings.v1';
-      window.msSettingsMeta = {menuKeys,defaults,storageKey};
-      const boundedInteger = (value, fallback, minimum, maximum) => {
-        const parsed = Number.parseInt(value, 10);
-        return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
-      };
-      window.msLoadSettings = () => {
-        let stored = {};
-        try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (error) { stored = {}; }
-        const legacyTheme = localStorage.getItem('ms-theme');
-        const theme = ['light','dark'].includes(stored.theme) ? stored.theme : (['light','dark'].includes(legacyTheme) ? legacyTheme : defaults.theme);
-        const density = ['ultracompact','compact','standard','large'].includes(stored.density) ? stored.density : defaults.density;
-        const schemes = ['ocean','indigo','emerald','teal','ruby','amber','violet','rose','slate','contrast'];
-        const scheme = schemes.includes(stored.scheme) ? stored.scheme : defaults.scheme;
-        const sqlRows = boundedInteger(stored.sqlRows, defaults.sqlRows, 1, 100000);
-        const selectRows = boundedInteger(stored.selectRows, defaults.selectRows, 1, 500);
-        const paginationPosition = ['top','bottom','both'].includes(stored.paginationPosition) ? stored.paginationPosition : defaults.paginationPosition;
-        const truncateCells = stored.truncateCells === true;
-        const tableLayouts = stored.tableLayouts && typeof stored.tableLayouts === 'object' && !Array.isArray(stored.tableLayouts) ? stored.tableLayouts : {};
-        const hiddenSidebarObjects = stored.hiddenSidebarObjects && typeof stored.hiddenSidebarObjects === 'object' && !Array.isArray(stored.hiddenSidebarObjects) ? stored.hiddenSidebarObjects : {};
-        const menu = {...defaultMenu};
-        if (stored.menu && typeof stored.menu === 'object') menuKeys.forEach(key => menu[key] = stored.menu[key] !== false);
-        return {theme,density,scheme,sqlRows,selectRows,paginationPosition,truncateCells,menu,tableLayouts,hiddenSidebarObjects};
-      };
-      window.msSyncSettingsCookies = settings => {
-        const secure = location.protocol === 'https:' ? '; Secure' : '';
-        document.cookie = `mysqlStudioSqlRows=${settings.sqlRows}; Max-Age=31536000; Path=/; SameSite=Lax${secure}`;
-        document.cookie = `mysqlStudioSelectRows=${settings.selectRows}; Max-Age=31536000; Path=/; SameSite=Lax${secure}`;
-      };
-      window.msSaveSettings = settings => {
-        localStorage.setItem(storageKey, JSON.stringify(settings));
-        localStorage.removeItem('ms-theme');
-        window.msSyncSettingsCookies(settings);
+      const defaults = <?= $defaultSettingsJson ?>;
+      const serverSettings = <?= $clientSettingsJson ?>;
+      const csrf = <?= $csrfJson ?>;
+      window.msSettingsMeta = {menuKeys,defaults};
+      window.msLoadSettings = () => JSON.parse(JSON.stringify(serverSettings));
+      window.msConfigPost = async (action, data = {}) => {
+        const body = new URLSearchParams();
+        body.set('csrf', csrf);
+        body.set('action', action);
+        Object.entries(data).forEach(([key,value]) => body.set(key, value == null ? '' : String(value)));
+        const response = await fetch('?ajax=profile_config', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+          body: body.toString()
+        });
+        let payload = null;
+        try { payload = await response.json(); } catch (error) {}
+        if (!response.ok || !payload || payload.ok !== true) {
+          throw new Error(payload && payload.error ? payload.error : 'Unable to save profile configuration.');
+        }
+        return payload;
       };
       window.msApplySettings = settings => {
         const root = document.documentElement;
@@ -3078,7 +3505,7 @@ function page_head(string $title, bool $authenticated): void {
         root.setAttribute('data-truncate-cells', settings.truncateCells ? 'true' : 'false');
         root.setAttribute('data-pagination-position', settings.paginationPosition);
         document.querySelectorAll('[data-ms-menu]').forEach(item => {
-          item.hidden = settings.menu[item.dataset.msMenu] === false;
+          item.hidden = settings.menu && settings.menu[item.dataset.msMenu] === false;
         });
         const hiddenSidebarObjects = settings.hiddenSidebarObjects && typeof settings.hiddenSidebarObjects === 'object' && !Array.isArray(settings.hiddenSidebarObjects) ? settings.hiddenSidebarObjects : {};
         const rawDbView = root.getAttribute('data-raw-db-view') === 'true';
@@ -3086,11 +3513,9 @@ function page_head(string $title, bool $authenticated): void {
           item.hidden = rawDbView ? false : hiddenSidebarObjects[item.dataset.msSidebarObjectKey] === true;
         });
         document.querySelectorAll('[data-ms-sql-row-limit]').forEach(input => input.value = settings.sqlRows);
-        document.querySelectorAll('[data-ms-sql-limit-label]').forEach(label => label.textContent = settings.sqlRows.toLocaleString());
+        document.querySelectorAll('[data-ms-sql-limit-label]').forEach(label => label.textContent = Number(settings.sqlRows || 0).toLocaleString());
       };
-      const initialSettings = window.msLoadSettings();
-      window.msSyncSettingsCookies(initialSettings);
-      window.msApplySettings(initialSettings);
+      window.msApplySettings(serverSettings);
     })();
   </script>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -3330,15 +3755,19 @@ function page_foot(): void {
   let settings=window.msLoadSettings();
   window.msApplySettings(settings);
   document.querySelectorAll('[data-ms-sidebar-object-toggle]').forEach(toggle=>{
-    const key=toggle.dataset.msSidebarObjectToggle||'';
-    if(!key)return;
+    const tableName=toggle.dataset.msSidebarObjectToggle||'';
+    if(!tableName)return;
     if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
-    toggle.checked=settings.hiddenSidebarObjects[key]!==true;
-    toggle.addEventListener('change',()=>{
-      if(toggle.checked)delete settings.hiddenSidebarObjects[key];
-      else settings.hiddenSidebarObjects[key]=true;
-      window.msSaveSettings(settings);
-      window.msApplySettings(settings);
+    toggle.checked=settings.hiddenSidebarObjects[tableName]!==true;
+    toggle.addEventListener('change',async()=>{
+      toggle.disabled=true;
+      try{
+        await window.msConfigPost('sidebar_visibility',{table:tableName,visible:toggle.checked?'1':'0'});
+        if(toggle.checked)delete settings.hiddenSidebarObjects[tableName];
+        else settings.hiddenSidebarObjects[tableName]=true;
+        window.msApplySettings(settings);
+      }catch(error){toggle.checked=!toggle.checked;alert(error.message||String(error));}
+      finally{toggle.disabled=false;}
     });
   });
   document.querySelectorAll('[data-ms-page-jump]').forEach(input => {
@@ -3371,8 +3800,8 @@ function page_foot(): void {
       if(theme)theme.checked=true;if(density)density.checked=true;if(scheme)scheme.checked=true;if(paginationPosition)paginationPosition.checked=true;
       settingsForm.elements.sqlRows.value=settings.sqlRows;
       settingsForm.elements.selectRows.value=settings.selectRows;
-      settingsForm.elements.truncateCells.checked=settings.truncateCells;
-      window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=settings.menu[key]!==false;});
+      settingsForm.elements.truncateCells.checked=!!settings.truncateCells;
+      window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=!settings.menu||settings.menu[key]!==false;});
     };
     selectCurrent();
     const renderHiddenSidebarSettings=()=>{
@@ -3387,146 +3816,130 @@ function page_foot(): void {
       const showAll=document.getElementById('ms-sidebar-show-all-hidden');
       if(showAll)showAll.disabled=shown===0;
     };
-    document.querySelectorAll('[data-ms-sidebar-restore]').forEach(button=>button.addEventListener('click',()=>{
-      const key=button.dataset.msSidebarRestore||'';
-      if(!key)return;
-      if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
-      delete settings.hiddenSidebarObjects[key];
-      window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();
+    document.querySelectorAll('[data-ms-sidebar-restore]').forEach(button=>button.addEventListener('click',async()=>{
+      const tableName=button.dataset.msSidebarRestore||'';
+      if(!tableName)return;
+      button.disabled=true;
+      try{
+        await window.msConfigPost('sidebar_visibility',{table:tableName,visible:'1'});
+        if(settings.hiddenSidebarObjects)delete settings.hiddenSidebarObjects[tableName];
+        window.msApplySettings(settings);renderHiddenSidebarSettings();
+      }catch(error){alert(error.message||String(error));}
+      finally{button.disabled=false;}
     }));
     const showAllHidden=document.getElementById('ms-sidebar-show-all-hidden');
-    if(showAllHidden)showAllHidden.addEventListener('click',()=>{
-      if(!settings.hiddenSidebarObjects||typeof settings.hiddenSidebarObjects!=='object'||Array.isArray(settings.hiddenSidebarObjects))settings.hiddenSidebarObjects={};
-      document.querySelectorAll('[data-ms-hidden-sidebar-row]').forEach(row=>delete settings.hiddenSidebarObjects[row.dataset.msHiddenSidebarKey]);
-      window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();
+    if(showAllHidden)showAllHidden.addEventListener('click',async()=>{
+      const buttons=Array.from(document.querySelectorAll('[data-ms-sidebar-restore]')).filter(button=>settings.hiddenSidebarObjects&&settings.hiddenSidebarObjects[button.dataset.msSidebarRestore]===true);
+      showAllHidden.disabled=true;
+      try{
+        for(const button of buttons){await window.msConfigPost('sidebar_visibility',{table:button.dataset.msSidebarRestore,visible:'1'});delete settings.hiddenSidebarObjects[button.dataset.msSidebarRestore];}
+        window.msApplySettings(settings);renderHiddenSidebarSettings();
+      }catch(error){alert(error.message||String(error));}
+      finally{renderHiddenSidebarSettings();}
     });
     renderHiddenSidebarSettings();
     settingsForm.addEventListener('change',()=>{
-      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
-      window.msSettingsMeta.menuKeys.forEach(key=>preview.menu[key]=settingsForm.querySelector(`[name="menu[${key}]"]`).checked);
+      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,rawDbView:settings.rawDbView,menu:{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
+      window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);preview.menu[key]=!!(input&&input.checked);});
       window.msApplySettings(preview);
     });
-    settingsForm.addEventListener('submit',event=>{
-      event.preventDefault();
-      settings={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,menu:{},tableLayouts:settings.tableLayouts||{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
-      window.msSettingsMeta.menuKeys.forEach(key=>settings.menu[key]=settingsForm.querySelector(`[name="menu[${key}]"]`).checked);
-      window.msSaveSettings(settings);window.msApplySettings(settings);
-      const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);
+    const showMenu=document.getElementById('ms-menu-show-all');
+    if(showMenu)showMenu.addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=true;});settingsForm.dispatchEvent(new Event('change'));});
+    const hideMenu=document.getElementById('ms-menu-hide-all');
+    if(hideMenu)hideMenu.addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=false;});settingsForm.dispatchEvent(new Event('change'));});
+    const reset=document.getElementById('ms-settings-reset');
+    if(reset)reset.addEventListener('click',async()=>{
+      if(!confirm('Restore every setting in the current profile to defaults? This also removes its saved column views, sidebar choices, saved widths, column order and saved searches.'))return;
+      reset.disabled=true;
+      try{await window.msConfigPost('reset_profile');location.reload();}
+      catch(error){alert(error.message||String(error));reset.disabled=false;}
     });
-    document.getElementById('ms-menu-show-all').addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>settingsForm.querySelector(`[name="menu[${key}]"]`).checked=true);settingsForm.dispatchEvent(new Event('change'));});
-    document.getElementById('ms-menu-hide-all').addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>settingsForm.querySelector(`[name="menu[${key}]"]`).checked=false);settingsForm.dispatchEvent(new Event('change'));});
-    document.getElementById('ms-settings-reset').addEventListener('click',()=>{settings=JSON.parse(JSON.stringify(window.msSettingsMeta.defaults));selectCurrent();window.msSaveSettings(settings);window.msApplySettings(settings);renderHiddenSidebarSettings();const saved=document.getElementById('ms-settings-saved');saved.classList.remove('d-none');setTimeout(()=>saved.classList.add('d-none'),2500);});
   }
   document.querySelectorAll('[data-ms-table-layout]').forEach(table=>{
     let nativeColumns=[];
     try{nativeColumns=JSON.parse(table.dataset.msColumns||'[]');}catch(error){nativeColumns=[];}
     if(!Array.isArray(nativeColumns)||!nativeColumns.length||nativeColumns.some(column=>typeof column!=='string'))return;
-    const layoutKey=table.dataset.msLayoutKey||'';
-    const context={server:table.dataset.msServer||'',database:table.dataset.msDatabase||'',table:table.dataset.msTable||''};
-    if(!layoutKey||!context.server||!context.database||!context.table)return;
-    if(!settings.tableLayouts||typeof settings.tableLayouts!=='object'||Array.isArray(settings.tableLayouts))settings.tableLayouts={};
-
+    const context={database:table.dataset.msDatabase||'',table:table.dataset.msTable||''};
+    if(!context.database||!context.table)return;
+    let rawLayout={};
+    try{rawLayout=JSON.parse(table.dataset.msLayout||'{}')||{};}catch(error){rawLayout={};}
     const normalizeLayout=raw=>{
-      if(!raw||raw.server!==context.server||raw.database!==context.database||raw.table!==context.table)return null;
-      const order=[];
-      const seen=new Set();
-      if(Array.isArray(raw.order)){
-        raw.order.forEach(column=>{
-          if(typeof column==='string'&&nativeColumns.includes(column)&&!seen.has(column)){order.push(column);seen.add(column);}
-        });
-      }
+      const order=[];const seen=new Set();
+      if(raw&&Array.isArray(raw.order))raw.order.forEach(column=>{if(typeof column==='string'&&nativeColumns.includes(column)&&!seen.has(column)){order.push(column);seen.add(column);}});
       nativeColumns.forEach(column=>{if(!seen.has(column)){order.push(column);seen.add(column);}});
       const widths={};
-      if(raw.widths&&typeof raw.widths==='object'&&!Array.isArray(raw.widths)){
-        Object.entries(raw.widths).forEach(([column,width])=>{
-          const numeric=Number(width);
-          if(nativeColumns.includes(column)&&Number.isFinite(numeric)&&numeric>=48&&numeric<=1200)widths[column]=numeric;
-        });
-      }
-      return {server:context.server,database:context.database,table:context.table,columns:[...nativeColumns],order,widths};
+      if(raw&&raw.widths&&typeof raw.widths==='object'&&!Array.isArray(raw.widths))Object.entries(raw.widths).forEach(([column,width])=>{const numeric=Number(width);if(nativeColumns.includes(column)&&Number.isFinite(numeric)&&numeric>=48&&numeric<=1200)widths[column]=numeric;});
+      return {order,widths};
     };
-
-    let layout=normalizeLayout(settings.tableLayouts[layoutKey]||null);
-    if(layout){
-      const serializedBefore=JSON.stringify(settings.tableLayouts[layoutKey]||null);
-      const serializedAfter=JSON.stringify(layout);
-      settings.tableLayouts[layoutKey]=layout;
-      if(serializedBefore!==serializedAfter)window.msSaveSettings(settings);
-    }
-
+    let layout=normalizeLayout(rawLayout);
     const cellsFor=column=>Array.from(table.querySelectorAll('[data-ms-column]')).filter(cell=>cell.dataset.msColumn===column);
-    const setColumnWidth=(column,width)=>{
-      const pixels=Math.max(48,Math.min(1200,Math.round(width)));
-      cellsFor(column).forEach(cell=>{cell.style.width=`${pixels}px`;cell.style.minWidth=`${pixels}px`;cell.style.maxWidth=`${pixels}px`;});
-      return pixels;
-    };
-    const applyOrder=order=>{
-      table.querySelectorAll('tr').forEach(row=>{
-        const cells=new Map(Array.from(row.children).filter(cell=>cell.dataset&&cell.dataset.msColumn).map(cell=>[cell.dataset.msColumn,cell]));
-        order.forEach(column=>{const cell=cells.get(column);if(cell)row.appendChild(cell);});
-      });
-    };
-    const currentFullOrder=()=>layout&&Array.isArray(layout.order)&&layout.order.length?[...layout.order]:[...nativeColumns];
-    const mergeVisibleOrder=visibleOrder=>{
-      const visibleSet=new Set(visibleOrder);
-      let visibleIndex=0;
-      return currentFullOrder().map(column=>visibleSet.has(column)?visibleOrder[visibleIndex++]:column);
-    };
-
-    if(layout){
-      applyOrder(layout.order);
-      Object.entries(layout.widths).forEach(([column,width])=>setColumnWidth(column,Number(width)));
-    }
-
-    const saveLayout=()=>{
+    const setColumnWidth=(column,width)=>{const pixels=Math.max(48,Math.min(1200,Math.round(width)));cellsFor(column).forEach(cell=>{cell.style.width=`${pixels}px`;cell.style.minWidth=`${pixels}px`;cell.style.maxWidth=`${pixels}px`;});return pixels;};
+    const applyOrder=order=>{table.querySelectorAll('tr').forEach(row=>{const cells=new Map(Array.from(row.children).filter(cell=>cell.dataset&&cell.dataset.msColumn).map(cell=>[cell.dataset.msColumn,cell]));order.forEach(column=>{const cell=cells.get(column);if(cell)row.appendChild(cell);});});};
+    const currentFullOrder=()=>Array.isArray(layout.order)&&layout.order.length?[...layout.order]:[...nativeColumns];
+    const mergeVisibleOrder=visibleOrder=>{const visibleSet=new Set(visibleOrder);let visibleIndex=0;return currentFullOrder().map(column=>visibleSet.has(column)?visibleOrder[visibleIndex++]:column);};
+    applyOrder(layout.order);
+    Object.entries(layout.widths).forEach(([column,width])=>setColumnWidth(column,Number(width)));
+    const saveOrder=async()=>{
       const visibleOrder=Array.from(table.querySelectorAll('thead th[data-ms-column]')).map(th=>th.dataset.msColumn);
-      const order=mergeVisibleOrder(visibleOrder);
-      const widths=layout&&layout.widths&&typeof layout.widths==='object'?{...layout.widths}:{};
-      table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{
-        const width=Number.parseInt(th.style.width,10);
-        if(Number.isFinite(width))widths[th.dataset.msColumn]=width;
-      });
-      layout={server:context.server,database:context.database,table:context.table,columns:[...nativeColumns],order,widths};
-      settings.tableLayouts[layoutKey]=layout;
-      window.msSaveSettings(settings);
+      layout.order=mergeVisibleOrder(visibleOrder);
+      try{await window.msConfigPost('save_table_order',{table:context.table,order_json:JSON.stringify(layout.order)});}catch(error){console.error(error);}
     };
+    const saveWidthsButton=Array.from(document.querySelectorAll('[data-ms-save-widths]')).find(button=>button.dataset.msSaveWidths===context.table);
+    if(saveWidthsButton)saveWidthsButton.addEventListener('click',async()=>{
+      const widths={};
+      table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{const width=Math.round(th.getBoundingClientRect().width);if(Number.isFinite(width))widths[th.dataset.msColumn]=Math.max(48,Math.min(1200,width));});
+      const original=saveWidthsButton.innerHTML;saveWidthsButton.disabled=true;saveWidthsButton.innerHTML='<i class="fa-solid fa-spinner fa-spin me-1"></i>Saving';
+      try{
+        await window.msConfigPost('save_table_widths',{table:context.table,widths_json:JSON.stringify(widths)});
+        layout.widths={...layout.widths,...widths};
+        saveWidthsButton.innerHTML='<i class="fa-solid fa-check me-1"></i>Widths saved';
+        setTimeout(()=>{saveWidthsButton.innerHTML=original;},1600);
+      }catch(error){alert(error.message||String(error));saveWidthsButton.innerHTML=original;}
+      finally{saveWidthsButton.disabled=false;}
+    });
     const clearDropMarkers=()=>table.querySelectorAll('.ms-column-drop-before,.ms-column-drop-after').forEach(th=>th.classList.remove('ms-column-drop-before','ms-column-drop-after'));
     let draggedColumn='';
     table.querySelectorAll('thead th[data-ms-column]').forEach(th=>{
-      th.addEventListener('dragstart',event=>{
-        const target=event.target instanceof Element?event.target:null;
-        if(!target||!target.closest('[data-ms-column-drag-handle]')){event.preventDefault();return;}
-        draggedColumn=th.dataset.msColumn;th.classList.add('ms-column-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',draggedColumn);
-      });
-      th.addEventListener('dragover',event=>{
-        if(!draggedColumn||draggedColumn===th.dataset.msColumn)return;
-        event.preventDefault();event.dataTransfer.dropEffect='move';clearDropMarkers();
-        const rect=th.getBoundingClientRect();th.classList.add(event.clientX<rect.left+rect.width/2?'ms-column-drop-before':'ms-column-drop-after');
-      });
-      th.addEventListener('drop',event=>{
-        if(!draggedColumn||draggedColumn===th.dataset.msColumn)return;
-        event.preventDefault();
-        const before=th.classList.contains('ms-column-drop-before');
-        table.querySelectorAll('tr').forEach(row=>{
-          const source=Array.from(row.children).find(cell=>cell.dataset&&cell.dataset.msColumn===draggedColumn);
-          const target=Array.from(row.children).find(cell=>cell.dataset&&cell.dataset.msColumn===th.dataset.msColumn);
-          if(source&&target)row.insertBefore(source,before?target:target.nextSibling);
-        });
-        clearDropMarkers();saveLayout();
-      });
+      th.addEventListener('dragstart',event=>{const target=event.target instanceof Element?event.target:null;if(!target||!target.closest('[data-ms-column-drag-handle]')){event.preventDefault();return;}draggedColumn=th.dataset.msColumn;th.classList.add('ms-column-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',draggedColumn);});
+      th.addEventListener('dragover',event=>{if(!draggedColumn||draggedColumn===th.dataset.msColumn)return;event.preventDefault();event.dataTransfer.dropEffect='move';clearDropMarkers();const rect=th.getBoundingClientRect();th.classList.add(event.clientX<rect.left+rect.width/2?'ms-column-drop-before':'ms-column-drop-after');});
+      th.addEventListener('drop',event=>{if(!draggedColumn||draggedColumn===th.dataset.msColumn)return;event.preventDefault();const before=th.classList.contains('ms-column-drop-before');table.querySelectorAll('tr').forEach(row=>{const source=Array.from(row.children).find(cell=>cell.dataset&&cell.dataset.msColumn===draggedColumn);const target=Array.from(row.children).find(cell=>cell.dataset&&cell.dataset.msColumn===th.dataset.msColumn);if(source&&target)row.insertBefore(source,before?target:target.nextSibling);});clearDropMarkers();saveOrder();});
       th.addEventListener('dragend',()=>{draggedColumn='';th.classList.remove('ms-column-dragging');clearDropMarkers();});
       const handle=th.querySelector('[data-ms-col-resizer]');
-      if(handle)handle.addEventListener('pointerdown',event=>{
-        if(event.button!==0)return;
-        event.preventDefault();event.stopPropagation();document.body.classList.add('ms-column-resizing');
-        const startX=event.clientX,startWidth=th.getBoundingClientRect().width,column=th.dataset.msColumn;
-        let finished=false;
-        const move=moveEvent=>setColumnWidth(column,startWidth+moveEvent.clientX-startX);
-        const finish=()=>{if(finished)return;finished=true;window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',finish);window.removeEventListener('pointercancel',finish);document.body.classList.remove('ms-column-resizing');saveLayout();};
-        window.addEventListener('pointermove',move);window.addEventListener('pointerup',finish);window.addEventListener('pointercancel',finish);
-      });
+      if(handle)handle.addEventListener('pointerdown',event=>{if(event.button!==0)return;event.preventDefault();event.stopPropagation();document.body.classList.add('ms-column-resizing');const startX=event.clientX,startWidth=th.getBoundingClientRect().width,column=th.dataset.msColumn;let finished=false;const move=moveEvent=>setColumnWidth(column,startWidth+moveEvent.clientX-startX);const finish=()=>{if(finished)return;finished=true;window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',finish);window.removeEventListener('pointercancel',finish);document.body.classList.remove('ms-column-resizing');};window.addEventListener('pointermove',move);window.addEventListener('pointerup',finish);window.addEventListener('pointercancel',finish);});
     });
   });
+
+  const savedSearchSelect=document.querySelector('[data-ms-saved-search-select]');
+  if(savedSearchSelect){
+    const saveButton=document.querySelector('[data-ms-save-search]');
+    const loadButton=document.querySelector('[data-ms-load-search]');
+    const deleteButton=document.querySelector('[data-ms-delete-search]');
+    const nameInput=document.querySelector('[data-ms-search-name]');
+    const queryForm=document.getElementById('ms-query-builder-form');
+    if(loadButton)loadButton.addEventListener('click',()=>{const option=savedSearchSelect.selectedOptions[0];if(option&&option.value){if(typeof window.msShowPageLoader==='function')window.msShowPageLoader('Loading saved search...');location.href=option.value;}});
+    if(saveButton&&nameInput&&queryForm)saveButton.addEventListener('click',async()=>{
+      const name=nameInput.value.trim();if(!name){nameInput.focus();return;}
+      const params=new URLSearchParams(new FormData(queryForm));const query={};
+      for(const [rawKey,value] of params.entries()){
+        if(rawKey==='page'||rawKey==='table'||rawKey==='p')continue;
+        const isArray=rawKey.endsWith('[]');const key=isArray?rawKey.slice(0,-2):rawKey;
+        if(isArray){if(!Array.isArray(query[key]))query[key]=[];query[key].push(value);}else query[key]=value;
+      }
+      saveButton.disabled=true;
+      try{await window.msConfigPost('save_search',{table:saveButton.dataset.msSaveSearch,name,search_json:JSON.stringify(query)});location.reload();}
+      catch(error){alert(error.message||String(error));saveButton.disabled=false;}
+    });
+    if(deleteButton)deleteButton.addEventListener('click',async()=>{
+      const option=savedSearchSelect.selectedOptions[0];const name=option?option.dataset.searchName||'':'';if(!name)return;
+      if(!confirm(`Delete saved search “${name}”?`))return;
+      deleteButton.disabled=true;
+      try{await window.msConfigPost('delete_search',{table:deleteButton.dataset.msDeleteSearch,name});location.reload();}
+      catch(error){alert(error.message||String(error));deleteButton.disabled=false;}
+    });
+    savedSearchSelect.addEventListener('change',()=>{if(loadButton)loadButton.disabled=!savedSearchSelect.value;if(deleteButton)deleteButton.disabled=!savedSearchSelect.value;});
+    if(loadButton)loadButton.disabled=!savedSearchSelect.value;
+    if(deleteButton)deleteButton.disabled=!savedSearchSelect.value;
+  }
 })();
 </script>
 </body></html><?php
@@ -3550,6 +3963,9 @@ function render_sidebar(): void {
     ['variables', 'fa-sliders', 'Variables']
   ];
   $rawDbView = ms_raw_db_view();
+  $profileNames = ms_profile_names();
+  $activeProfile = ms_active_profile_name();
+  $hiddenSidebar = $dbName !== '' ? ms_profile_hidden_sidebar($dbName) : [];
   ?><aside class="sidebar p-3">
     <div class="mb-3">
       <div class="brand d-flex align-items-center gap-2"><a class="text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a><a class="badge text-bg-secondary fw-normal text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a></div>
@@ -3571,14 +3987,12 @@ function render_sidebar(): void {
       try {
         $sideDb = connect_db();
         $tables = db_all($sideDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
-        $login = is_array($_SESSION['ms_login'] ?? null) ? $_SESSION['ms_login'] : [];
-        $sidebarServer = hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? '') . "\0" . (string)($login['user'] ?? ''));
         ?><hr><div class="small text-uppercase text-body-secondary mb-2">Objects</div><div class="list-group list-group-flush small">
         <?php foreach ($tables as $t) {
           $name=(string)$t['TABLE_NAME'];
           $isBaseTable=(string)$t['TABLE_TYPE']==='BASE TABLE';
-          $sidebarObjectKey=hash('sha256',$sidebarServer."\0".$dbName."\0".$name);
-          ?><div class="ms-sidebar-object-row" data-ms-sidebar-object-key="<?= h($sidebarObjectKey) ?>">
+          $sidebarObjectHidden=!empty($hiddenSidebar[$name]);
+          ?><div class="ms-sidebar-object-row" data-ms-sidebar-object-key="<?= h($name) ?>"<?= (!$rawDbView && $sidebarObjectHidden) ? ' hidden' : '' ?>>
             <a class="ms-sidebar-object-name text-truncate" title="<?= h($name) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="fa-solid <?= $isBaseTable?'fa-table':'fa-eye' ?> fa-fw me-1"></i><span class="text-truncate"><?= h($name) ?></span></a>
             <span class="ms-sidebar-object-actions">
               <a class="ms-sidebar-object-action" href="?page=select&amp;table=<?= urlencode($name) ?>" title="Show content: <?= h($name) ?>" aria-label="Show content of <?= h($name) ?>"><i class="fa-solid fa-table-cells" aria-hidden="true"></i></a>
@@ -3590,6 +4004,11 @@ function render_sidebar(): void {
       } catch (Throwable $ignored) {}
     } ?>
     <hr><a class="nav-link mb-2 <?= $page === 'settings' ? 'active' : 'text-body' ?>" href="?page=settings"><i class="fa-solid fa-gear fa-fw me-2"></i>Settings</a>
+    <div class="mb-3 ps-2">
+      <?php if (count($profileNames) > 1) { ?>
+        <form method="post" class="m-0"><input type="hidden" name="action" value="switch_profile"><?= csrf_field() ?><label class="form-label small text-body-secondary mb-1" for="ms-sidebar-profile">Profile</label><select class="form-select form-select-sm" id="ms-sidebar-profile" name="profile" onchange="this.form.submit()"><?php foreach($profileNames as $profileName){?><option value="<?= h($profileName) ?>"<?= $profileName===$activeProfile?' selected':'' ?>><?= h($profileName) ?></option><?php }?></select></form>
+      <?php } else { ?><div class="small text-body-secondary">Profile: <strong class="text-body">Default</strong></div><?php } ?>
+    </div>
     <form method="post"><input type="hidden" name="action" value="logout"><?= csrf_field() ?><button class="btn btn-secondary btn-sm w-100"><i class="fa-solid fa-right-from-bracket me-1"></i>Log out</button></form>
     <div class="small text-body-secondary mt-3"><a class="text-body-secondary text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a> · PHP 7.4+</div>
   </aside>
@@ -3599,12 +4018,14 @@ function render_sidebar(): void {
     const toggle=document.getElementById('ms-raw-db-view');
     const box=document.getElementById('ms-raw-db-switch-box');
     if(!toggle)return;
-    toggle.addEventListener('change',()=>{
-      const secure=location.protocol==='https:'?'; Secure':'';
-      document.cookie=`mysqlStudioRawDbView=${toggle.checked?'1':'0'}; Max-Age=31536000; Path=/; SameSite=Lax${secure}`;
-      if(box)box.classList.toggle('is-active',toggle.checked);
-      if(typeof window.msShowPageLoader==='function')window.msShowPageLoader(toggle.checked?'Opening raw DB view...':'Restoring custom views...');
-      location.reload();
+    toggle.addEventListener('change',async()=>{
+      toggle.disabled=true;
+      try{
+        await window.msConfigPost('raw_db_view',{enabled:toggle.checked?'1':'0'});
+        if(box)box.classList.toggle('is-active',toggle.checked);
+        if(typeof window.msShowPageLoader==='function')window.msShowPageLoader(toggle.checked?'Opening raw DB view...':'Restoring custom views...');
+        location.reload();
+      }catch(error){toggle.checked=!toggle.checked;toggle.disabled=false;alert(error.message||String(error));}
     });
   })();
   </script><?php
@@ -4245,7 +4666,7 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
   $select='*';$group='';
   if(in_array($aggregate,$validAgg,true)&&in_array($aggregateColumn,$allowed,true)){$select=($groupColumn!==''&&in_array($groupColumn,$allowed,true)?qi($groupColumn).', ':'').$aggregate.'('.qi($aggregateColumn).') AS '.qi(strtolower($aggregate).'_'.$aggregateColumn);if($groupColumn!==''&&in_array($groupColumn,$allowed,true))$group=' GROUP BY '.qi($groupColumn);}
   $orderParts=[];$orderCols=$_GET['order_col']??[];$orderDirs=$_GET['order_dir']??[];if(!is_array($orderCols))$orderCols=[];if(!is_array($orderDirs))$orderDirs=[];foreach($orderCols as $i=>$column){if(in_array($column,$allowed,true))$orderParts[]=qi((string)$column).' '.(strtoupper((string)($orderDirs[$i]??'ASC'))==='DESC'?'DESC':'ASC');}
-  $defaultLimit=browser_setting_int('mysqlStudioSelectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
+  $defaultLimit=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
   $from=' FROM '.qi($table).($where?' WHERE '.implode(' AND ',$where):'');
   $sql='SELECT '.$select.$from.$group.($orderParts?' ORDER BY '.implode(', ',$orderParts):'').($showAll?'':' LIMIT '.$offset.','.$queryLimit);
   $countSql=$group!==''?'SELECT COUNT(*) AS n FROM (SELECT 1'.$from.$group.') ms_groups':'SELECT COUNT(*) AS n'.$from;
@@ -4346,7 +4767,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
 function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
-  [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=browser_setting_int('mysqlStudioSelectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
+  [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
@@ -4355,16 +4776,24 @@ function page_select(mysqli $db): void {
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
-  $layoutColumns=$allColumnNames;$login=is_array($_SESSION['ms_login']??null)?$_SESSION['ms_login']:[];$layoutServer=hash('sha256',(string)($login['host']??'')."\0".(string)($login['port']??'')."\0".(string)($login['socket']??'')."\0".(string)($login['user']??''));$layoutKey=hash('sha256',$layoutServer."\0".selected_db()."\0".$table);$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
+  $layoutColumns=$allColumnNames;$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';$savedLayout=ms_profile_table_layout(selected_db(),$table);$savedLayoutJson=json_encode($savedLayout,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'{}';$sidebarHidden=!empty(ms_profile_hidden_sidebar(selected_db())[$table]);$savedSearches=ms_profile_table_saved_searches(selected_db(),$table);
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
-  $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($layoutKey).'" checked><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> <a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
+  $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   title_bar($table,number_format($total).' result(s)',$actions);
-  ?><div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body"><form method="get"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
+  ?><div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body">
+    <div class="row g-2 align-items-end mb-3 pb-3 border-bottom">
+      <div class="col-md-4"><label class="form-label" for="ms-saved-search-select">Saved search</label><select class="form-select" id="ms-saved-search-select" data-ms-saved-search-select><option value="">Choose saved search…</option><?php foreach($savedSearches as $searchName=>$searchQuery){$savedUrl='?'.http_build_query(array_merge(['page'=>'select','table'=>$table],is_array($searchQuery)?$searchQuery:[]));?><option value="<?= h($savedUrl) ?>" data-search-name="<?= h((string)$searchName) ?>"><?= h((string)$searchName) ?></option><?php }?></select></div>
+      <div class="col-md-4"><label class="form-label" for="ms-search-name">Save current search as</label><input class="form-control" id="ms-search-name" data-ms-search-name maxlength="100" placeholder="Search name"></div>
+      <div class="col-md-auto"><button class="btn btn-outline-primary" type="button" data-ms-save-search="<?= h($table) ?>"><i class="fa-solid fa-floppy-disk me-1"></i>Save search</button></div>
+      <div class="col-md-auto"><button class="btn btn-secondary" type="button" data-ms-load-search disabled><i class="fa-solid fa-folder-open me-1"></i>Load</button></div>
+      <div class="col-md-auto"><button class="btn btn-outline-danger" type="button" data-ms-delete-search="<?= h($table) ?>" disabled><i class="fa-solid fa-trash me-1"></i>Delete</button></div>
+    </div>
+    <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
-  <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-layout-key="<?= h($layoutKey) ?>" data-ms-server="<?= h($layoutServer) ?>" data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>"<?php } ?>><thead><tr><?php
+  <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>" data-ms-layout="<?= h($savedLayoutJson) ?>"<?php } ?>><thead><tr><?php
     if(!$aggregated){if($editable){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><?php }?><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php }
     foreach($headers as $header){
       $header=(string)$header;
@@ -5244,7 +5673,7 @@ function page_row(mysqli $db): void {
 
 
 function page_sql(mysqli $db,?array $results,float $time): void {
-  $sqlDefaultRows=browser_setting_int('mysqlStudioSqlRows',MS_SQL_ROWS_DEFAULT,1,100000);
+  $sqlDefaultRows=ms_profile_setting_int('sqlRows',MS_SQL_ROWS_DEFAULT,1,100000);
   $tableRows=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
   $columnRows=db_all($db,'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
   $sqlSchema=['tables'=>[],'columns'=>[]];
@@ -5444,7 +5873,7 @@ function page_schema(mysqli $db): void {
   (()=>{
     'use strict';
     const allowed=[2,3,4,6,12];
-    const storageKey='mysqlStudioSchemaColumnWidth.v1';
+    const initialProfileWidth=<?= h((string)ms_profile_setting_int('schemaColumnWidth',3,2,12)) ?>;
     const columns=Array.from(document.querySelectorAll('[data-ms-schema-column]'));
     const buttons=Array.from(document.querySelectorAll('[data-ms-schema-col]'));
     if(!columns.length||!buttons.length)return;
@@ -5460,12 +5889,12 @@ function page_schema(mysqli $db): void {
         button.classList.toggle('btn-outline-secondary',!active);
         button.setAttribute('aria-pressed',active?'true':'false');
       });
-      try{localStorage.setItem(storageKey,String(width));}catch(error){}
     };
-    let initial=3;
-    try{const stored=Number(localStorage.getItem(storageKey));if(allowed.includes(stored))initial=stored;}catch(error){}
-    apply(initial);
-    buttons.forEach(button=>button.addEventListener('click',()=>apply(Number(button.dataset.msSchemaCol))));
+    apply(allowed.includes(Number(initialProfileWidth))?Number(initialProfileWidth):3);
+    buttons.forEach(button=>button.addEventListener('click',async()=>{
+      const width=Number(button.dataset.msSchemaCol);apply(width);
+      try{await window.msConfigPost('schema_width',{width:String(width)});}catch(error){alert(error.message||String(error));}
+    }));
   })();
   </script><?php
 }
@@ -5523,7 +5952,7 @@ function render_column_display_settings(): void {
       foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
       foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
     }
-    ?><p class="text-body-secondary">These rules are stored server-side in <code><?= h(ms_column_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
+    ?><p class="text-body-secondary">These rules are stored inside the active profile in <code><?= h(ms_profile_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
     <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
@@ -5571,19 +6000,19 @@ function page_settings(): void {
     try {
       $settingsDb = connect_db();
       $settingsTables = db_all($settingsDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
-      $login = is_array($_SESSION['ms_login'] ?? null) ? $_SESSION['ms_login'] : [];
-      $settingsSidebarServer = hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? '') . "\0" . (string)($login['user'] ?? ''));
       foreach ($settingsTables as $settingsTable) {
         $settingsName = (string)$settingsTable['TABLE_NAME'];
         $settingsSidebarObjects[] = [
           'name' => $settingsName,
           'type' => (string)$settingsTable['TABLE_TYPE'],
-          'key' => hash('sha256', $settingsSidebarServer . "\0" . $settingsDbName . "\0" . $settingsName)
+          'key' => $settingsName
         ];
       }
     } catch (Throwable $ignored) {}
   }
-  title_bar('Settings', 'Browser preferences plus server-side column display rules.');
+  $activeProfile = ms_active_profile_name();
+  $profileNames = ms_profile_names();
+  title_bar('Settings', 'Profile: ' . $activeProfile . ' · all preferences and database display customizations are profile-specific.');
   $updateCache = ms_update_cache_read();
   $updateCheckedAt = (int)($updateCache['checked_at'] ?? 0);
   $updateRemoteVersion = trim((string)($updateCache['remote_version'] ?? ''));
@@ -5597,8 +6026,7 @@ function page_settings(): void {
     'check_failed' => 'Check failed'
   ];
   $updateStatusLabel = $updateStatusLabels[$updateStatus] ?? ucfirst(str_replace('_', ' ', $updateStatus));
-  ?><div id="ms-settings-saved" class="alert alert-success d-none" role="status"><i class="fa-solid fa-circle-check me-2"></i>Settings saved.</div>
-  <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-cloud-arrow-down me-2"></i>Software update</h2><a class="btn btn-primary btn-sm" href="<?= h(url(['ms_check_update' => '1'])) ?>"><i class="fa-solid fa-rotate me-1"></i>Check for new version</a></div><div class="card-body">
+  ?><section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-cloud-arrow-down me-2"></i>Software update</h2><a class="btn btn-primary btn-sm" href="<?= h(url(['ms_check_update' => '1'])) ?>"><i class="fa-solid fa-rotate me-1"></i>Check for new version</a></div><div class="card-body">
     <div class="row g-3">
       <div class="col-md-3"><div class="small text-body-secondary">Installed version</div><div class="fw-semibold">v<?= h(MS_VERSION) ?></div></div>
       <div class="col-md-3"><div class="small text-body-secondary">Last checked</div><div class="fw-semibold"><?= $updateCheckedAt > 0 ? h(date('Y-m-d H:i:s', $updateCheckedAt)) : 'Never' ?></div></div>
@@ -5608,7 +6036,13 @@ function page_settings(): void {
       <div class="col-12"><div class="small text-body-secondary">The automatic check runs at most once every <?= h((string)(MS_UPDATE_CHECK_SECONDS / 3600)) ?> hours. The shared update state is stored in <code><?= h(ms_update_runtime_file('update.json')) ?></code>. Clicking the version number or this button bypasses the cache and checks GitHub immediately.</div></div>
     </div>
   </div></section>
-  <form id="ms-settings-form">
+  <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-user-gear me-2"></i>Profiles</h2></div><div class="card-body">
+    <div class="row g-3 align-items-end"><div class="col-lg-4"><div class="small text-body-secondary">Active profile</div><div class="fs-5 fw-semibold"><?= h($activeProfile) ?></div><div class="form-text">Configuration file: <code><?= h(ms_profile_config_file()) ?></code></div></div>
+    <div class="col-lg-4"><form method="post" class="row g-2"><input type="hidden" name="action" value="create_profile"><?= csrf_field() ?><div class="col"><label class="form-label">New profile</label><input class="form-control" name="profile_name" maxlength="80" required></div><div class="col-auto align-self-end"><button class="btn btn-primary"><i class="fa-solid fa-plus me-1"></i>Create</button></div></form></div>
+    <?php if($activeProfile!=='Default'){ ?><div class="col-lg-4"><div class="d-flex flex-wrap gap-2"><form method="post" class="d-flex gap-2 flex-grow-1"><input type="hidden" name="action" value="rename_profile"><?= csrf_field() ?><input class="form-control" name="profile_name" value="<?= h($activeProfile) ?>" maxlength="80" required><button class="btn btn-secondary text-nowrap"><i class="fa-solid fa-pen me-1"></i>Rename</button></form><form method="post"><input type="hidden" name="action" value="delete_profile"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete profile <?= h($activeProfile) ?> and all of its settings?"><i class="fa-solid fa-trash"></i></button></form></div></div><?php } ?>
+    </div><div class="form-text mt-3">Default always exists. New profiles start with clean defaults. No legacy configuration is imported.</div>
+  </div></section>
+  <form id="ms-settings-form" method="post"><input type="hidden" name="action" value="save_profile_settings"><?= csrf_field() ?>
     <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-circle-half-stroke me-2"></i>Appearance mode</h2></div><div class="card-body"><div class="row g-3">
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-light" value="light"><label class="settings-choice card h-100" for="theme-light"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-warning"><i class="fa-solid fa-sun"></i></span><span><strong class="d-block">Light</strong><span class="text-body-secondary">Bright background for well-lit environments.</span></span></div></label></div>
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-dark" value="dark"><label class="settings-choice card h-100" for="theme-dark"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-primary"><i class="fa-solid fa-moon"></i></span><span><strong class="d-block">Dark</strong><span class="text-body-secondary">Reduced glare for low-light environments.</span></span></div></label></div>
@@ -5626,8 +6060,8 @@ function page_settings(): void {
       <div class="col-md-6"><label class="form-label" for="settings-sql-rows">Default number of rows in Execute SQL</label><input class="form-control" type="number" name="sqlRows" id="settings-sql-rows" min="1" max="100000" step="1" required><div class="form-text">Result sets display this many rows unless “Show all result rows” is enabled. Exports still include the complete result.</div></div>
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
-      <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
-      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order, widths, and per-table left-sidebar visibility are saved automatically for each server, database and table. Restore defaults also makes all tables visible in the sidebar again. A schema mismatch discards that table’s saved column layout and restores its natural column layout.</div></div>
+      <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" value="1" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
+      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules and saved searches are also profile-specific. Restore defaults resets the complete active profile.</div></div>
     </div></div></section>
 
     <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
