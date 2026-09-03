@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.12.7';
+const MS_VERSION = '1.13.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1320,11 +1320,91 @@ function ms_render_image_value($value, array $rule): string {
     '</a>';
 }
 
-function ms_render_formatted_value($value, array $rule): string {
-  if ($value === null) {
-    return render_value(null);
+function ms_text_length(string $value): int {
+  return function_exists('mb_strlen') ? (int)mb_strlen($value, 'UTF-8') : strlen($value);
+}
+
+function ms_text_slice(string $value, int $start, ?int $length = null): string {
+  if (function_exists('mb_substr')) {
+    return $length === null ? (string)mb_substr($value, $start, ms_text_length($value), 'UTF-8') : (string)mb_substr($value, $start, $length, 'UTF-8');
   }
+  return $length === null ? (string)substr($value, $start) : (string)substr($value, $start, $length);
+}
+
+function ms_currency_symbol(string $currency): string {
+  $symbols = ['' => '', 'EUR' => '€', 'USD' => '$', 'THB' => '฿', 'GBP' => '£'];
+  return $symbols[$currency] ?? '';
+}
+
+function ms_parse_display_date($value): ?DateTimeImmutable {
+  $text = trim((string)$value);
+  if ($text === '' || $text === '0000-00-00' || strpos($text, '0000-00-00 ') === 0) {
+    return null;
+  }
+  try {
+    return new DateTimeImmutable($text);
+  } catch (Throwable $e) {
+    return null;
+  }
+}
+
+function ms_relative_date_text(DateTimeImmutable $date): string {
+  $today = new DateTimeImmutable('today', $date->getTimezone());
+  $target = $date->setTime(0, 0, 0);
+  $future = $target > $today;
+  $days = (int)$today->diff($target)->format('%a');
+  if ($days === 0) return 'today';
+  if ($days === 1) return $future ? 'tomorrow' : 'yesterday';
+  if ($days <= 30) return $future ? 'in ' . $days . ' days' : $days . ' days ago';
+
+  $todayMonth = ((int)$today->format('Y') * 12) + (int)$today->format('n');
+  $targetMonth = ((int)$target->format('Y') * 12) + (int)$target->format('n');
+  $months = abs($targetMonth - $todayMonth);
+  if ($months <= 1) return $future ? 'next month' : 'last month';
+  if ($months <= 11) return $future ? 'in ' . $months . ' months' : $months . ' months ago';
+
+  $years = max(1, (int)floor($months / 12));
+  $label = 'more than ' . $years . ' year' . ($years === 1 ? '' : 's');
+  return $future ? $label . ' from now' : $label . ' ago';
+}
+
+function ms_elapsed_date_text(DateTimeImmutable $date): string {
+  $now = new DateTimeImmutable('now', $date->getTimezone());
+  $future = $date > $now;
+  $interval = $now->diff($date);
+  $parts = [];
+  foreach ([['y', 'year'], ['m', 'month'], ['d', 'day']] as $item) {
+    $amount = (int)$interval->{$item[0]};
+    if ($amount > 0) $parts[] = $amount . ' ' . $item[1] . ($amount === 1 ? '' : 's');
+    if (count($parts) >= 2) break;
+  }
+  if (!$parts) return 'today';
+  $text = implode(', ', $parts);
+  return $future ? 'in ' . $text : $text;
+}
+
+function ms_render_number($value, int $decimals, string $prefix = '', string $suffix = '', bool $group = true): ?string {
+  $text = trim((string)$value);
+  if ($text === '' || !is_numeric($text)) return null;
+  $formatted = number_format((float)$text, max(0, min(8, $decimals)), '.', $group ? ',' : '');
+  return '<span class="text-nowrap">' . h($prefix) . h($formatted) . h($suffix) . '</span>';
+}
+
+function ms_render_formatted_value($value, array $rule): string {
   $kind = (string)($rule['kind'] ?? '');
+  if ($kind === 'null_display') {
+    if ($value === null) {
+      $label = trim((string)($rule['null_label'] ?? 'NULL')) ?: 'NULL';
+      return '<span class="badge text-bg-secondary">' . h($label) . '</span>';
+    }
+    if ((string)$value === '') {
+      $label = trim((string)($rule['empty_label'] ?? 'EMPTY')) ?: 'EMPTY';
+      return '<span class="badge text-bg-light border text-body-secondary">' . h($label) . '</span>';
+    }
+    return render_value($value);
+  }
+  if ($value === null) return render_value(null);
+
   if ($kind === 'date' || $kind === 'datetime') {
     $format = (string)($rule['format'] ?? ($kind === 'date' ? 'd-m-Y' : 'd-m-Y H:i:s'));
     $allowed = $kind === 'date'
@@ -1347,12 +1427,306 @@ function ms_render_formatted_value($value, array $rule): string {
     }
     $decimals = max(0, min(4, (int)($rule['decimals'] ?? 2)));
     $currency = (string)($rule['currency'] ?? '');
-    $symbols = ['' => '', 'EUR' => '€', 'USD' => '$', 'THB' => '฿', 'GBP' => '£'];
-    $symbol = $symbols[$currency] ?? '';
+    $symbol = ms_currency_symbol($currency);
     $formatted = number_format((float)$text, $decimals, '.', ',');
     return '<span class="text-nowrap">' . ($symbol !== '' ? h($symbol) . '&nbsp;' : '') . h($formatted) . '</span>';
   }
+
+  if ($kind === 'relative_date' || $kind === 'date_relative' || $kind === 'elapsed_date') {
+    $date = ms_parse_display_date($value);
+    if (!$date) return render_value($value);
+    if ($kind === 'relative_date') return '<span class="text-nowrap">' . h(ms_relative_date_text($date)) . '</span>';
+    if ($kind === 'elapsed_date') return '<span class="text-nowrap">' . h(ms_elapsed_date_text($date)) . '</span>';
+    $format = (string)($rule['format'] ?? 'd-m-Y');
+    $allowed = ['d-m-Y', 'd/m/Y', 'd.m.Y', 'j/n/Y', 'Y-m-d', 'Ymd', 'm/d/Y', 'm-d-Y', 'j M Y', 'j F Y', 'M j, Y', 'F j, Y', 'D, d M Y', 'l, j F Y'];
+    if (!in_array($format, $allowed, true)) $format = 'd-m-Y';
+    return '<span class="text-nowrap">' . h($date->format($format)) . '<br><small class="text-body-secondary">' . h(ms_relative_date_text($date)) . '</small></span>';
+  }
+
+  if ($kind === 'boolean') {
+    $text = strtolower(trim((string)$value));
+    $trueValues = ['1', 'true', 'yes', 'y', 'on'];
+    $falseValues = ['0', 'false', 'no', 'n', 'off', ''];
+    if (in_array($text, $trueValues, true)) {
+      return '<span class="badge text-bg-success"><i class="fa-solid fa-check me-1"></i>' . h((string)($rule['true_label'] ?? 'Yes')) . '</span>';
+    }
+    if (in_array($text, $falseValues, true)) {
+      return '<span class="badge text-bg-danger"><i class="fa-solid fa-xmark me-1"></i>' . h((string)($rule['false_label'] ?? 'No')) . '</span>';
+    }
+    return render_value($value);
+  }
+
+  if ($kind === 'value_map') {
+    $map = isset($rule['map']) && is_array($rule['map']) ? $rule['map'] : [];
+    $key = (string)$value;
+    if (!array_key_exists($key, $map) || !is_array($map[$key])) return render_value($value);
+    $item = $map[$key];
+    $label = (string)($item['label'] ?? $key);
+    $color = (string)($item['color'] ?? 'secondary');
+    $allowedColors = ['primary', 'secondary', 'success', 'danger', 'warning', 'info', 'light', 'dark'];
+    if (!in_array($color, $allowedColors, true)) $color = 'secondary';
+    $extra = in_array($color, ['warning', 'info', 'light'], true) ? ' text-dark' : '';
+    return '<span class="badge text-bg-' . h($color) . $extra . '">' . h($label) . '</span>';
+  }
+
+  if ($kind === 'percentage') {
+    $text = trim((string)$value);
+    if ($text === '' || !is_numeric($text)) return render_value($value);
+    $percentage = (float)$text * (($rule['input'] ?? 'value') === 'fraction' ? 100 : 1);
+    $decimals = max(0, min(4, (int)($rule['decimals'] ?? 1)));
+    $label = number_format($percentage, $decimals, '.', ',') . '%';
+    if (!empty($rule['progress'])) {
+      $width = max(0, min(100, $percentage));
+      return '<div class="d-flex align-items-center gap-2 text-nowrap"><div class="progress flex-grow-1" style="min-width:80px;height:.7rem" role="progressbar" aria-valuenow="' . h((string)$width) . '" aria-valuemin="0" aria-valuemax="100"><div class="progress-bar" style="width:' . h((string)$width) . '%"></div></div><span>' . h($label) . '</span></div>';
+    }
+    return '<span class="text-nowrap">' . h($label) . '</span>';
+  }
+
+  if ($kind === 'duration') {
+    $text = trim((string)$value);
+    if ($text === '' || !is_numeric($text)) return render_value($value);
+    $seconds = (int)round((float)$text * (($rule['input'] ?? 'seconds') === 'minutes' ? 60 : 1));
+    $negative = $seconds < 0;
+    $seconds = abs($seconds);
+    $days = intdiv($seconds, 86400); $seconds %= 86400;
+    $hours = intdiv($seconds, 3600); $seconds %= 3600;
+    $minutes = intdiv($seconds, 60); $seconds %= 60;
+    $parts = [];
+    if ($days) $parts[] = $days . 'd';
+    if ($hours) $parts[] = $hours . 'h';
+    if ($minutes) $parts[] = $minutes . 'm';
+    if ($seconds || !$parts) $parts[] = $seconds . 's';
+    return '<span class="text-nowrap">' . ($negative ? '−' : '') . h(implode(' ', $parts)) . '</span>';
+  }
+
+  if ($kind === 'file_size') {
+    $text = trim((string)$value);
+    if ($text === '' || !is_numeric($text)) return render_value($value);
+    $multipliers = ['bytes' => 1, 'kb' => 1024, 'mb' => 1048576];
+    $bytes = (float)$text * ($multipliers[(string)($rule['input'] ?? 'bytes')] ?? 1);
+    $negative = $bytes < 0; $bytes = abs($bytes);
+    $units = ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB']; $unit = 0;
+    while ($bytes >= 1024 && $unit < count($units) - 1) { $bytes /= 1024; $unit++; }
+    $decimals = $unit === 0 ? 0 : max(0, min(4, (int)($rule['decimals'] ?? 2)));
+    return '<span class="text-nowrap">' . ($negative ? '−' : '') . h(number_format($bytes, $decimals, '.', ',')) . '&nbsp;' . h($units[$unit]) . '</span>';
+  }
+
+  if ($kind === 'phone' || $kind === 'email' || $kind === 'whatsapp') {
+    $text = trim((string)$value);
+    if ($text === '') return render_value($value);
+    if ($kind === 'email') {
+      if (!filter_var($text, FILTER_VALIDATE_EMAIL)) return render_value($value);
+      return '<a href="mailto:' . h($text) . '"><i class="fa-solid fa-envelope me-1"></i>' . h($text) . '</a>';
+    }
+    if ($kind === 'whatsapp') {
+      $digits = preg_replace('/\D+/', '', $text);
+      if (!is_string($digits) || $digits === '') return render_value($value);
+      return '<a href="https://wa.me/' . h($digits) . '" target="_blank" rel="noopener"><i class="fa-brands fa-whatsapp me-1"></i>' . h($text) . '</a>';
+    }
+    $target = preg_replace('/[^0-9+*#,;pwPW]/', '', $text);
+    if (!is_string($target) || $target === '') return render_value($value);
+    return '<a href="tel:' . h($target) . '"><i class="fa-solid fa-phone me-1"></i>' . h($text) . '</a>';
+  }
+
+  if ($kind === 'url') {
+    $text = trim((string)$value);
+    if (preg_match('#\Ahttps?://[^\s<>"\']+\z#iu', $text) !== 1) return render_value($value);
+    $label = $text;
+    if (($rule['display'] ?? 'full') === 'domain') {
+      $host = parse_url($text, PHP_URL_HOST);
+      $path = parse_url($text, PHP_URL_PATH);
+      $label = is_string($host) && $host !== '' ? $host . (is_string($path) && $path !== '/' ? $path : '') : $text;
+    }
+    return '<a href="' . h($text) . '" target="_blank" rel="noopener" title="' . h($text) . '">' . h($label) . ' <i class="fa-solid fa-arrow-up-right-from-square small"></i></a>';
+  }
+
+  if ($kind === 'color') {
+    $text = trim((string)$value);
+    if (preg_match('/\A#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\z/', $text) !== 1) return render_value($value);
+    return '<span class="d-inline-flex align-items-center gap-2 text-nowrap"><span class="border rounded" style="display:inline-block;width:1.35rem;height:1.35rem;background:' . h($text) . '"></span><span class="font-monospace">' . h($text) . '</span></span>';
+  }
+
+  if ($kind === 'json') {
+    $text = (string)$value;
+    $decoded = json_decode($text, true);
+    if (json_last_error() !== JSON_ERROR_NONE) return render_value($value);
+    $pretty = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($pretty)) return render_value($value);
+    $pre = '<pre class="code mb-0 p-2 bg-body-tertiary border rounded" style="max-width:46rem;max-height:24rem;overflow:auto">' . h($pretty) . '</pre>';
+    if (!empty($rule['collapsed'])) return '<details><summary class="btn btn-sm btn-outline-secondary">View JSON</summary><div class="mt-2">' . $pre . '</div></details>';
+    return $pre;
+  }
+
+  if ($kind === 'truncate') {
+    $text = (string)$value;
+    $length = max(10, min(2000, (int)($rule['length'] ?? 120)));
+    if (ms_text_length($text) <= $length) return render_value($value, max(500, $length));
+    $preview = rtrim(ms_text_slice($text, 0, $length));
+    return '<details><summary>' . h($preview) . '… <span class="text-primary">more</span></summary><div class="cell-value mt-2 p-2 border rounded">' . h($text) . '</div></details>';
+  }
+
+  if ($kind === 'multiline') return '<span class="cell-value">' . nl2br(h((string)$value)) . '</span>';
+  if ($kind === 'html') return (string)$value;
+
+  if ($kind === 'image_url') {
+    $src = trim((string)$value);
+    if (!ms_safe_image_base_url($src)) return render_value($value);
+    $width = max(16, min(1024, (int)($rule['width'] ?? 96)));
+    return '<a href="' . h($src) . '" target="_blank" rel="noopener"><img src="' . h($src) . '" alt="' . h($src) . '" loading="lazy" decoding="async" width="' . $width . '" style="width:' . $width . 'px;max-width:' . $width . 'px;height:auto;max-height:' . $width . 'px;object-fit:contain"></a>';
+  }
+
+  if ($kind === 'accounting') {
+    $text = trim((string)$value);
+    if ($text === '' || !is_numeric($text)) return render_value($value);
+    $number = (float)$text; $negative = $number < 0;
+    $decimals = max(0, min(4, (int)($rule['decimals'] ?? 2)));
+    $symbol = ms_currency_symbol((string)($rule['currency'] ?? ''));
+    $body = ($symbol !== '' ? h($symbol) . '&nbsp;' : '') . h(number_format(abs($number), $decimals, '.', ','));
+    return '<span class="text-nowrap' . ($negative ? ' text-danger' : '') . '">' . ($negative ? '(' . $body . ')' : $body) . '</span>';
+  }
+
+  if ($kind === 'compact_number') {
+    $text = trim((string)$value);
+    if ($text === '' || !is_numeric($text)) return render_value($value);
+    $number = (float)$text; $absolute = abs($number); $suffix = ''; $divisor = 1;
+    foreach ([[1.0e12, 'T'], [1.0e9, 'B'], [1.0e6, 'M'], [1.0e3, 'K']] as $scale) {
+      if ($absolute >= $scale[0]) { $divisor = $scale[0]; $suffix = $scale[1]; break; }
+    }
+    $decimals = max(0, min(4, (int)($rule['decimals'] ?? 2)));
+    return '<span class="text-nowrap">' . h(number_format($number / $divisor, $decimals, '.', '')) . h($suffix) . '</span>';
+  }
+
+  if ($kind === 'number') {
+    $rendered = ms_render_number($value, (int)($rule['decimals'] ?? 0), '', '', true);
+    return $rendered ?? render_value($value);
+  }
+
+  if ($kind === 'unit') {
+    $rendered = ms_render_number($value, (int)($rule['decimals'] ?? 2), (string)($rule['prefix'] ?? ''), (string)($rule['suffix'] ?? ''), !empty($rule['group']));
+    return $rendered ?? render_value($value);
+  }
+
+  if ($kind === 'ip') {
+    $text = trim((string)$value);
+    if (!filter_var($text, FILTER_VALIDATE_IP)) return render_value($value);
+    $body = '<span class="font-monospace">' . h($text) . '</span>';
+    return !empty($rule['lookup']) ? '<a href="https://whatismyipaddress.com/ip/' . rawurlencode($text) . '" target="_blank" rel="noopener">' . $body . ' <i class="fa-solid fa-arrow-up-right-from-square small"></i></a>' : $body;
+  }
+
+  if ($kind === 'coordinates') {
+    $text = trim((string)$value);
+    if (preg_match('/\A\s*(-?\d+(?:\.\d+)?)\s*[,;]\s*(-?\d+(?:\.\d+)?)\s*\z/', $text, $match) !== 1) return render_value($value);
+    $lat = (float)$match[1]; $lng = (float)$match[2];
+    if ($lat < -90 || $lat > 90 || $lng < -180 || $lng > 180) return render_value($value);
+    $query = $match[1] . ',' . $match[2];
+    return '<a href="https://www.google.com/maps?q=' . rawurlencode($query) . '" target="_blank" rel="noopener"><i class="fa-solid fa-map-location-dot me-1"></i>' . h($query) . '</a>';
+  }
+
+  if ($kind === 'masked') {
+    $text = (string)$value;
+    $keep = max(0, min(32, (int)($rule['keep_last'] ?? 4)));
+    $length = ms_text_length($text);
+    if ($length <= $keep) return render_value($value);
+    $prefix = ms_text_slice($text, 0, $length - $keep);
+    $suffix = $keep > 0 ? ms_text_slice($text, $length - $keep) : '';
+    $masked = preg_replace('/[^\s\-._]/u', '•', $prefix);
+    return '<span class="font-monospace text-nowrap" title="Masked display">' . h((string)$masked . $suffix) . '</span>';
+  }
+
   return render_value($value);
+}
+
+function ms_display_short_text(string $field, string $default, int $maximum = 100): string {
+  $value = trim(p($field, $default));
+  if ($value === '') $value = $default;
+  if (ms_text_length($value) > $maximum) {
+    throw new RuntimeException('Display text is too long (maximum ' . $maximum . ' characters).');
+  }
+  return $value;
+}
+
+function ms_display_rule_from_post(string $style): array {
+  if ($style === 'relative_date') return ['kind' => 'relative_date'];
+  if ($style === 'elapsed_date') return ['kind' => 'elapsed_date'];
+  if ($style === 'date_relative') {
+    $format = p('relative_date_format', 'd-m-Y');
+    $allowed = ['d-m-Y', 'd/m/Y', 'd.m.Y', 'j/n/Y', 'Y-m-d', 'Ymd', 'm/d/Y', 'm-d-Y', 'j M Y', 'j F Y', 'M j, Y', 'F j, Y', 'D, d M Y', 'l, j F Y'];
+    if (!in_array($format, $allowed, true)) throw new RuntimeException('Choose a valid date format.');
+    return ['kind' => 'date_relative', 'format' => $format];
+  }
+  if ($style === 'boolean') {
+    return [
+      'kind' => 'boolean',
+      'true_label' => ms_display_short_text('boolean_true_label', 'Yes'),
+      'false_label' => ms_display_short_text('boolean_false_label', 'No')
+    ];
+  }
+  if ($style === 'value_map') {
+    $source = p('value_map_rules');
+    if (strlen($source) > 100000) throw new RuntimeException('The value map is too large.');
+    $map = [];
+    $allowedColors = ['primary', 'secondary', 'success', 'danger', 'warning', 'info', 'light', 'dark'];
+    foreach (preg_split('/\r\n|\r|\n/', $source) ?: [] as $lineNumber => $line) {
+      if (trim($line) === '') continue;
+      $parts = array_map('trim', explode('|', $line, 3));
+      if (count($parts) < 2 || $parts[0] === '' || $parts[1] === '') {
+        throw new RuntimeException('Invalid value-map line ' . ($lineNumber + 1) . '. Use value | label | color.');
+      }
+      $color = $parts[2] ?? 'secondary';
+      if (!in_array($color, $allowedColors, true)) {
+        throw new RuntimeException('Invalid Bootstrap color on value-map line ' . ($lineNumber + 1) . '.');
+      }
+      if (ms_text_length($parts[0]) > 255 || ms_text_length($parts[1]) > 255) {
+        throw new RuntimeException('Value-map values and labels must be 255 characters or fewer.');
+      }
+      $map[$parts[0]] = ['label' => $parts[1], 'color' => $color];
+      if (count($map) > 200) throw new RuntimeException('A value map can contain at most 200 entries.');
+    }
+    if (!$map) throw new RuntimeException('Enter at least one value mapping.');
+    return ['kind' => 'value_map', 'map' => $map];
+  }
+  if ($style === 'percentage') {
+    $input = p('percentage_input', 'value');
+    if (!in_array($input, ['value', 'fraction'], true)) throw new RuntimeException('Choose a valid percentage input type.');
+    return ['kind' => 'percentage', 'input' => $input, 'decimals' => max(0, min(4, (int)p('percentage_decimals', '1'))), 'progress' => p('percentage_progress') === '1'];
+  }
+  if ($style === 'duration') {
+    $input = p('duration_input', 'seconds');
+    if (!in_array($input, ['seconds', 'minutes'], true)) throw new RuntimeException('Choose a valid duration input unit.');
+    return ['kind' => 'duration', 'input' => $input];
+  }
+  if ($style === 'file_size') {
+    $input = p('file_size_input', 'bytes');
+    if (!in_array($input, ['bytes', 'kb', 'mb'], true)) throw new RuntimeException('Choose a valid file-size input unit.');
+    return ['kind' => 'file_size', 'input' => $input, 'decimals' => max(0, min(4, (int)p('file_size_decimals', '2')))];
+  }
+  if (in_array($style, ['phone', 'email', 'whatsapp', 'color', 'multiline', 'html', 'coordinates'], true)) return ['kind' => $style];
+  if ($style === 'url') {
+    $display = p('url_display', 'full');
+    if (!in_array($display, ['full', 'domain'], true)) throw new RuntimeException('Choose a valid URL display.');
+    return ['kind' => 'url', 'display' => $display];
+  }
+  if ($style === 'json') return ['kind' => 'json', 'collapsed' => p('json_collapsed') === '1'];
+  if ($style === 'truncate') return ['kind' => 'truncate', 'length' => max(10, min(2000, (int)p('truncate_length', '120')))];
+  if ($style === 'image_url') return ['kind' => 'image_url', 'width' => max(16, min(1024, (int)p('image_url_width', '96')))];
+  if ($style === 'accounting') {
+    $currency = p('accounting_currency');
+    if (!in_array($currency, ['', 'EUR', 'USD', 'THB', 'GBP'], true)) throw new RuntimeException('Choose a valid currency.');
+    return ['kind' => 'accounting', 'currency' => $currency, 'decimals' => max(0, min(4, (int)p('accounting_decimals', '2')))];
+  }
+  if ($style === 'compact_number') return ['kind' => 'compact_number', 'decimals' => max(0, min(4, (int)p('compact_decimals', '2')))];
+  if ($style === 'number') return ['kind' => 'number', 'decimals' => max(0, min(8, (int)p('number_decimals', '0')))];
+  if ($style === 'unit') {
+    $prefix = p('unit_prefix'); $suffix = p('unit_suffix');
+    if (ms_text_length($prefix) > 50 || ms_text_length($suffix) > 50) throw new RuntimeException('Prefix and suffix must be 50 characters or fewer.');
+    return ['kind' => 'unit', 'prefix' => $prefix, 'suffix' => $suffix, 'decimals' => max(0, min(8, (int)p('unit_decimals', '2'))), 'group' => p('unit_group') === '1'];
+  }
+  if ($style === 'ip') return ['kind' => 'ip', 'lookup' => p('ip_lookup') === '1'];
+  if ($style === 'null_display') {
+    return ['kind' => 'null_display', 'null_label' => ms_display_short_text('null_label', 'NULL'), 'empty_label' => ms_display_short_text('empty_label', 'EMPTY')];
+  }
+  if ($style === 'masked') return ['kind' => 'masked', 'keep_last' => max(0, min(32, (int)p('masked_keep_last', '4')))];
+  throw new RuntimeException('Choose a valid display style.');
 }
 
 function primary_columns(mysqli $db, string $table): array {
@@ -2787,6 +3161,14 @@ try {
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'money', 'currency' => $currency, 'decimals' => $decimals]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
             go([], $configTable . '.' . $configColumn . ' money display saved' . ($hideColumn ? ' and column hidden.' : '.'));
+          } elseif (in_array($style, [
+            'relative_date', 'date_relative', 'elapsed_date', 'boolean', 'value_map', 'percentage', 'duration', 'file_size',
+            'phone', 'email', 'url', 'whatsapp', 'color', 'json', 'truncate', 'multiline', 'html', 'image_url',
+            'accounting', 'compact_number', 'number', 'unit', 'ip', 'coordinates', 'null_display', 'masked'
+          ], true)) {
+            ms_column_view_set_format($database, $configTable, $configColumn, ms_display_rule_from_post($style));
+            ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            go([], $configTable . '.' . $configColumn . ' ' . str_replace('_', ' ', $style) . ' display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'image') {
             $baseUrl = trim(p('image_base_url'));
             $width = max(16, min(1024, (int)p('image_width', '96')));
@@ -4886,10 +5268,11 @@ function page_select(mysqli $db): void {
       $storedImageRule=is_array($storedImageColumns[$header]??null)?$storedImageColumns[$header]:[];
       $storedSoftRule=is_array($storedSoftFkRules[$header]??null)?$storedSoftFkRules[$header]:[];
       $storedFormatRule=is_array($storedFormatRules[$header]??null)?$storedFormatRules[$header]:[];
+      $storedFormatJson=json_encode($storedFormatRule,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($storedFormatJson))$storedFormatJson='{}';
       $storedDisplayLabel=trim((string)($storedLabelRules[$header]??''));
       $alignment=(string)($alignmentRules[$header]??'left');$headerClasses=[];if($alignment==='center')$headerClasses[]='text-center';elseif($alignment==='right')$headerClasses[]='text-end';else $headerClasses[]='text-start';if(!empty($fixedFontRules[$header]))$headerClasses[]='font-monospace';
       $storedAlignment=(string)($storedAlignmentRules[$header]??'left');if(!in_array($storedAlignment,['left','center','right'],true))$storedAlignment='left';
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="true" data-ms-column-drag-handle title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$relations,$returnQuery,$returnToken);
@@ -4923,9 +5306,35 @@ function page_select(mysqli $db): void {
           <option value="default">Default / raw database value</option>
           <option value="date">Date</option>
           <option value="datetime">Date &amp; time</option>
+          <option value="relative_date">Relative date (17 days ago)</option>
+          <option value="date_relative">Date + relative date</option>
+          <option value="elapsed_date">Date age / elapsed time</option>
           <option value="money">Money</option>
+          <option value="accounting">Money · accounting style</option>
+          <option value="number">Number with thousands separators</option>
+          <option value="compact_number">Abbreviated number (K / M / B)</option>
+          <option value="unit">Number + prefix / suffix / unit</option>
+          <option value="percentage">Percentage / progress</option>
+          <option value="duration">Duration</option>
+          <option value="file_size">File size</option>
+          <option value="boolean">Boolean / Yes-No badge</option>
+          <option value="value_map">Value mapping / colored badges</option>
+          <option value="phone">Clickable phone number</option>
+          <option value="email">Clickable email address</option>
+          <option value="url">Clickable URL</option>
+          <option value="whatsapp">Clickable WhatsApp number</option>
+          <option value="coordinates">Coordinates → map</option>
+          <option value="ip">IP address</option>
+          <option value="color">Color swatch</option>
+          <option value="json">Pretty JSON</option>
+          <option value="truncate">Long-text preview</option>
+          <option value="multiline">Multiline text</option>
+          <option value="html">Trusted HTML</option>
           <option value="image">Picture from URL prefix + field value</option>
+          <option value="image_url">Picture from complete field URL</option>
           <option value="soft_fk">Virtual foreign key</option>
+          <option value="null_display">Visible NULL / empty string</option>
+          <option value="masked">Masked value</option>
         </select>
 
         <div class="border rounded p-3 mt-3" data-ms-display-section="date" hidden>
@@ -5005,6 +5414,92 @@ function page_select(mysqli $db): void {
           <div class="form-text mt-2">Thousands are grouped with commas and decimals use a dot, for example <code>฿ 12,345.67</code>.</div>
         </div>
 
+        <div class="border rounded p-3 mt-3" data-ms-display-section="relative_date" hidden>
+          <div class="form-text mt-0">Today/yesterday, up to 30 days ago, last month, months ago, then more than one or more years ago. Future dates use equivalent forward wording.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="date_relative" hidden>
+          <label class="form-label" for="ms-relative-date-format">Date format on the first line</label>
+          <select class="form-select" id="ms-relative-date-format" name="relative_date_format">
+            <option value="d-m-Y">31-08-2026</option><option value="d/m/Y">31/08/2026</option><option value="d.m.Y">31.08.2026</option><option value="j/n/Y">31/8/2026</option><option value="Y-m-d">2026-08-31</option><option value="Ymd">20260831</option><option value="m/d/Y">08/31/2026</option><option value="m-d-Y">08-31-2026</option><option value="j M Y">31 Aug 2026</option><option value="j F Y">31 August 2026</option><option value="M j, Y">Aug 31, 2026</option><option value="F j, Y">August 31, 2026</option><option value="D, d M Y">Mon, 31 Aug 2026</option><option value="l, j F Y">Monday, 31 August 2026</option>
+          </select>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="elapsed_date" hidden>
+          <div class="form-text mt-0">Shows the two largest calendar units, for example <code>6 years, 4 months</code>.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="boolean" hidden>
+          <div class="row g-3"><div class="col-md-6"><label class="form-label" for="ms-boolean-true">True label</label><input class="form-control" id="ms-boolean-true" name="boolean_true_label" maxlength="100" value="Yes"></div><div class="col-md-6"><label class="form-label" for="ms-boolean-false">False label</label><input class="form-control" id="ms-boolean-false" name="boolean_false_label" maxlength="100" value="No"></div></div>
+          <div class="form-text mt-2">True: 1, true, yes, y, on. False: 0, false, no, n, off and empty string.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="value_map" hidden>
+          <label class="form-label" for="ms-value-map">Mappings · one per line</label><textarea class="form-control code" id="ms-value-map" name="value_map_rules" rows="6" placeholder="0 | Unpaid | danger&#10;1 | Paid | success&#10;2 | Disputed | warning"></textarea>
+          <div class="form-text">Syntax: <code>stored value | displayed label | Bootstrap color</code>. Colors: primary, secondary, success, danger, warning, info, light, dark.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="percentage" hidden>
+          <div class="row g-3"><div class="col-md-7"><label class="form-label" for="ms-percentage-input">Stored value</label><select class="form-select" id="ms-percentage-input" name="percentage_input"><option value="value">23.5 means 23.5%</option><option value="fraction">0.235 means 23.5%</option></select></div><div class="col-md-5"><label class="form-label" for="ms-percentage-decimals">Decimal places</label><select class="form-select" id="ms-percentage-decimals" name="percentage_decimals"><?php for($i=0;$i<=4;$i++){?><option value="<?= $i ?>"<?= $i===1?' selected':'' ?>><?= $i ?></option><?php }?></select></div></div>
+          <div class="form-check form-switch mt-3"><input class="form-check-input" type="checkbox" role="switch" id="ms-percentage-progress" name="percentage_progress" value="1"><label class="form-check-label" for="ms-percentage-progress">Also show a progress bar</label></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="duration" hidden>
+          <label class="form-label" for="ms-duration-input">Stored unit</label><select class="form-select" id="ms-duration-input" name="duration_input"><option value="seconds">Seconds</option><option value="minutes">Minutes</option></select><div class="form-text">Example: 3665 seconds → <code>1h 1m 5s</code>.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="file_size" hidden>
+          <div class="row g-3"><div class="col-md-7"><label class="form-label" for="ms-file-size-input">Stored unit</label><select class="form-select" id="ms-file-size-input" name="file_size_input"><option value="bytes">Bytes</option><option value="kb">KB</option><option value="mb">MB</option></select></div><div class="col-md-5"><label class="form-label" for="ms-file-size-decimals">Decimal places</label><select class="form-select" id="ms-file-size-decimals" name="file_size_decimals"><?php for($i=0;$i<=4;$i++){?><option value="<?= $i ?>"<?= $i===2?' selected':'' ?>><?= $i ?></option><?php }?></select></div></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="url" hidden>
+          <label class="form-label" for="ms-url-display">Link label</label><select class="form-select" id="ms-url-display" name="url_display"><option value="full">Full URL</option><option value="domain">Domain + path</option></select>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="json" hidden>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" id="ms-json-collapsed" name="json_collapsed" value="1" checked><label class="form-check-label" for="ms-json-collapsed">Collapsed behind a “View JSON” button</label></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="truncate" hidden>
+          <label class="form-label" for="ms-truncate-length">Preview length</label><div class="input-group"><input class="form-control" type="number" id="ms-truncate-length" name="truncate_length" min="10" max="2000" value="120"><span class="input-group-text">characters</span></div><div class="form-text">The complete value expands inside the cell.</div>
+        </div>
+
+        <div class="border border-warning rounded p-3 mt-3" data-ms-display-section="html" hidden>
+          <div class="text-warning-emphasis"><i class="fa-solid fa-triangle-exclamation me-1"></i><strong>Trusted content only.</strong> The field is inserted as HTML and can execute unsafe markup permitted by the page policy.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="image_url" hidden>
+          <label class="form-label" for="ms-image-url-width">Thumbnail width</label><div class="input-group"><input class="form-control" type="number" id="ms-image-url-width" name="image_url_width" min="16" max="1024" value="96"><span class="input-group-text">px</span></div><div class="form-text">The field itself must contain the complete HTTP(S) or relative image URL.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="accounting" hidden>
+          <div class="row g-3"><div class="col-md-7"><label class="form-label" for="ms-accounting-currency">Currency / prefix</label><select class="form-select" id="ms-accounting-currency" name="accounting_currency"><option value="">No currency symbol</option><option value="EUR">€ Euro</option><option value="USD">$ US Dollar</option><option value="THB">฿ Thai Baht</option><option value="GBP">£ British Pound</option></select></div><div class="col-md-5"><label class="form-label" for="ms-accounting-decimals">Decimal places</label><select class="form-select" id="ms-accounting-decimals" name="accounting_decimals"><?php for($i=0;$i<=4;$i++){?><option value="<?= $i ?>"<?= $i===2?' selected':'' ?>><?= $i ?></option><?php }?></select></div></div><div class="form-text mt-2">Negative values appear in red parentheses, for example <code>(€ 1,234.50)</code>.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="compact_number" hidden>
+          <label class="form-label" for="ms-compact-decimals">Decimal places</label><select class="form-select" id="ms-compact-decimals" name="compact_decimals"><?php for($i=0;$i<=4;$i++){?><option value="<?= $i ?>"<?= $i===2?' selected':'' ?>><?= $i ?></option><?php }?></select><div class="form-text">Examples: <code>1.25K</code>, <code>2.65M</code>, <code>3.10B</code>.</div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="number" hidden>
+          <label class="form-label" for="ms-number-decimals">Decimal places</label><select class="form-select" id="ms-number-decimals" name="number_decimals"><?php for($i=0;$i<=8;$i++){?><option value="<?= $i ?>"><?= $i ?></option><?php }?></select>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="unit" hidden>
+          <div class="row g-3"><div class="col-md-4"><label class="form-label" for="ms-unit-prefix">Prefix</label><input class="form-control" id="ms-unit-prefix" name="unit_prefix" maxlength="50" placeholder="~"></div><div class="col-md-4"><label class="form-label" for="ms-unit-suffix">Suffix / unit</label><input class="form-control" id="ms-unit-suffix" name="unit_suffix" maxlength="50" placeholder=" kg"></div><div class="col-md-4"><label class="form-label" for="ms-unit-decimals">Decimal places</label><select class="form-select" id="ms-unit-decimals" name="unit_decimals"><?php for($i=0;$i<=8;$i++){?><option value="<?= $i ?>"<?= $i===2?' selected':'' ?>><?= $i ?></option><?php }?></select></div></div><div class="form-check form-switch mt-3"><input class="form-check-input" type="checkbox" role="switch" id="ms-unit-group" name="unit_group" value="1" checked><label class="form-check-label" for="ms-unit-group">Use thousands separators</label></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="ip" hidden>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" id="ms-ip-lookup" name="ip_lookup" value="1"><label class="form-check-label" for="ms-ip-lookup">Link to external IP lookup</label></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="null_display" hidden>
+          <div class="row g-3"><div class="col-md-6"><label class="form-label" for="ms-null-label">NULL label</label><input class="form-control" id="ms-null-label" name="null_label" maxlength="100" value="NULL"></div><div class="col-md-6"><label class="form-label" for="ms-empty-label">Empty-string label</label><input class="form-control" id="ms-empty-label" name="empty_label" maxlength="100" value="EMPTY"></div></div>
+        </div>
+
+        <div class="border rounded p-3 mt-3" data-ms-display-section="masked" hidden>
+          <label class="form-label" for="ms-masked-keep">Visible characters at the end</label><input class="form-control" type="number" id="ms-masked-keep" name="masked_keep_last" min="0" max="32" value="4"><div class="form-text">Spaces, dashes, dots and underscores remain visible in the masked portion.</div>
+        </div>
+
         <div class="border rounded p-3 mt-3" data-ms-display-section="image" hidden>
           <label class="form-label" for="ms-image-base-url">URL prefix</label><input class="form-control code" id="ms-image-base-url" name="image_base_url" placeholder="https://example.com/images/">
           <div class="form-text">The field content is appended exactly. Example: <code>https://site/images/</code> + <code>123.jpg</code>. The thumbnail is clickable and opens the full picture.</div>
@@ -5044,6 +5539,8 @@ function page_select(mysqli $db): void {
     const sections=Array.from(viewModal.querySelectorAll('[data-ms-display-section]'));
     let currentHeader=null;
     const setColumnLabels=column=>viewModal.querySelectorAll('[data-ms-modal-column]').forEach(el=>el.textContent=column);
+    const decodeFormatRule=header=>{try{const encoded=header.dataset.msFormatRule||'';if(!encoded)return{};const bytes=Uint8Array.from(atob(encoded),char=>char.charCodeAt(0));const parsed=JSON.parse(new TextDecoder().decode(bytes));return parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:{};}catch(error){return{};}};
+    const setField=(name,value)=>{const field=viewForm.elements.namedItem(name);if(!field)return;if(field.type==='checkbox')field.checked=!!value;else if(value!==undefined&&value!==null)field.value=String(value);};
     const fillColumnSelect=(select,columns,selected)=>{select.innerHTML='<option value="">Choose…</option>';columns.forEach(column=>{const option=document.createElement('option');option.value=column;option.textContent=column;if(column===selected)option.selected=true;select.appendChild(option);});select.disabled=false;};
     const loadSoftColumns=async(table,idSelected='',valueSelected='')=>{
       softId.disabled=true;softValue.disabled=true;
@@ -5065,6 +5562,7 @@ function page_select(mysqli $db): void {
     const openViewSettings=async header=>{
       if(!header)return;
       currentHeader=header;
+      viewForm.reset();
       const column=header.dataset.msColumn||'';
       viewForm.elements.config_column.value=column;setColumnLabels(column);
       displayLabel.value=header.dataset.msDisplayLabel||'';
@@ -5072,14 +5570,27 @@ function page_select(mysqli $db): void {
       fixedFont.checked=header.dataset.msFixedFont==='1';
       hideColumn.checked=header.dataset.msHidden==='1';updateHideLabel();
       let style=header.dataset.msDisplayKind||'';
+      const rule=decodeFormatRule(header);
       if(header.dataset.msImageBase)style='image';
       else if(header.dataset.msSoftTable)style='soft_fk';
-      else if(!['date','datetime','money'].includes(style))style='default';
+      else if(!Array.from(displayStyle.options).some(option=>option.value===style))style='default';
       displayStyle.value=style;
-      dateFormat.value=style==='date'&&(header.dataset.msDisplayFormat||'')?header.dataset.msDisplayFormat:'d-m-Y';
-      datetimeFormat.value=style==='datetime'&&(header.dataset.msDisplayFormat||'')?header.dataset.msDisplayFormat:'d-m-Y H:i:s';
-      moneyCurrency.value=header.dataset.msMoneyCurrency||'';
-      moneyDecimals.value=header.dataset.msMoneyDecimals||'2';
+      dateFormat.value=style==='date'&&(rule.format||header.dataset.msDisplayFormat||'')?(rule.format||header.dataset.msDisplayFormat):'d-m-Y';
+      datetimeFormat.value=style==='datetime'&&(rule.format||header.dataset.msDisplayFormat||'')?(rule.format||header.dataset.msDisplayFormat):'d-m-Y H:i:s';
+      moneyCurrency.value=rule.currency||header.dataset.msMoneyCurrency||'';
+      moneyDecimals.value=rule.decimals!==undefined?String(rule.decimals):(header.dataset.msMoneyDecimals||'2');
+      setField('relative_date_format',rule.format||'d-m-Y');
+      setField('boolean_true_label',rule.true_label||'Yes');setField('boolean_false_label',rule.false_label||'No');
+      if(rule.map&&typeof rule.map==='object'){setField('value_map_rules',Object.entries(rule.map).map(([key,item])=>`${key} | ${item&&item.label!==undefined?item.label:key} | ${item&&item.color?item.color:'secondary'}`).join('\n'));}
+      setField('percentage_input',rule.input||'value');setField('percentage_decimals',rule.decimals!==undefined?rule.decimals:1);setField('percentage_progress',rule.progress);
+      setField('duration_input',rule.input||'seconds');
+      setField('file_size_input',rule.input||'bytes');setField('file_size_decimals',rule.decimals!==undefined?rule.decimals:2);
+      setField('url_display',rule.display||'full');setField('json_collapsed',rule.collapsed!==undefined?rule.collapsed:true);setField('truncate_length',rule.length||120);
+      setField('image_url_width',rule.width||96);
+      setField('accounting_currency',rule.currency||'');setField('accounting_decimals',rule.decimals!==undefined?rule.decimals:2);
+      setField('compact_decimals',rule.decimals!==undefined?rule.decimals:2);setField('number_decimals',rule.decimals!==undefined?rule.decimals:0);
+      setField('unit_prefix',rule.prefix||'');setField('unit_suffix',rule.suffix||'');setField('unit_decimals',rule.decimals!==undefined?rule.decimals:2);setField('unit_group',rule.group!==undefined?rule.group:true);
+      setField('ip_lookup',rule.lookup);setField('null_label',rule.null_label||'NULL');setField('empty_label',rule.empty_label||'EMPTY');setField('masked_keep_last',rule.keep_last!==undefined?rule.keep_last:4);
       imageBase.value=header.dataset.msImageBase||'';imageWidth.value=header.dataset.msImageWidth||'96';
       const target=header.dataset.msSoftTable||'',id=header.dataset.msSoftId||'',value=header.dataset.msSoftValue||'';
       softTable.value=target;softId.dataset.selected=id;softValue.dataset.selected=value;
