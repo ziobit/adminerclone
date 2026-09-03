@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.13.0';
+const MS_VERSION = '1.14.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -107,7 +107,7 @@ function go(array $changes = [], string $flash = '', string $type = 'success'): 
 }
 
 function ms_allowed_pages(): array {
-  return ['databases','database','create_table','structure','select','clone_rows','row','sql','export','schema','views','routines','triggers','events','processes','users','variables','settings'];
+  return ['databases','database','create_table','structure','select','clone_rows','row','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','settings'];
 }
 
 function ms_clean_navigation_value($value, int $depth = 0) {
@@ -281,6 +281,8 @@ function ms_profile_default_settings(): array {
       'databases' => true,
       'database' => true,
       'sql' => true,
+      'query_builder' => true,
+      'import' => true,
       'export' => true,
       'schema' => true,
       'views' => true,
@@ -569,6 +571,89 @@ function ms_profile_update_database(string $database, callable $mutator): void {
       unset($config['profiles'][$profile]['servers'][$serverKey]['databases'][$database]);
     }
     return $config;
+  });
+}
+
+function ms_query_history(string $database): array {
+  $databaseConfig = ms_profile_database_config($database);
+  $history = isset($databaseConfig['query_history']) && is_array($databaseConfig['query_history']) ? $databaseConfig['query_history'] : [];
+  $clean = [];
+  foreach ($history as $entry) {
+    if (!is_array($entry) || empty($entry['id']) || !isset($entry['sql'])) continue;
+    $entry['id'] = (string)$entry['id'];
+    $entry['sql'] = (string)$entry['sql'];
+    $entry['params'] = isset($entry['params']) && is_array($entry['params']) ? $entry['params'] : [];
+    $entry['executed_at'] = (int)($entry['executed_at'] ?? 0);
+    $entry['duration'] = max(0, (float)($entry['duration'] ?? 0));
+    $entry['success'] = !empty($entry['success']);
+    $entry['favorite'] = !empty($entry['favorite']);
+    $entry['mode'] = (string)($entry['mode'] ?? 'execute');
+    $entry['error'] = (string)($entry['error'] ?? '');
+    $clean[] = $entry;
+  }
+  usort($clean, static function (array $a, array $b): int {
+    if ($a['favorite'] !== $b['favorite']) return $a['favorite'] ? -1 : 1;
+    return $b['executed_at'] <=> $a['executed_at'];
+  });
+  return $clean;
+}
+
+function ms_query_history_add(string $database, string $sql, array $params, float $duration, bool $success, string $error, string $mode): void {
+  $sql = trim($sql);
+  if ($sql === '') return;
+  if (strlen($sql) > 500000) $sql = substr($sql, 0, 500000);
+  $cleanParams = [];
+  foreach ($params as $name => $param) {
+    if (!is_array($param) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', (string)$name) !== 1) continue;
+    $type = (string)($param['type'] ?? 'text');
+    if (!in_array($type, ['text', 'number', 'null', 'raw'], true)) $type = 'text';
+    $cleanParams[(string)$name] = ['type' => $type, 'value' => substr((string)($param['value'] ?? ''), 0, 10000)];
+  }
+  $entry = [
+    'id' => bin2hex(random_bytes(8)),
+    'sql' => $sql,
+    'params' => $cleanParams,
+    'executed_at' => time(),
+    'duration' => max(0, $duration),
+    'success' => $success,
+    'favorite' => false,
+    'mode' => $mode === 'explain' ? 'explain' : 'execute',
+    'error' => substr($error, 0, 2000)
+  ];
+  ms_profile_update_database($database, static function (array $databaseConfig) use ($entry): array {
+    $history = isset($databaseConfig['query_history']) && is_array($databaseConfig['query_history']) ? $databaseConfig['query_history'] : [];
+    array_unshift($history, $entry);
+    $favorites = []; $normal = [];
+    foreach ($history as $item) {
+      if (!is_array($item)) continue;
+      if (!empty($item['favorite'])) $favorites[] = $item;
+      else $normal[] = $item;
+    }
+    usort($favorites, static function (array $a, array $b): int { return (int)($b['executed_at'] ?? 0) <=> (int)($a['executed_at'] ?? 0); });
+    usort($normal, static function (array $a, array $b): int { return (int)($b['executed_at'] ?? 0) <=> (int)($a['executed_at'] ?? 0); });
+    $databaseConfig['query_history'] = array_merge(array_slice($favorites, 0, 100), array_slice($normal, 0, 100));
+    return $databaseConfig;
+  });
+}
+
+function ms_query_history_change(string $database, string $id, string $operation): void {
+  if ($operation !== 'clear' && preg_match('/^[a-f0-9]{16}$/', $id) !== 1) throw new RuntimeException('Invalid history item.');
+  ms_profile_update_database($database, static function (array $databaseConfig) use ($id, $operation): array {
+    $history = isset($databaseConfig['query_history']) && is_array($databaseConfig['query_history']) ? $databaseConfig['query_history'] : [];
+    if ($operation === 'clear') {
+      $history = array_values(array_filter($history, static function ($entry): bool { return is_array($entry) && !empty($entry['favorite']); }));
+    } else {
+      foreach ($history as $index => $entry) {
+        if (!is_array($entry) || (string)($entry['id'] ?? '') !== $id) continue;
+        if ($operation === 'delete') unset($history[$index]);
+        elseif ($operation === 'toggle') $history[$index]['favorite'] = empty($entry['favorite']);
+        break;
+      }
+      $history = array_values($history);
+    }
+    if ($history) $databaseConfig['query_history'] = $history;
+    else unset($databaseConfig['query_history']);
+    return $databaseConfig;
   });
 }
 
@@ -2330,6 +2415,93 @@ function register_sql_result_export(string $statement): string {
   return $token;
 }
 
+function ms_sql_parameters_from_post(): array {
+  $names = isset($_POST['param_name']) && is_array($_POST['param_name']) ? array_values($_POST['param_name']) : [];
+  $values = isset($_POST['param_value']) && is_array($_POST['param_value']) ? array_values($_POST['param_value']) : [];
+  $types = isset($_POST['param_type']) && is_array($_POST['param_type']) ? array_values($_POST['param_type']) : [];
+  $parameters = [];
+  foreach ($names as $index => $rawName) {
+    $name = ltrim(trim((string)$rawName), ':');
+    if ($name === '') continue;
+    if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) throw new RuntimeException('Invalid SQL parameter name: ' . $name);
+    if (isset($parameters[$name])) throw new RuntimeException('Duplicate SQL parameter: :' . $name);
+    $type = (string)($types[$index] ?? 'text');
+    if (!in_array($type, ['text', 'number', 'null', 'raw'], true)) $type = 'text';
+    $parameters[$name] = ['type' => $type, 'value' => (string)($values[$index] ?? '')];
+  }
+  return $parameters;
+}
+
+function ms_sql_parameter_literal(mysqli $db, string $name, array $parameter): string {
+  $type = (string)($parameter['type'] ?? 'text');
+  $value = (string)($parameter['value'] ?? '');
+  if ($type === 'null') return 'NULL';
+  if ($type === 'number') {
+    $value = trim(str_replace(',', '.', $value));
+    if (preg_match('/^-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/', $value) !== 1) {
+      throw new RuntimeException('Parameter :' . $name . ' must contain a valid number.');
+    }
+    return $value;
+  }
+  if ($type === 'raw') {
+    $value = trim($value);
+    if ($value === '' || preg_match('/[;\x00]/', $value) === 1) throw new RuntimeException('Raw parameter :' . $name . ' is empty or contains a forbidden semicolon.');
+    return $value;
+  }
+  return qs($db, $value);
+}
+
+function ms_expand_sql_parameters(mysqli $db, string $sql, array $parameters): string {
+  $output = '';
+  $length = strlen($sql);
+  $quote = '';
+  $lineComment = false;
+  $blockComment = false;
+  for ($i = 0; $i < $length; $i++) {
+    $char = $sql[$i];
+    $next = $i + 1 < $length ? $sql[$i + 1] : '';
+    if ($lineComment) {
+      $output .= $char;
+      if ($char === "\n") $lineComment = false;
+      continue;
+    }
+    if ($blockComment) {
+      $output .= $char;
+      if ($char === '*' && $next === '/') { $output .= '/'; $i++; $blockComment = false; }
+      continue;
+    }
+    if ($quote !== '') {
+      $output .= $char;
+      if ($char === '\\' && $next !== '') { $output .= $next; $i++; }
+      elseif ($char === $quote) {
+        if ($next === $quote) { $output .= $next; $i++; }
+        else $quote = '';
+      }
+      continue;
+    }
+    if ($char === '#' || ($char === '-' && $next === '-' && ($i + 2 >= $length || ctype_space($sql[$i + 2])))) {
+      $lineComment = true; $output .= $char; continue;
+    }
+    if ($char === '/' && $next === '*') {
+      $blockComment = true; $output .= '/*'; $i++; continue;
+    }
+    if (in_array($char, ["'", '"', '`'], true)) {
+      $quote = $char; $output .= $char; continue;
+    }
+    if ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
+      $j = $i + 1;
+      while ($j < $length && preg_match('/[A-Za-z0-9_]/', $sql[$j]) === 1) $j++;
+      $name = substr($sql, $i + 1, $j - $i - 1);
+      if (!array_key_exists($name, $parameters)) throw new RuntimeException('Missing value for SQL parameter :' . $name . '.');
+      $output .= ms_sql_parameter_literal($db, $name, $parameters[$name]);
+      $i = $j - 1;
+      continue;
+    }
+    $output .= $char;
+  }
+  return $output;
+}
+
 function execute_sql(mysqli $db, string $sql, bool $showAll = false, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
   $started = microtime(true);
   $results = [];
@@ -2658,6 +2830,241 @@ function csv_export(mysqli $db, string $table, string $delimiter = ','): void {
   fclose($out);
 }
 
+function ms_import_cleanup(): void {
+  $now = time();
+  foreach (['ms_imports', 'ms_import_errors'] as $sessionKey) {
+    $entries = isset($_SESSION[$sessionKey]) && is_array($_SESSION[$sessionKey]) ? $_SESSION[$sessionKey] : [];
+    foreach ($entries as $token => $entry) {
+      if (!is_array($entry) || (int)($entry['created'] ?? 0) < $now - 3600 || !is_file((string)($entry['path'] ?? ''))) {
+        if (is_array($entry) && is_file((string)($entry['path'] ?? ''))) @unlink((string)$entry['path']);
+        unset($entries[$token]);
+      }
+    }
+    while (count($entries) > 5) {
+      $first = array_key_first($entries);
+      if ($first === null) break;
+      if (is_array($entries[$first]) && is_file((string)($entries[$first]['path'] ?? ''))) @unlink((string)$entries[$first]['path']);
+      unset($entries[$first]);
+    }
+    $_SESSION[$sessionKey] = $entries;
+  }
+}
+
+function ms_import_unique_headers(array $headers): array {
+  $result = []; $used = [];
+  foreach ($headers as $index => $header) {
+    $base = trim((string)$header);
+    if ($index === 0) $base = preg_replace('/^\xEF\xBB\xBF/', '', $base) ?? $base;
+    if ($base === '') $base = 'column_' . ($index + 1);
+    $base = substr($base, 0, 255);
+    $candidate = $base; $suffix = 2;
+    while (isset($used[strtolower($candidate)])) $candidate = substr($base, 0, 240) . '_' . $suffix++;
+    $used[strtolower($candidate)] = true;
+    $result[] = $candidate;
+  }
+  return $result;
+}
+
+function ms_import_detect_delimiter(string $line): string {
+  $candidates = [',' => 0, ';' => 0, "\t" => 0, '|' => 0];
+  foreach ($candidates as $delimiter => $unused) $candidates[$delimiter] = count(str_getcsv($line, $delimiter));
+  arsort($candidates);
+  $delimiter = (string)array_key_first($candidates);
+  return (int)($candidates[$delimiter] ?? 0) > 1 ? $delimiter : ',';
+}
+
+function ms_import_parse_csv_file(string $path, string $delimiterChoice): array {
+  $handle = @fopen($path, 'rb');
+  if ($handle === false) throw new RuntimeException('Cannot open the uploaded CSV file.');
+  $firstLine = fgets($handle);
+  if ($firstLine === false) { fclose($handle); throw new RuntimeException('The uploaded file is empty.'); }
+  $delimiters = ['comma' => ',', 'semicolon' => ';', 'tab' => "\t", 'pipe' => '|'];
+  $delimiter = $delimiters[$delimiterChoice] ?? ms_import_detect_delimiter($firstLine);
+  rewind($handle);
+  $headers = fgetcsv($handle, 0, $delimiter);
+  if (!is_array($headers) || !$headers) { fclose($handle); throw new RuntimeException('The CSV header row could not be read.'); }
+  if (count($headers) > 200) { fclose($handle); throw new RuntimeException('Import files can contain at most 200 columns.'); }
+  $headers = ms_import_unique_headers($headers);
+  $rows = [];
+  while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
+    if (count($rows) >= 50000) { fclose($handle); throw new RuntimeException('Import files can contain at most 50,000 data rows.'); }
+    $row = array_values($row);
+    if (count($row) < count($headers)) $row = array_pad($row, count($headers), '');
+    if (count($row) > count($headers)) $row = array_slice($row, 0, count($headers));
+    $rows[] = $row;
+  }
+  fclose($handle);
+  if (!$rows) throw new RuntimeException('The import file contains a header but no data rows.');
+  return [$headers, $rows, $delimiter];
+}
+
+function ms_import_parse_json_file(string $path): array {
+  $raw = @file_get_contents($path);
+  if (!is_string($raw) || trim($raw) === '') throw new RuntimeException('The uploaded JSON file is empty.');
+  $data = json_decode($raw, true);
+  if (json_last_error() !== JSON_ERROR_NONE || !is_array($data) || !$data) throw new RuntimeException('JSON must contain a non-empty array of objects or arrays.');
+  if (count($data) > 50000) throw new RuntimeException('Import files can contain at most 50,000 data rows.');
+  $first = reset($data);
+  if (!is_array($first)) throw new RuntimeException('Every JSON row must be an object or array.');
+  $associative = $first !== [] && array_keys($first) !== range(0, count($first) - 1);
+  $headers = []; $sourceKeys = [];
+  if ($associative) {
+    foreach ($data as $row) {
+      if (!is_array($row)) throw new RuntimeException('Every JSON row must be an object.');
+      foreach (array_keys($row) as $key) if (!in_array((string)$key, $sourceKeys, true)) $sourceKeys[] = (string)$key;
+      if (count($sourceKeys) > 200) throw new RuntimeException('Import files can contain at most 200 columns.');
+    }
+    $headers = $sourceKeys;
+  } else {
+    $maximum = 0;
+    foreach ($data as $row) { if (!is_array($row)) throw new RuntimeException('Every JSON row must be an array.'); $maximum = max($maximum, count($row)); }
+    if ($maximum < 1) throw new RuntimeException('JSON rows contain no fields.');
+    if ($maximum > 200) throw new RuntimeException('Import files can contain at most 200 columns.');
+    for ($i = 0; $i < $maximum; $i++) $headers[] = 'column_' . ($i + 1);
+  }
+  $headers = ms_import_unique_headers($headers);
+  $rows = [];
+  foreach ($data as $row) {
+    $values = [];
+    if ($associative) {
+      foreach ($sourceKeys as $sourceKey) $values[] = array_key_exists($sourceKey, $row) ? $row[$sourceKey] : null;
+    } else {
+      for ($i = 0; $i < count($headers); $i++) $values[] = $row[$i] ?? null;
+    }
+    $rows[] = $values;
+  }
+  return [$headers, $rows, 'json'];
+}
+
+function ms_import_create_preview(string $uploadPath, string $sourceName, string $delimiterChoice): string {
+  ms_import_cleanup();
+  $extension = strtolower(pathinfo($sourceName, PATHINFO_EXTENSION));
+  if ($extension === 'json') [$headers, $rows, $delimiter] = ms_import_parse_json_file($uploadPath);
+  elseif (in_array($extension, ['csv', 'tsv', 'txt'], true)) [$headers, $rows, $delimiter] = ms_import_parse_csv_file($uploadPath, $extension === 'tsv' ? 'tab' : $delimiterChoice);
+  elseif (in_array($extension, ['xls', 'xlsx'], true)) throw new RuntimeException('Excel conversion did not run in the browser. Save the sheet as CSV or enable JavaScript and try again.');
+  else throw new RuntimeException('Choose a CSV, TSV, JSON, XLS, or XLSX file.');
+  $token = bin2hex(random_bytes(16));
+  $path = ms_update_runtime_file('import-' . $token . '.json');
+  $json = json_encode(['headers' => $headers, 'rows' => $rows], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  if (!is_string($json) || @file_put_contents($path, $json, LOCK_EX) === false) throw new RuntimeException('Unable to create the temporary import preview.');
+  if (!isset($_SESSION['ms_imports']) || !is_array($_SESSION['ms_imports'])) $_SESSION['ms_imports'] = [];
+  $_SESSION['ms_imports'][$token] = ['path' => $path, 'database' => selected_db(), 'created' => time(), 'source_name' => substr($sourceName, 0, 255), 'row_count' => count($rows), 'headers' => $headers, 'delimiter' => $delimiter];
+  return $token;
+}
+
+function ms_import_entry(string $token): array {
+  ms_import_cleanup();
+  if (preg_match('/^[a-f0-9]{32}$/', $token) !== 1) throw new RuntimeException('Invalid or expired import preview.');
+  $entry = $_SESSION['ms_imports'][$token] ?? null;
+  if (!is_array($entry) || (string)($entry['database'] ?? '') !== selected_db() || !is_file((string)($entry['path'] ?? ''))) throw new RuntimeException('Invalid or expired import preview.');
+  return $entry;
+}
+
+function ms_import_load_rows(array $entry): array {
+  $raw = @file_get_contents((string)$entry['path']);
+  $data = is_string($raw) ? json_decode($raw, true) : null;
+  if (!is_array($data) || !isset($data['headers'], $data['rows']) || !is_array($data['headers']) || !is_array($data['rows'])) throw new RuntimeException('The temporary import data is damaged or expired.');
+  return $data;
+}
+
+function ms_import_cell_text($value): string {
+  if ($value === null) return '';
+  if (is_array($value) || is_object($value)) {
+    $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    return is_string($json) ? $json : '';
+  }
+  if (is_bool($value)) return $value ? '1' : '0';
+  return (string)$value;
+}
+
+function ms_import_execute_rows(mysqli $db, string $token): array {
+  $entry = ms_import_entry($token);
+  $data = ms_import_load_rows($entry);
+  $table = p('import_table');
+  $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+  if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('Choose a valid target table.');
+  $columns = table_columns($db, $table);
+  $columnMap = [];
+  foreach ($columns as $column) $columnMap[(string)$column['COLUMN_NAME']] = $column;
+  $mappingInput = isset($_POST['mapping']) && is_array($_POST['mapping']) ? array_values($_POST['mapping']) : [];
+  $mapping = []; $usedTargets = [];
+  foreach ($data['headers'] as $sourceIndex => $header) {
+    $target = (string)($mappingInput[$sourceIndex] ?? '');
+    if ($target === '') continue;
+    if (!isset($columnMap[$target])) throw new RuntimeException('Mapped target column not found: ' . $target);
+    if (isset($usedTargets[$target])) throw new RuntimeException('A target column can be mapped only once: ' . $target);
+    $usedTargets[$target] = true;
+    $mapping[$sourceIndex] = $target;
+  }
+  if (!$mapping) throw new RuntimeException('Map at least one source field.');
+  $mode = p('import_mode', 'insert');
+  if (!in_array($mode, ['insert', 'update', 'upsert'], true)) throw new RuntimeException('Choose a valid import mode.');
+  $keyColumn = p('import_key');
+  if ($mode === 'update' && ($keyColumn === '' || !isset($usedTargets[$keyColumn]))) throw new RuntimeException('Update mode requires a mapped match-key column.');
+  $emptyAsNull = p('empty_as_null') === '1';
+  $success = 0; $errors = [];
+  $db->begin_transaction();
+  try {
+    foreach ($data['rows'] as $rowIndex => $row) {
+      try {
+        if (!is_array($row)) throw new RuntimeException('Source row is not an array.');
+        $values = [];
+        foreach ($mapping as $sourceIndex => $target) {
+          $raw = $row[$sourceIndex] ?? null;
+          $text = ms_import_cell_text($raw);
+          $isNull = $raw === null || ($emptyAsNull && $text === '');
+          $values[$target] = $isNull ? null : ms_normalize_column_literal($columnMap[$target], $text);
+        }
+        if ($mode === 'update') {
+          $sets = [];
+          foreach ($values as $column => $value) if ($column !== $keyColumn) $sets[] = qi($column) . '=' . ($value === null ? 'NULL' : qs($db, $value));
+          if (!$sets) throw new RuntimeException('Update mode needs at least one mapped column besides the match key.');
+          $keyValue = $values[$keyColumn];
+          $sql = 'UPDATE ' . qi($table) . ' SET ' . implode(', ', $sets) . ' WHERE ' . qi($keyColumn) . ($keyValue === null ? ' IS NULL' : '=' . qs($db, $keyValue)) . ' LIMIT 1';
+        } else {
+          $names = array_keys($values);
+          $sqlValues = array_map(static function ($value) use ($db): string { return $value === null ? 'NULL' : qs($db, $value); }, array_values($values));
+          $sql = 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $names)) . ') VALUES (' . implode(', ', $sqlValues) . ')';
+          if ($mode === 'upsert') {
+            $updates = [];
+            foreach ($names as $name) $updates[] = qi($name) . '=VALUES(' . qi($name) . ')';
+            $sql .= ' ON DUPLICATE KEY UPDATE ' . implode(', ', $updates);
+          }
+        }
+        if (!$db->query($sql)) throw new RuntimeException($db->error);
+        $success++;
+      } catch (Throwable $rowError) {
+        $errors[] = ['row' => $rowIndex + 2, 'values' => $row, 'error' => $rowError->getMessage()];
+      }
+    }
+    $db->commit();
+  } catch (Throwable $fatal) {
+    $db->rollback();
+    throw $fatal;
+  }
+  $errorToken = '';
+  if ($errors) {
+    $errorToken = bin2hex(random_bytes(16));
+    $errorPath = ms_update_runtime_file('import-errors-' . $errorToken . '.csv');
+    $out = @fopen($errorPath, 'wb');
+    if ($out !== false) {
+      fwrite($out, "\xEF\xBB\xBF");
+      fputcsv($out, array_merge(['source_row'], $data['headers'], ['error']));
+      foreach ($errors as $error) {
+        $row = array_map('ms_import_cell_text', is_array($error['values']) ? $error['values'] : []);
+        if (count($row) < count($data['headers'])) $row = array_pad($row, count($data['headers']), '');
+        fputcsv($out, array_merge([(string)$error['row']], array_slice($row, 0, count($data['headers'])), [(string)$error['error']]));
+      }
+      fclose($out);
+      if (!isset($_SESSION['ms_import_errors']) || !is_array($_SESSION['ms_import_errors'])) $_SESSION['ms_import_errors'] = [];
+      $_SESSION['ms_import_errors'][$errorToken] = ['path' => $errorPath, 'created' => time(), 'filename' => $table . '-rejected-' . gmdate('Ymd-His') . '.csv'];
+    }
+  }
+  @unlink((string)$entry['path']);
+  unset($_SESSION['ms_imports'][$token]);
+  return ['table' => $table, 'success' => $success, 'errors' => count($errors), 'error_token' => $errorToken, 'mode' => $mode];
+}
+
 function raw_definition(mysqli $db, string $kind, string $name): string {
   if ($kind === 'VIEW') {
     $row = db_one($db, 'SHOW CREATE VIEW ' . qi($name));
@@ -2936,6 +3343,16 @@ try {
       exit;
     }
 
+    if (g('download') === 'import_errors') {
+      ms_import_cleanup();
+      $token = g('token');
+      $entry = preg_match('/^[a-f0-9]{32}$/', $token) === 1 ? ($_SESSION['ms_import_errors'][$token] ?? null) : null;
+      if (!is_array($entry) || !is_file((string)($entry['path'] ?? ''))) throw new RuntimeException('Rejected-row report not found or expired.');
+      download_headers((string)($entry['filename'] ?? 'import-rejected.csv'), 'text/csv; charset=UTF-8');
+      readfile((string)$entry['path']);
+      exit;
+    }
+
     if (g('download') === 'export') {
       $db->select_db(selected_db());
       $format = g('format', 'sql');
@@ -3198,8 +3615,36 @@ try {
         }
       }
 
+      if ($action === 'query_history_toggle' || $action === 'query_history_delete' || $action === 'query_history_clear') {
+        $operation = $action === 'query_history_toggle' ? 'toggle' : ($action === 'query_history_delete' ? 'delete' : 'clear');
+        ms_query_history_change(selected_db(), p('history_id'), $operation);
+        go(['page' => 'sql'], $operation === 'clear' ? 'Non-favourite query history cleared.' : 'Query history updated.');
+      }
+
+      if ($action === 'open_generated_sql') {
+        $generatedSql = p('generated_sql');
+        if (trim($generatedSql) === '' || strlen($generatedSql) > 500000) throw new RuntimeException('Generated SQL is empty or too large.');
+        $_SESSION['ms_last_sql'] = $generatedSql;
+        $_SESSION['ms_last_sql_params'] = [];
+        go(['page' => 'sql'], 'Generated query opened in the SQL editor.');
+      }
+
+      if ($action === 'import_preview') {
+        if (empty($_FILES['import_file']['tmp_name']) || !is_uploaded_file((string)$_FILES['import_file']['tmp_name'])) throw new RuntimeException('Choose a file to import.');
+        $size = (int)($_FILES['import_file']['size'] ?? 0);
+        if ($size <= 0 || $size > 20 * 1024 * 1024) throw new RuntimeException('Import files must be between 1 byte and 20 MB.');
+        $token = ms_import_create_preview((string)$_FILES['import_file']['tmp_name'], (string)($_FILES['import_file']['name'] ?? 'import.csv'), p('import_delimiter', 'auto'));
+        go(['page' => 'import', 'import_token' => $token], 'Import preview created. Check the mapping before importing.');
+      }
+
+      if ($action === 'import_execute') {
+        $summary = ms_import_execute_rows($db, p('import_token'));
+        $_SESSION['ms_import_summary'] = $summary;
+        go(['page' => 'import', 'import_token' => null], $summary['success'] . ' row(s) processed successfully; ' . $summary['errors'] . ' rejected.', $summary['errors'] > 0 ? 'warning' : 'success');
+      }
+
       if ($action === 'run_sql') {
-        $sql = p('sql');
+        $sqlTemplate = p('sql');
         if (!empty($_FILES['sql_file']['tmp_name'])) {
           if ((int)$_FILES['sql_file']['size'] > 50 * 1024 * 1024) {
             throw new RuntimeException('SQL file is larger than 50 MB.');
@@ -3208,20 +3653,42 @@ try {
           if ($uploaded === false) {
             throw new RuntimeException('Cannot read uploaded SQL file.');
           }
-          $sql = $uploaded;
+          $sqlTemplate = $uploaded;
         }
-        if (trim($sql) === '') {
+        if (trim($sqlTemplate) === '') {
           throw new RuntimeException('Enter SQL or choose a SQL file.');
         }
         $sqlDisplayLimit = max(1, min(100000, (int)p('row_limit', (string)ms_profile_setting_int('sqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000))));
-        if (p('sql_submit') === 'explain') {
-          [$sqlResults, $sqlTime] = explain_sql($db, $sql, $sqlDisplayLimit);
-          $sqlExplainMode = true;
-        } else {
-          [$sqlResults, $sqlTime] = execute_sql($db, $sql, p('show_all') === '1', $sqlDisplayLimit);
-          $sqlExplainMode = false;
+        $historyStarted = microtime(true);
+        $parameters = [];
+        $mode = p('sql_submit') === 'explain' ? 'explain' : 'execute';
+        try {
+          $parameters = ms_sql_parameters_from_post();
+          $sql = ms_expand_sql_parameters($db, $sqlTemplate, $parameters);
+          if ($mode === 'explain') {
+            [$sqlResults, $sqlTime] = explain_sql($db, $sql, $sqlDisplayLimit);
+            $sqlExplainMode = true;
+          } else {
+            [$sqlResults, $sqlTime] = execute_sql($db, $sql, p('show_all') === '1', $sqlDisplayLimit);
+            $sqlExplainMode = false;
+          }
+          try {
+            $historyParams = p('remember_params') === '1' ? $parameters : array_map(static function (array $parameter): array { return ['type' => (string)($parameter['type'] ?? 'text'), 'value' => '']; }, $parameters);
+            ms_query_history_add(selected_db(), $sqlTemplate, $historyParams, (float)$sqlTime, true, '', $mode);
+          } catch (Throwable $historyError) {
+            $_SESSION['ms_history_warning'] = $historyError->getMessage();
+          }
+        } catch (Throwable $queryError) {
+          try {
+            $historyParams = p('remember_params') === '1' ? $parameters : array_map(static function (array $parameter): array { return ['type' => (string)($parameter['type'] ?? 'text'), 'value' => '']; }, $parameters);
+            ms_query_history_add(selected_db(), $sqlTemplate, $historyParams, microtime(true) - $historyStarted, false, $queryError->getMessage(), $mode);
+          } catch (Throwable $historyError) {}
+          $_SESSION['ms_last_sql'] = $sqlTemplate;
+          $_SESSION['ms_last_sql_params'] = $parameters;
+          throw $queryError;
         }
-        $_SESSION['ms_last_sql'] = $sql;
+        $_SESSION['ms_last_sql'] = $sqlTemplate;
+        $_SESSION['ms_last_sql_params'] = $parameters;
       } elseif ($action === 'create_table') {
         $name = trim(p('name'));
         $columns = isset($_POST['columns']) && is_array($_POST['columns']) ? $_POST['columns'] : [];
@@ -3895,7 +4362,7 @@ function page_head(string $title, bool $authenticated): void {
   <script>
     (() => {
       'use strict';
-      const menuKeys = ['databases','database','sql','export','schema','views','routines','triggers','events','processes','users','variables'];
+      const menuKeys = ['databases','database','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables'];
       const defaults = <?= $defaultSettingsJson ?>;
       const serverSettings = <?= $clientSettingsJson ?>;
       const csrf = <?= $csrfJson ?>;
@@ -4390,6 +4857,8 @@ function render_sidebar(): void {
     ['databases', 'fa-database', 'Databases'],
     ['database', 'fa-table-list', 'Database'],
     ['sql', 'fa-terminal', 'SQL command'],
+    ['query_builder', 'fa-code-branch', 'Query builder'],
+    ['import', 'fa-file-import', 'Import'],
     ['export', 'fa-file-export', 'Export'],
     ['schema', 'fa-diagram-project', 'Schema'],
     ['views', 'fa-eye', 'Views'],
@@ -6275,16 +6744,85 @@ function page_row(mysqli $db): void {
 }
 
 
-function page_sql(mysqli $db,?array $results,float $time): void {
-  $sqlDefaultRows=ms_profile_setting_int('sqlRows',MS_SQL_ROWS_DEFAULT,1,100000);
-  $tableRows=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
-  $columnRows=db_all($db,'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
-  $sqlSchema=['tables'=>[],'columns'=>[]];
-  foreach($tableRows as $tableRow){$tableName=(string)$tableRow['TABLE_NAME'];$sqlSchema['tables'][]=['name'=>$tableName,'type'=>(string)$tableRow['TABLE_TYPE']];$sqlSchema['columns'][$tableName]=[];}
-  foreach($columnRows as $columnRow){$tableName=(string)$columnRow['TABLE_NAME'];if(!isset($sqlSchema['columns'][$tableName]))$sqlSchema['columns'][$tableName]=[];$sqlSchema['columns'][$tableName][]=['name'=>(string)$columnRow['COLUMN_NAME'],'type'=>(string)$columnRow['COLUMN_TYPE'],'key'=>(string)$columnRow['COLUMN_KEY']];}
-  $sqlSchemaJson=json_encode($sqlSchema,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'{"tables":[],"columns":{}}';
-  title_bar('SQL command',selected_db());
-  ?><div class="card mb-3"><div class="card-body"><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?><label class="form-label">SQL statements</label><textarea class="form-control sql-editor" name="sql" spellcheck="false" autocomplete="off" data-ms-sql-schema-id="ms-sql-schema"><?= h(p('sql',(string)($_SESSION['ms_last_sql']??''))) ?></textarea><script type="application/json" id="ms-sql-schema"><?= $sqlSchemaJson ?></script><div class="form-text mt-2"><i class="fa-solid fa-wand-magic-sparkles me-1"></i>Smart SQL: table suggestions after <code>SELECT</code>, <code>UPDATE</code>, <code>INSERT</code>, <code>FROM</code>, <code>JOIN</code> and related clauses; type <code>table.</code> for columns. Use ↑/↓ and Enter/Tab to accept, Esc to close, Ctrl+Space to reopen suggestions.</div><div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><div class="d-inline-flex flex-wrap justify-content-md-end gap-2"><button class="btn btn-outline-secondary" type="submit" name="sql_submit" value="explain" title="Show the optimizer execution plan without executing the statement"><i class="fa-solid fa-magnifying-glass-chart me-1"></i>Explain SQL</button><button class="btn btn-primary" type="submit" name="sql_submit" value="execute"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></div></form></div></div><?php if(!empty($sqlExplainMode)){?><div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>EXPLAIN shows the optimizer plan and does not execute the submitted DML statement.</div><?php } if($results!==null)render_sql_results($results,$time);
+function page_sql(mysqli $db, ?array $results, float $time): void {
+  $sqlDefaultRows = ms_profile_setting_int('sqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000);
+  $tableRows = db_all($db, 'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
+  $columnRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+  $sqlSchema = ['tables' => [], 'columns' => []];
+  foreach ($tableRows as $tableRow) {
+    $tableName = (string)$tableRow['TABLE_NAME'];
+    $sqlSchema['tables'][] = ['name' => $tableName, 'type' => (string)$tableRow['TABLE_TYPE']];
+    $sqlSchema['columns'][$tableName] = [];
+  }
+  foreach ($columnRows as $columnRow) {
+    $tableName = (string)$columnRow['TABLE_NAME'];
+    if (!isset($sqlSchema['columns'][$tableName])) $sqlSchema['columns'][$tableName] = [];
+    $sqlSchema['columns'][$tableName][] = ['name' => (string)$columnRow['COLUMN_NAME'], 'type' => (string)$columnRow['COLUMN_TYPE'], 'key' => (string)$columnRow['COLUMN_KEY']];
+  }
+  $sqlSchemaJson = json_encode($sqlSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{"tables":[],"columns":{}}';
+  $history = ms_query_history(selected_db());
+  $historyJson = json_encode($history, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '[]';
+  $initialParams = isset($_SESSION['ms_last_sql_params']) && is_array($_SESSION['ms_last_sql_params']) ? $_SESSION['ms_last_sql_params'] : [];
+  if (isset($_POST['param_name']) && is_array($_POST['param_name'])) {
+    try { $initialParams = ms_sql_parameters_from_post(); } catch (Throwable $ignored) {}
+  }
+  $initialParamsJson = json_encode($initialParams, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}';
+  $actions = '<a class="btn btn-primary" href="?page=query_builder"><i class="fa-solid fa-diagram-project me-1"></i>Visual query builder</a>';
+  title_bar('SQL command', selected_db(), $actions);
+  if (!empty($_SESSION['ms_history_warning'])) {
+    echo '<div class="alert alert-warning">The query ran, but its history could not be saved: ' . h((string)$_SESSION['ms_history_warning']) . '</div>';
+    unset($_SESSION['ms_history_warning']);
+  }
+  ?>
+  <div class="card mb-3"><div class="card-body">
+    <form method="post" enctype="multipart/form-data" id="msSqlCommandForm">
+      <input type="hidden" name="action" value="run_sql"><input type="hidden" name="row_limit" value="<?= h((string)$sqlDefaultRows) ?>" data-ms-sql-row-limit><?= csrf_field() ?>
+      <label class="form-label" for="msSqlCommand">SQL statements</label>
+      <textarea class="form-control sql-editor" id="msSqlCommand" name="sql" spellcheck="false" autocomplete="off" data-ms-sql-schema-id="ms-sql-schema"><?= h(p('sql', (string)($_SESSION['ms_last_sql'] ?? ''))) ?></textarea>
+      <script type="application/json" id="ms-sql-schema"><?= $sqlSchemaJson ?></script>
+      <div class="form-text mt-2"><i class="fa-solid fa-wand-magic-sparkles me-1"></i>Use parameters such as <code>:customer_id</code>. Text values are escaped and quoted; number and NULL types are inserted safely. Raw SQL parameters are intentionally unrestricted except for semicolons.</div>
+
+      <div class="border rounded mt-3">
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 p-3 border-bottom"><div><strong><i class="fa-solid fa-sliders me-2"></i>Query parameters</strong><div class="small text-body-secondary">Reusable named values, applied only outside SQL strings and comments.</div></div><div class="d-flex gap-2"><button class="btn btn-outline-secondary btn-sm" type="button" id="msDetectSqlParams"><i class="fa-solid fa-magnifying-glass me-1"></i>Detect</button><button class="btn btn-outline-primary btn-sm" type="button" id="msAddSqlParam"><i class="fa-solid fa-plus me-1"></i>Add</button></div></div>
+        <div class="p-3" id="msSqlParams"><div class="text-body-secondary small" data-ms-no-params>No parameters defined.</div></div>
+        <div class="px-3 pb-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" id="msRememberParams" name="remember_params" value="1" checked><label class="form-check-label" for="msRememberParams">Remember parameter values in query history</label></div><div class="form-text">Turn this off for passwords, tokens, or other sensitive values.</div></div>
+      </div>
+
+      <div class="row g-3 mt-1 align-items-end"><div class="col-md-7"><label class="form-label">Or import a .sql file (maximum 50 MB)</label><input class="form-control" type="file" name="sql_file" accept=".sql,text/sql,text/plain"><label class="mt-3 d-flex align-items-start gap-2"><input class="form-check-input mt-1" type="checkbox" name="show_all" value="1"<?= p('show_all') === '1' ? ' checked' : '' ?>><span><strong>Show all result rows</strong><span class="d-block form-text mt-0">The default display limit is <span data-ms-sql-limit-label><?= h(number_format($sqlDefaultRows)) ?></span> rows. Large results can use substantial browser and server memory.</span></span></label></div><div class="col-md-5 text-md-end"><div class="d-inline-flex flex-wrap justify-content-md-end gap-2"><button class="btn btn-outline-secondary" type="submit" name="sql_submit" value="explain"><i class="fa-solid fa-magnifying-glass-chart me-1"></i>Explain SQL</button><button class="btn btn-primary" type="submit" name="sql_submit" value="execute"><i class="fa-solid fa-play me-1"></i>Execute <span class="small">Ctrl+Enter</span></button></div></div></div>
+    </form>
+  </div></div>
+
+  <template id="msSqlParamTemplate"><div class="row g-2 align-items-end mb-2" data-ms-param-row><div class="col-md-3"><label class="form-label small">Name</label><div class="input-group"><span class="input-group-text">:</span><input class="form-control code" name="param_name[]" pattern="[A-Za-z_][A-Za-z0-9_]*" required></div></div><div class="col-md-3"><label class="form-label small">Type</label><select class="form-select" name="param_type[]"><option value="text">Text</option><option value="number">Number</option><option value="null">NULL</option><option value="raw">Raw SQL</option></select></div><div class="col-md-5"><label class="form-label small">Value</label><input class="form-control code" name="param_value[]"></div><div class="col-md-1"><button class="btn btn-outline-danger w-100" type="button" data-ms-remove-param title="Remove parameter"><i class="fa-solid fa-xmark"></i></button></div></div></template>
+  <script type="application/json" id="msSqlInitialParams"><?= $initialParamsJson ?></script>
+  <script type="application/json" id="msSqlHistoryData"><?= $historyJson ?></script>
+  <script>
+  (()=>{
+    'use strict';
+    const form=document.getElementById('msSqlCommandForm'),sql=document.getElementById('msSqlCommand'),holder=document.getElementById('msSqlParams'),template=document.getElementById('msSqlParamTemplate');
+    if(!form||!sql||!holder||!template)return;
+    let initial={};try{initial=JSON.parse(document.getElementById('msSqlInitialParams').textContent||'{}');}catch(error){initial={};}
+    let history=[];try{history=JSON.parse(document.getElementById('msSqlHistoryData').textContent||'[]');}catch(error){history=[];}
+    const refreshEmpty=()=>{const empty=holder.querySelector('[data-ms-no-params]');if(empty)empty.hidden=holder.querySelectorAll('[data-ms-param-row]').length>0;};
+    const add=(name='',type='text',value='')=>{const row=template.content.firstElementChild.cloneNode(true);row.querySelector('[name="param_name[]"]').value=name;row.querySelector('[name="param_type[]"]').value=type;row.querySelector('[name="param_value[]"]').value=value;row.querySelector('[data-ms-remove-param]').addEventListener('click',()=>{row.remove();refreshEmpty();});holder.appendChild(row);refreshEmpty();return row;};
+    const clear=()=>{holder.querySelectorAll('[data-ms-param-row]').forEach(row=>row.remove());refreshEmpty();};
+    const loadParams=params=>{clear();Object.entries(params&&typeof params==='object'?params:{}).forEach(([name,param])=>add(name,param&&param.type?param.type:'text',param&&param.value!==undefined?param.value:''));};
+    loadParams(initial);
+    document.getElementById('msAddSqlParam').addEventListener('click',()=>{const row=add();row.querySelector('[name="param_name[]"]').focus();});
+    document.getElementById('msDetectSqlParams').addEventListener('click',()=>{const existing=new Set(Array.from(holder.querySelectorAll('[name="param_name[]"]')).map(input=>input.value.trim()).filter(Boolean));const found=[];for(const match of sql.value.matchAll(/:([A-Za-z_][A-Za-z0-9_]*)/g)){if(!existing.has(match[1])&&!found.includes(match[1]))found.push(match[1]);}found.forEach(name=>add(name));if(found.length){const rows=holder.querySelectorAll('[data-ms-param-row]');rows[rows.length-1].querySelector('[name="param_value[]"]').focus();}});
+    document.querySelectorAll('[data-ms-load-history]').forEach(button=>button.addEventListener('click',()=>{const entry=history.find(item=>item.id===button.dataset.msLoadHistory);if(!entry)return;sql.value=entry.sql||'';sql.dispatchEvent(new Event('input',{bubbles:true}));loadParams(entry.params||{});sql.focus();window.scrollTo({top:0,behavior:'smooth'});}));
+  })();
+  </script>
+  <?php
+  if (!empty($sqlExplainMode)) echo '<div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>EXPLAIN shows the optimizer plan and does not execute the submitted DML statement.</div>';
+  if ($results !== null) render_sql_results($results, $time);
+  ?>
+  <section class="card mt-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><div><strong><i class="fa-solid fa-clock-rotate-left me-2"></i>Query history</strong><span class="text-body-secondary ms-2"><?= count($history) ?> item(s)</span></div><?php if ($history) { ?><form method="post" class="m-0"><input type="hidden" name="action" value="query_history_clear"><input type="hidden" name="history_id" value=""><?= csrf_field() ?><button class="btn btn-outline-danger btn-sm" data-confirm="Clear all non-favourite query history entries?"><i class="fa-solid fa-broom me-1"></i>Clear non-favourites</button></form><?php } ?></div><div class="card-body p-0">
+    <?php if (!$history) { ?><div class="p-3 text-body-secondary">Executed and failed queries will appear here.</div><?php } else { ?>
+      <div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead><tr><th></th><th>When</th><th>Status</th><th>Duration</th><th>SQL template</th><th class="text-end">Actions</th></tr></thead><tbody>
+      <?php foreach ($history as $entry) { $historyId=(string)$entry['id']; ?><tr><td><form method="post"><input type="hidden" name="action" value="query_history_toggle"><input type="hidden" name="history_id" value="<?= h($historyId) ?>"><?= csrf_field() ?><button class="btn btn-link p-0 <?= !empty($entry['favorite'])?'text-warning':'text-body-secondary' ?>" title="<?= !empty($entry['favorite'])?'Remove from favourites':'Add to favourites' ?>"><i class="<?= !empty($entry['favorite'])?'fa-solid':'fa-regular' ?> fa-star"></i></button></form></td><td class="text-nowrap"><?= h(date('Y-m-d H:i:s',(int)$entry['executed_at'])) ?></td><td><span class="badge text-bg-<?= !empty($entry['success'])?'success':'danger' ?>"><?= !empty($entry['success'])?'OK':'Error' ?></span> <span class="badge text-bg-secondary"><?= h(strtoupper((string)$entry['mode'])) ?></span></td><td class="text-nowrap"><?= h(number_format((float)$entry['duration'],4)) ?> s</td><td style="min-width:20rem"><div class="code small text-truncate" style="max-width:48rem"><?= h(preg_replace('/\s+/',' ',trim((string)$entry['sql'])) ?: '') ?></div><?php if((string)$entry['error']!==''){?><div class="small text-danger text-truncate" style="max-width:48rem"><?= h((string)$entry['error']) ?></div><?php } ?></td><td class="text-end text-nowrap"><button class="btn btn-outline-primary btn-sm" type="button" data-ms-load-history="<?= h($historyId) ?>"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Load</button> <form method="post" class="d-inline"><input type="hidden" name="action" value="query_history_delete"><input type="hidden" name="history_id" value="<?= h($historyId) ?>"><?= csrf_field() ?><button class="btn btn-outline-danger btn-sm" data-confirm="Delete this history item?"><i class="fa-solid fa-trash"></i></button></form></td></tr><?php } ?>
+      </tbody></table></div>
+    <?php } ?>
+  </div></section><?php
 }
 
 function page_export(mysqli $db): void {
@@ -6450,6 +6988,158 @@ function page_export(mysqli $db): void {
   </script><?php
 }
 
+function page_import(mysqli $db): void {
+  ms_import_cleanup();
+  $tables = array_values(array_map('strval', array_column(db_all($db, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"), 'TABLE_NAME')));
+  $tableColumns = [];
+  foreach (db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_KEY,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION') as $column) {
+    $table = (string)$column['TABLE_NAME'];
+    if (!isset($tableColumns[$table])) $tableColumns[$table] = [];
+    $tableColumns[$table][] = ['name' => (string)$column['COLUMN_NAME'], 'key' => (string)$column['COLUMN_KEY'], 'extra' => (string)$column['EXTRA']];
+  }
+  $schemaJson = json_encode($tableColumns, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}';
+  $summary = isset($_SESSION['ms_import_summary']) && is_array($_SESSION['ms_import_summary']) ? $_SESSION['ms_import_summary'] : null;
+  unset($_SESSION['ms_import_summary']);
+  title_bar('Import data', selected_db());
+  if ($summary) {
+    ?><div class="alert alert-<?= (int)$summary['errors']>0?'warning':'success' ?>"><strong><?= h((string)$summary['success']) ?> successful row(s)</strong> · <?= h((string)$summary['errors']) ?> rejected.<?php if(!empty($summary['error_token'])){?> <a class="alert-link" href="?download=import_errors&amp;token=<?= h((string)$summary['error_token']) ?>"><i class="fa-solid fa-download me-1"></i>Download rejected rows with errors</a><?php } ?></div><?php
+  }
+  ?>
+  <section class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-file-import me-2"></i>1. Choose source file</strong></div><div class="card-body">
+    <form method="post" enctype="multipart/form-data" id="msImportUploadForm" class="row g-3 align-items-end"><input type="hidden" name="action" value="import_preview"><?= csrf_field() ?>
+      <div class="col-lg-7"><label class="form-label" for="msImportFile">CSV, TSV, JSON, XLS or XLSX</label><input class="form-control" type="file" id="msImportFile" name="import_file" accept=".csv,.tsv,.txt,.json,.xls,.xlsx,text/csv,application/json" required><div class="form-text">Maximum 20 MB and 50,000 rows. Excel files use the first worksheet and are converted locally in your browser before upload.</div></div>
+      <div class="col-lg-3"><label class="form-label" for="msImportDelimiter">CSV delimiter</label><select class="form-select" id="msImportDelimiter" name="import_delimiter"><option value="auto">Auto detect</option><option value="comma">Comma</option><option value="semicolon">Semicolon</option><option value="tab">Tab</option><option value="pipe">Pipe |</option></select></div>
+      <div class="col-lg-2"><button class="btn btn-primary w-100" type="submit"><i class="fa-solid fa-eye me-1"></i>Preview</button></div>
+    </form>
+  </div></section>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script>
+  (()=>{
+    'use strict';
+    const form=document.getElementById('msImportUploadForm'),input=document.getElementById('msImportFile');if(!form||!input)return;
+    let converted=false;
+    form.addEventListener('submit',async event=>{
+      const file=input.files&&input.files[0];if(!file||converted)return;
+      if(!/\.(xlsx?|xls)$/i.test(file.name))return;
+      event.preventDefault();
+      if(typeof XLSX==='undefined'){alert('The Excel reader could not be loaded. Save the worksheet as CSV and try again.');return;}
+      try{
+        if(typeof window.msShowPageLoader==='function')window.msShowPageLoader('Converting Excel worksheet...');
+        const workbook=XLSX.read(await file.arrayBuffer(),{type:'array',cellDates:false,raw:true});
+        if(!workbook.SheetNames.length)throw new Error('The workbook contains no worksheets.');
+        const csv=XLSX.utils.sheet_to_csv(workbook.Sheets[workbook.SheetNames[0]],{blankrows:true});
+        const replacement=new File([csv],file.name.replace(/\.xlsx?$/i,'')+'.csv',{type:'text/csv'});
+        const transfer=new DataTransfer();transfer.items.add(replacement);input.files=transfer.files;converted=true;form.submit();
+      }catch(error){if(typeof window.msHidePageLoader==='function')window.msHidePageLoader();alert(error instanceof Error?error.message:String(error));}
+    });
+  })();
+  </script>
+  <?php
+  $token = g('import_token');
+  if ($token === '') return;
+  $entry = ms_import_entry($token);
+  $data = ms_import_load_rows($entry);
+  $sourceHeaders = array_values(array_map('strval', $data['headers']));
+  $baseName = pathinfo((string)($entry['source_name'] ?? ''), PATHINFO_FILENAME);
+  $defaultTable = '';
+  foreach ($tables as $table) if (strcasecmp($table, $baseName) === 0) { $defaultTable = $table; break; }
+  if ($defaultTable === '' && $tables) $defaultTable = $tables[0];
+  $sourceJson = json_encode($sourceHeaders, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '[]';
+  ?>
+  <section class="card"><div class="card-header"><strong><i class="fa-solid fa-table-columns me-2"></i>2. Map and import</strong> <span class="text-body-secondary ms-2"><?= h((string)$entry['source_name']) ?> · <?= h(number_format((int)$entry['row_count'])) ?> row(s)</span></div><div class="card-body">
+    <form method="post" id="msImportExecuteForm"><input type="hidden" name="action" value="import_execute"><input type="hidden" name="import_token" value="<?= h($token) ?>"><?= csrf_field() ?>
+      <div class="row g-3 mb-3"><div class="col-lg-4"><label class="form-label" for="msImportTable">Target table</label><select class="form-select" id="msImportTable" name="import_table" required><?php foreach($tables as $table){?><option value="<?= h($table) ?>"<?= $table===$defaultTable?' selected':'' ?>><?= h($table) ?></option><?php }?></select></div><div class="col-lg-4"><label class="form-label" for="msImportMode">Operation</label><select class="form-select" id="msImportMode" name="import_mode"><option value="insert">Insert every row</option><option value="update">Update by match key</option><option value="upsert">Insert or update duplicate key</option></select></div><div class="col-lg-4"><label class="form-label" for="msImportKey">Update match key</label><select class="form-select" id="msImportKey" name="import_key" disabled><option value="">Choose mapped column…</option></select></div></div>
+      <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" role="switch" id="msEmptyAsNull" name="empty_as_null" value="1"><label class="form-check-label" for="msEmptyAsNull">Convert empty strings to NULL</label></div>
+      <div class="table-responsive mb-3"><table class="table table-sm align-middle"><thead><tr><th>Source field</th><th>Target column</th></tr></thead><tbody><?php foreach($sourceHeaders as $header){?><tr><td class="code"><?= h($header) ?></td><td><select class="form-select form-select-sm" name="mapping[]" data-ms-import-map data-source="<?= h($header) ?>"><option value="">Do not import</option></select></td></tr><?php }?></tbody></table></div>
+      <div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>Update mode modifies the first row matching the chosen key. Upsert mode uses the table’s PRIMARY/UNIQUE indexes through <code>ON DUPLICATE KEY UPDATE</code>. Invalid rows do not stop valid rows and are downloadable afterward.</div>
+      <button class="btn btn-primary" data-confirm="Import <?= h(number_format((int)$entry['row_count'])) ?> row(s) into the selected table?"><i class="fa-solid fa-file-import me-1"></i>Run import</button>
+    </form>
+    <hr><h3 class="h6">Source preview · first <?= min(10,count($data['rows'])) ?> rows</h3><div class="table-responsive"><table class="table table-sm table-striped"><thead><tr><?php foreach($sourceHeaders as $header){?><th><?= h($header) ?></th><?php }?></tr></thead><tbody><?php foreach(array_slice($data['rows'],0,10) as $row){?><tr><?php foreach($sourceHeaders as $index=>$header){?><td><?= render_value(ms_import_cell_text($row[$index]??null),160) ?></td><?php }?></tr><?php }?></tbody></table></div>
+  </div></section>
+  <script type="application/json" id="msImportSchema"><?= $schemaJson ?></script><script type="application/json" id="msImportSources"><?= $sourceJson ?></script>
+  <script>
+  (()=>{
+    'use strict';
+    const table=document.getElementById('msImportTable'),mode=document.getElementById('msImportMode'),key=document.getElementById('msImportKey'),maps=Array.from(document.querySelectorAll('[data-ms-import-map]'));
+    if(!table||!mode||!key)return;let schema={};try{schema=JSON.parse(document.getElementById('msImportSchema').textContent||'{}');}catch(error){schema={};}
+    const quote=value=>String(value||'').toLowerCase();
+    const refreshKey=()=>{const previous=key.value,available=[];maps.forEach(select=>{if(select.value&&!available.includes(select.value))available.push(select.value);});key.innerHTML='<option value="">Choose mapped column…</option>';available.forEach(name=>{const option=document.createElement('option');option.value=name;option.textContent=name;if(name===previous)option.selected=true;key.appendChild(option);});key.disabled=mode.value!=='update';};
+    const refreshMappings=()=>{const columns=Array.isArray(schema[table.value])?schema[table.value]:[];maps.forEach(select=>{const source=select.dataset.source||'',previous=select.value;select.innerHTML='<option value="">Do not import</option>';columns.forEach(column=>{const option=document.createElement('option');option.value=column.name;option.textContent=column.name+(column.key?' · '+column.key:'')+(String(column.extra||'').includes('auto_increment')?' · auto':'');if((previous&&previous===column.name)||(!previous&&quote(source)===quote(column.name)))option.selected=true;select.appendChild(option);});});refreshKey();};
+    table.addEventListener('change',refreshMappings);mode.addEventListener('change',refreshKey);maps.forEach(select=>select.addEventListener('change',refreshKey));refreshMappings();
+  })();
+  </script><?php
+}
+
+function page_query_builder(mysqli $db): void {
+  $tableRows = db_all($db, 'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
+  $columnRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+  $foreignRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION');
+  $schema = ['tables' => [], 'columns' => [], 'foreign' => []];
+  foreach ($tableRows as $row) {
+    $name = (string)$row['TABLE_NAME'];
+    $schema['tables'][] = ['name' => $name, 'type' => (string)$row['TABLE_TYPE']];
+    $schema['columns'][$name] = [];
+  }
+  foreach ($columnRows as $row) {
+    $name = (string)$row['TABLE_NAME'];
+    if (!isset($schema['columns'][$name])) $schema['columns'][$name] = [];
+    $schema['columns'][$name][] = ['name' => (string)$row['COLUMN_NAME'], 'type' => (string)$row['COLUMN_TYPE'], 'key' => (string)$row['COLUMN_KEY']];
+  }
+  foreach ($foreignRows as $row) $schema['foreign'][] = ['table' => (string)$row['TABLE_NAME'], 'column' => (string)$row['COLUMN_NAME'], 'ref_table' => (string)$row['REFERENCED_TABLE_NAME'], 'ref_column' => (string)$row['REFERENCED_COLUMN_NAME'], 'name' => (string)$row['CONSTRAINT_NAME']];
+  $schemaJson = json_encode($schema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{"tables":[],"columns":{},"foreign":[]}';
+  title_bar('Visual query builder', selected_db(), '<a class="btn btn-secondary" href="?page=sql"><i class="fa-solid fa-terminal me-1"></i>SQL editor</a>');
+  ?>
+  <script type="application/json" id="msBuilderSchema"><?= $schemaJson ?></script>
+  <div class="row g-3">
+    <div class="col-xl-3"><section class="card h-100"><div class="card-header"><strong><i class="fa-solid fa-table-list me-2"></i>Tables and views</strong></div><div class="card-body"><input class="form-control mb-3" id="msBuilderSearch" placeholder="Filter tables…"><div class="list-group small" id="msBuilderPalette"></div><div class="form-text mt-3">Click a table or drag it onto the canvas. Foreign-key joins are detected automatically.</div></div></section></div>
+    <div class="col-xl-9">
+      <section class="card mb-3"><div class="card-header d-flex justify-content-between align-items-center"><strong><i class="fa-solid fa-diagram-project me-2"></i>Query canvas</strong><button class="btn btn-outline-danger btn-sm" type="button" id="msBuilderClear"><i class="fa-solid fa-eraser me-1"></i>Clear</button></div><div class="card-body"><div id="msBuilderCanvas" class="row g-3" style="min-height:12rem"><div class="col-12 text-center text-body-secondary py-5" data-ms-builder-empty>Drag or click a table to begin.</div></div></div></section>
+      <section class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-filter me-2"></i>Filters, grouping and ordering</strong></div><div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2"><span class="fw-semibold">WHERE filters</span><button class="btn btn-outline-primary btn-sm" id="msBuilderAddFilter" type="button"><i class="fa-solid fa-plus me-1"></i>Add filter</button></div><div id="msBuilderFilters"></div>
+        <div class="row g-3 mt-1"><div class="col-md-5"><label class="form-label" for="msBuilderGroup">GROUP BY</label><select class="form-select" id="msBuilderGroup"><option value="">No grouping</option></select></div><div class="col-md-5"><label class="form-label" for="msBuilderOrder">ORDER BY</label><select class="form-select" id="msBuilderOrder"><option value="">No ordering</option></select></div><div class="col-md-2"><label class="form-label" for="msBuilderDirection">Direction</label><select class="form-select" id="msBuilderDirection"><option>ASC</option><option>DESC</option></select></div><div class="col-md-3"><label class="form-label" for="msBuilderLimit">LIMIT</label><input class="form-control" type="number" id="msBuilderLimit" min="0" max="1000000" value="100"></div><div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" role="switch" id="msBuilderDistinct"><label class="form-check-label" for="msBuilderDistinct">SELECT DISTINCT</label></div></div></div>
+      </div></section>
+      <section class="card"><div class="card-header"><strong><i class="fa-solid fa-code me-2"></i>Generated SQL</strong></div><div class="card-body"><textarea class="form-control sql-editor" id="msBuilderSql" rows="12" spellcheck="false"></textarea><div class="d-flex flex-wrap gap-2 mt-3"><form method="post" id="msBuilderOpenForm"><input type="hidden" name="action" value="open_generated_sql"><input type="hidden" name="generated_sql" id="msBuilderGeneratedInput"><?= csrf_field() ?><button class="btn btn-primary"><i class="fa-solid fa-arrow-up-right-from-square me-1"></i>Open in SQL editor</button></form><button class="btn btn-outline-secondary" id="msBuilderCopy" type="button"><i class="fa-solid fa-copy me-1"></i>Copy SQL</button></div></div></section>
+    </div>
+  </div>
+  <template id="msBuilderFilterTemplate"><div class="row g-2 mb-2 align-items-end" data-ms-builder-filter><div class="col-md-4"><label class="form-label small">Field</label><select class="form-select" data-filter-field></select></div><div class="col-md-3"><label class="form-label small">Operator</label><select class="form-select" data-filter-op><option>=</option><option>!=</option><option>&gt;</option><option>&gt;=</option><option>&lt;</option><option>&lt;=</option><option>LIKE</option><option>NOT LIKE</option><option>IS NULL</option><option>IS NOT NULL</option></select></div><div class="col-md-4"><label class="form-label small">Value or :parameter</label><input class="form-control code" data-filter-value></div><div class="col-md-1"><button class="btn btn-outline-danger w-100" type="button" data-remove-filter><i class="fa-solid fa-xmark"></i></button></div></div></template>
+  <script>
+  (()=>{
+    'use strict';
+    let schema={tables:[],columns:{},foreign:[]};try{schema=JSON.parse(document.getElementById('msBuilderSchema').textContent||'{}');}catch(error){}
+    const palette=document.getElementById('msBuilderPalette'),canvas=document.getElementById('msBuilderCanvas'),search=document.getElementById('msBuilderSearch'),filters=document.getElementById('msBuilderFilters'),filterTemplate=document.getElementById('msBuilderFilterTemplate'),group=document.getElementById('msBuilderGroup'),order=document.getElementById('msBuilderOrder'),direction=document.getElementById('msBuilderDirection'),limit=document.getElementById('msBuilderLimit'),distinct=document.getElementById('msBuilderDistinct'),sqlOutput=document.getElementById('msBuilderSql'),generatedInput=document.getElementById('msBuilderGeneratedInput');
+    if(!palette||!canvas||!sqlOutput)return;
+    const selected=[];let draggedIndex=-1;
+    const qi=value=>'`'+String(value).replace(/`/g,'``')+'`';
+    const aliasFor=index=>'t'+(index+1);
+    const fieldValue=(index,column)=>aliasFor(index)+'.'+column;
+    const fieldSql=value=>{const dot=value.indexOf('.');if(dot<1)return'';return qi(value.slice(0,dot))+'.'+qi(value.slice(dot+1));};
+    const allFields=()=>{const fields=[];selected.forEach((item,index)=>(schema.columns[item.name]||[]).forEach(column=>fields.push({value:fieldValue(index,column.name),label:aliasFor(index)+'.'+column.name+' · '+item.name})));return fields;};
+    const sqlValue=value=>{const text=String(value).trim();if(/^:[A-Za-z_][A-Za-z0-9_]*$/.test(text))return text;if(/^NULL$/i.test(text))return'NULL';if(/^-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/.test(text))return text;return"'"+text.replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";};
+    const fillFieldSelect=(select,includeEmpty=true)=>{const previous=select.value;select.innerHTML=includeEmpty?'<option value="">None</option>':'';allFields().forEach(field=>{const option=document.createElement('option');option.value=field.value;option.textContent=field.label;if(field.value===previous)option.selected=true;select.appendChild(option);});};
+    const refreshGlobalFields=()=>{fillFieldSelect(group,true);fillFieldSelect(order,true);filters.querySelectorAll('[data-filter-field]').forEach(select=>fillFieldSelect(select,false));};
+    const findAutoJoin=(newIndex)=>{const current=selected[newIndex],previous=selected.slice(0,newIndex);for(const relation of schema.foreign||[]){if(relation.table===current.name){const otherIndex=previous.findIndex(item=>item.name===relation.ref_table);if(otherIndex>=0)return{left:fieldValue(otherIndex,relation.ref_column),right:fieldValue(newIndex,relation.column)};}if(relation.ref_table===current.name){const otherIndex=previous.findIndex(item=>item.name===relation.table);if(otherIndex>=0)return{left:fieldValue(otherIndex,relation.column),right:fieldValue(newIndex,relation.ref_column)};}}return{left:'',right:''};};
+    const generate=()=>{
+      if(!selected.length){sqlOutput.value='';generatedInput.value='';sqlOutput.dispatchEvent(new Event('input',{bubbles:true}));return;}
+      const selectedFields=[];selected.forEach((item,index)=>item.fields.forEach(column=>selectedFields.push(fieldSql(fieldValue(index,column)))));
+      const selectClause=selectedFields.length?selectedFields.join(',\n  '):selected.map((item,index)=>qi(aliasFor(index))+'.*').join(',\n  ');
+      let sql='SELECT '+(distinct.checked?'DISTINCT ':'')+'\n  '+selectClause+'\nFROM '+qi(selected[0].name)+' AS '+qi(aliasFor(0));
+      for(let index=1;index<selected.length;index++){const item=selected[index],join=item.join||{};if(join.left&&join.right)sql+='\n'+(join.type||'INNER')+' JOIN '+qi(item.name)+' AS '+qi(aliasFor(index))+' ON '+fieldSql(join.left)+' = '+fieldSql(join.right);else sql+='\nCROSS JOIN '+qi(item.name)+' AS '+qi(aliasFor(index));}
+      const where=[];filters.querySelectorAll('[data-ms-builder-filter]').forEach(row=>{const field=row.querySelector('[data-filter-field]').value,op=row.querySelector('[data-filter-op]').value,value=row.querySelector('[data-filter-value]').value;if(!field)return;if(op==='IS NULL'||op==='IS NOT NULL')where.push(fieldSql(field)+' '+op);else where.push(fieldSql(field)+' '+op+' '+sqlValue(value));});
+      if(where.length)sql+='\nWHERE '+where.join('\n  AND ');if(group.value)sql+='\nGROUP BY '+fieldSql(group.value);if(order.value)sql+='\nORDER BY '+fieldSql(order.value)+' '+direction.value;const limitValue=Math.max(0,Math.min(1000000,Number.parseInt(limit.value,10)||0));if(limitValue>0)sql+='\nLIMIT '+limitValue;sql+=';';sqlOutput.value=sql;generatedInput.value=sql;sqlOutput.dispatchEvent(new Event('input',{bubbles:true}));
+    };
+    const render=()=>{
+      canvas.innerHTML='';if(!selected.length){canvas.innerHTML='<div class="col-12 text-center text-body-secondary py-5" data-ms-builder-empty>Drag or click a table to begin.</div>';refreshGlobalFields();generate();return;}
+      selected.forEach((item,index)=>{const col=document.createElement('div');col.className='col-lg-6';col.draggable=true;col.dataset.index=String(index);const card=document.createElement('div');card.className='card h-100 border-primary';const header=document.createElement('div');header.className='card-header d-flex justify-content-between align-items-center gap-2';const title=document.createElement('div');title.innerHTML='<i class="fa-solid fa-grip-vertical me-2 text-body-secondary"></i><strong></strong> <span class="badge text-bg-secondary"></span>';title.querySelector('strong').textContent=item.name;title.querySelector('.badge').textContent=aliasFor(index);const remove=document.createElement('button');remove.type='button';remove.className='btn btn-outline-danger btn-sm';remove.innerHTML='<i class="fa-solid fa-xmark"></i>';remove.addEventListener('click',()=>{selected.splice(index,1);selected.forEach((entry,i)=>{entry.join=i===0?null:{type:'INNER',...findAutoJoin(i)};});render();});header.append(title,remove);card.appendChild(header);const body=document.createElement('div');body.className='card-body p-2';
+        if(index>0){const joinBox=document.createElement('div');joinBox.className='border rounded p-2 mb-2 bg-body-tertiary';const fields=allFields();const leftOptions=fields.filter(field=>!field.value.startsWith(aliasFor(index)+'.')),rightOptions=fields.filter(field=>field.value.startsWith(aliasFor(index)+'.'));joinBox.innerHTML='<div class="row g-2"><div class="col-4"><label class="form-label small">Join</label><select class="form-select form-select-sm" data-join-type><option>INNER</option><option>LEFT</option><option>RIGHT</option></select></div><div class="col-8"><label class="form-label small">Previous field</label><select class="form-select form-select-sm" data-join-left><option value="">No condition / CROSS JOIN</option></select></div><div class="col-12"><label class="form-label small">'+aliasFor(index)+' field</label><select class="form-select form-select-sm" data-join-right><option value="">Choose…</option></select></div></div>';const fill=(select,items,value)=>items.forEach(field=>{const option=document.createElement('option');option.value=field.value;option.textContent=field.label;if(field.value===value)option.selected=true;select.appendChild(option);});fill(joinBox.querySelector('[data-join-left]'),leftOptions,item.join.left);fill(joinBox.querySelector('[data-join-right]'),rightOptions,item.join.right);joinBox.querySelector('[data-join-type]').value=item.join.type||'INNER';joinBox.querySelectorAll('select').forEach(select=>select.addEventListener('change',()=>{item.join={type:joinBox.querySelector('[data-join-type]').value,left:joinBox.querySelector('[data-join-left]').value,right:joinBox.querySelector('[data-join-right]').value};generate();}));body.appendChild(joinBox);}
+        const buttons=document.createElement('div');buttons.className='d-flex gap-2 mb-2';buttons.innerHTML='<button class="btn btn-outline-primary btn-sm" type="button">All fields</button><button class="btn btn-outline-secondary btn-sm" type="button">None</button>';buttons.children[0].addEventListener('click',()=>{item.fields=(schema.columns[item.name]||[]).map(column=>column.name);render();});buttons.children[1].addEventListener('click',()=>{item.fields=[];render();});body.appendChild(buttons);const list=document.createElement('div');list.className='list-group list-group-flush small';(schema.columns[item.name]||[]).forEach(column=>{const label=document.createElement('label');label.className='list-group-item py-1 px-2 d-flex align-items-center gap-2';const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.className='form-check-input mt-0';checkbox.checked=item.fields.includes(column.name);checkbox.addEventListener('change',()=>{if(checkbox.checked&&!item.fields.includes(column.name))item.fields.push(column.name);else item.fields=item.fields.filter(name=>name!==column.name);generate();});const text=document.createElement('span');text.className='code text-truncate flex-grow-1';text.textContent=column.name;const type=document.createElement('span');type.className='text-body-secondary';type.textContent=column.type;label.append(checkbox,text,type);list.appendChild(label);});body.appendChild(list);card.appendChild(body);col.appendChild(card);col.addEventListener('dragstart',event=>{if(event.target.closest('input,select,button')){event.preventDefault();return;}draggedIndex=index;event.dataTransfer.setData('application/x-ms-builder-index',String(index));});col.addEventListener('dragover',event=>{if(draggedIndex>=0)event.preventDefault();});col.addEventListener('drop',event=>{const from=Number.parseInt(event.dataTransfer.getData('application/x-ms-builder-index'),10);if(Number.isFinite(from)&&from!==index){const moved=selected.splice(from,1)[0];selected.splice(index,0,moved);selected.forEach((entry,i)=>{entry.join=i===0?null:{type:'INNER',...findAutoJoin(i)};});draggedIndex=-1;render();}});canvas.appendChild(col);});refreshGlobalFields();generate();
+    };
+    const addTable=name=>{if(selected.some(item=>item.name===name))return;selected.push({name,fields:[],join:null});const index=selected.length-1;if(index>0)selected[index].join={type:'INNER',...findAutoJoin(index)};render();};
+    const renderPalette=()=>{const needle=search.value.trim().toLowerCase();palette.innerHTML='';(schema.tables||[]).filter(table=>table.name.toLowerCase().includes(needle)).forEach(table=>{const button=document.createElement('button');button.type='button';button.className='list-group-item list-group-item-action d-flex justify-content-between align-items-center';button.draggable=true;button.innerHTML='<span class="text-truncate"></span><i class="fa-solid fa-plus text-primary"></i>';button.querySelector('span').textContent=table.name;button.addEventListener('click',()=>addTable(table.name));button.addEventListener('dragstart',event=>event.dataTransfer.setData('text/x-ms-table',table.name));palette.appendChild(button);});};
+    canvas.addEventListener('dragover',event=>{if(Array.from(event.dataTransfer.types||[]).includes('text/x-ms-table'))event.preventDefault();});canvas.addEventListener('drop',event=>{const name=event.dataTransfer.getData('text/x-ms-table');if(name){event.preventDefault();addTable(name);}});search.addEventListener('input',renderPalette);document.getElementById('msBuilderClear').addEventListener('click',()=>{selected.splice(0);filters.innerHTML='';render();});document.getElementById('msBuilderAddFilter').addEventListener('click',()=>{const row=filterTemplate.content.firstElementChild.cloneNode(true);filters.appendChild(row);fillFieldSelect(row.querySelector('[data-filter-field]'),false);row.querySelectorAll('select,input').forEach(input=>input.addEventListener('input',generate));row.querySelector('[data-filter-op]').addEventListener('change',()=>{const noValue=['IS NULL','IS NOT NULL'].includes(row.querySelector('[data-filter-op]').value);row.querySelector('[data-filter-value]').disabled=noValue;generate();});row.querySelector('[data-remove-filter]').addEventListener('click',()=>{row.remove();generate();});generate();});[group,order,direction,limit,distinct].forEach(input=>input.addEventListener('input',generate));document.getElementById('msBuilderCopy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(sqlOutput.value);const button=document.getElementById('msBuilderCopy'),old=button.innerHTML;button.innerHTML='<i class="fa-solid fa-check me-1"></i>Copied';setTimeout(()=>button.innerHTML=old,1200);}catch(error){alert('The browser did not allow clipboard access.');}});renderPalette();render();
+  })();
+  </script><?php
+}
+
 function page_schema(mysqli $db): void {
   $tables=db_all($db,"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME");$foreign=db_all($db,"SELECT TABLE_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION");$refs=[];foreach($foreign as $f)$refs[$f['TABLE_NAME']][$f['COLUMN_NAME']]=$f;
   title_bar('Database schema',selected_db(),'<button class="btn btn-primary" onclick="window.print()"><i class="fa-solid fa-print me-1"></i>Print</button>');
@@ -6589,6 +7279,8 @@ function page_settings(): void {
     'databases' => ['fa-database', 'Databases'],
     'database' => ['fa-table-list', 'Database'],
     'sql' => ['fa-terminal', 'SQL command'],
+    'query_builder' => ['fa-code-branch', 'Query builder'],
+    'import' => ['fa-file-import', 'Import'],
     'export' => ['fa-file-export', 'Export'],
     'schema' => ['fa-diagram-project', 'Schema'],
     'views' => ['fa-eye', 'Views'],
@@ -6666,7 +7358,7 @@ function page_settings(): void {
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
       <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" value="1" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
-      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules and saved searches are also profile-specific. Restore defaults resets the complete active profile.</div></div>
+      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules, saved searches and query history are also profile-specific. Restore defaults resets the complete active profile.</div></div>
     </div></div></section>
 
     <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
@@ -6725,6 +7417,8 @@ try {
     case 'clone_rows': page_clone_rows($db); break;
     case 'row': page_row($db); break;
     case 'sql': page_sql($db, isset($sqlResults) ? $sqlResults : null, isset($sqlTime) ? (float)$sqlTime : 0.0); break;
+    case 'query_builder': page_query_builder($db); break;
+    case 'import': page_import($db); break;
     case 'export': page_export($db); break;
     case 'schema': page_schema($db); break;
     case 'views': page_objects($db, 'views'); break;
