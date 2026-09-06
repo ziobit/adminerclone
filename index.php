@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.14.0';
+const MS_VERSION = '1.14.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1322,8 +1322,12 @@ function connect_db(bool $selectDatabase = true): mysqli {
   }
   $c = $_SESSION['ms_login'];
   mysqli_report(MYSQLI_REPORT_OFF);
-  $socket = !empty($c['socket']) ? (string)$c['socket'] : null;
-  $db = new mysqli((string)$c['host'], (string)$c['user'], (string)$c['password'], '', (int)$c['port'], $socket);
+  $socket = !empty($c['socket']) ? (string)$c['socket'] : '';
+  if ($socket !== '') {
+    $db = new mysqli((string)$c['host'], (string)$c['user'], (string)$c['password'], '', (int)$c['port'], $socket);
+  } else {
+    $db = new mysqli((string)$c['host'], (string)$c['user'], (string)$c['password'], '', (int)$c['port']);
+  }
   if ($db->connect_errno) {
     throw new RuntimeException('Connection failed: ' . $db->connect_error);
   }
@@ -3105,7 +3109,11 @@ try {
       throw new RuntimeException('Host, user and a non-empty password are required.');
     }
     mysqli_report(MYSQLI_REPORT_OFF);
-    $test = new mysqli($host, $user, $password, '', $port, $socket !== '' ? $socket : null);
+    if ($socket !== '') {
+      $test = new mysqli($host, $user, $password, '', $port, $socket);
+    } else {
+      $test = new mysqli($host, $user, $password, '', $port);
+    }
     if ($test->connect_errno) {
       $_SESSION['ms_attempts'] = $attempts + 1;
       $_SESSION['ms_last_attempt'] = time();
