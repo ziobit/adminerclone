@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.14.1';
+const MS_VERSION = '1.14.2';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2611,6 +2611,197 @@ function download_headers(string $filename, string $contentType = 'application/o
   header('X-Content-Type-Options: nosniff');
 }
 
+/** Write a complete chunk, also detecting a full temporary disk. */
+function ms_export_write($out, string $bytes): void {
+  $length = strlen($bytes);
+  $offset = 0;
+  while ($offset < $length) {
+    $written = @fwrite($out, $offset === 0 ? $bytes : substr($bytes, $offset));
+    if ($written === false || $written === 0) {
+      throw new RuntimeException('Unable to write the export. Check free temporary disk space.');
+    }
+    $offset += $written;
+  }
+}
+
+function ms_export_csv_row($out, array $row, string $delimiter): void {
+  // Explicit empty escape is supported from PHP 7.4 and preserves backslashes.
+  if (@fputcsv($out, $row, $delimiter, '"', '') === false) {
+    throw new RuntimeException('Unable to write the CSV/TSV export. Check free temporary disk space.');
+  }
+}
+
+function ms_export_content_type(string $format): string {
+  $types = [
+    'sql' => 'application/sql; charset=UTF-8',
+    'csv' => 'text/csv; charset=UTF-8',
+    'tsv' => 'text/tab-separated-values; charset=UTF-8'
+  ];
+  if (!isset($types[$format])) {
+    throw new RuntimeException('Choose SQL, CSV or TSV for a server-side export.');
+  }
+  return $types[$format];
+}
+
+function ms_export_safe_filename(string $filename): string {
+  // The same safe basename is used in Content-Disposition and inside the ZIP.
+  $filename = preg_replace('~[\\\\/:*?"<>|\x00-\x1F\x7F]+~', '_', $filename) ?? '';
+  $filename = trim($filename, ". \t\r\n");
+  return $filename !== '' ? $filename : 'export';
+}
+
+function ms_export_temp_file(array &$paths): string {
+  $path = @tempnam(sys_get_temp_dir(), 'ms-export-');
+  if (!is_string($path) || $path === '') {
+    throw new RuntimeException('Unable to create a temporary export file. Check the PHP temporary directory.');
+  }
+  $paths[] = $path;
+  @chmod($path, 0600);
+  return $path;
+}
+
+/**
+ * The writer receives an output stream, never an in-memory export string.
+ * Plain files stream directly; ZIP files are completed before any download bytes.
+ */
+function ms_download_export(string $filename, string $format, bool $zip, callable $writer): void {
+  $contentType = ms_export_content_type($format);
+  $filename = ms_export_safe_filename($filename);
+  if ($zip && !class_exists('ZipArchive')) {
+    throw new RuntimeException('ZIP export requires the PHP zip extension (ZipArchive). Enable it on the server, or turn Zip off.');
+  }
+  if (headers_sent()) {
+    throw new RuntimeException('The export cannot start because the server has already sent page content.');
+  }
+  @set_time_limit(0);
+  if (session_status() === PHP_SESSION_ACTIVE) {
+    session_write_close();
+  }
+
+  $paths = [];
+  $out = null;
+  $input = null;
+  $archive = null;
+  $archiveOpen = false;
+  if ($zip) {
+    // Also remove sensitive temporary data after a fatal error or disconnection.
+    register_shutdown_function(static function () use (&$paths): void {
+      foreach (array_reverse($paths) as $path) @unlink($path);
+    });
+  }
+
+  try {
+    if ($zip) {
+      $sourcePath = ms_export_temp_file($paths);
+      $out = @fopen($sourcePath, 'wb');
+      if ($out === false) throw new RuntimeException('Unable to open the temporary export file.');
+      $writer($out);
+      if (!@fflush($out)) throw new RuntimeException('Unable to finish writing the temporary export file.');
+      if (!@fclose($out)) throw new RuntimeException('Unable to close the temporary export file.');
+      $out = null;
+
+      $zipPath = ms_export_temp_file($paths);
+      $archive = new ZipArchive();
+      $status = $archive->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE);
+      if ($status !== true) throw new RuntimeException('Unable to create the ZIP archive (error ' . (string)$status . ').');
+      $archiveOpen = true;
+      if (!$archive->addFile($sourcePath, $filename)) {
+        throw new RuntimeException('Unable to add the export file to the ZIP archive.');
+      }
+      if (!$archive->setCompressionName($filename, ZipArchive::CM_DEFLATE, 6)) {
+        throw new RuntimeException('Unable to enable ZIP compression.');
+      }
+      if (!@$archive->close()) {
+        throw new RuntimeException('Unable to finish the ZIP archive. Check free temporary disk space.');
+      }
+      $archiveOpen = false;
+      $archive = null;
+      $input = @fopen($zipPath, 'rb');
+      if ($input === false) throw new RuntimeException('Unable to open the completed ZIP archive.');
+      $stat = fstat($input);
+      if (!is_array($stat) || $stat['size'] <= 0) throw new RuntimeException('The ZIP archive is empty or incomplete.');
+    } else {
+      $out = @fopen('php://output', 'wb');
+      if ($out === false) throw new RuntimeException('Cannot open the download stream.');
+    }
+
+    // Discard any framework/PHP output buffer so it cannot corrupt an archive.
+    while (ob_get_level() > 0) {
+      if (!@ob_end_clean()) break;
+    }
+    @ini_set('zlib.output_compression', '0');
+    header('Cache-Control: no-store, no-cache, must-revalidate, no-transform');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    if ($zip) {
+      download_headers($filename . '.zip', 'application/zip');
+      if (!filter_var(ini_get('zlib.output_compression'), FILTER_VALIDATE_BOOLEAN)) {
+        header('Content-Length: ' . (string)$stat['size']);
+      }
+      if (@fpassthru($input) === false) throw new RuntimeException('Unable to send the ZIP download.');
+    } else {
+      download_headers($filename, $contentType);
+      $writer($out);
+    }
+  } finally {
+    if (is_resource($out)) @fclose($out);
+    if (is_resource($input)) @fclose($input);
+    if ($archiveOpen && $archive instanceof ZipArchive) {
+      try { @$archive->close(); } catch (Throwable $ignored) {}
+    }
+    $archive = null;
+    foreach (array_reverse($paths) as $path) @unlink($path);
+    // Leave a failed deletion registered for one final retry at shutdown.
+    $paths = array_values(array_filter($paths, 'is_file'));
+  }
+}
+
+/** Bounded INSERT batches: never accumulate the entire MySQL result in PHP. */
+function ms_export_insert_rows(mysqli $db, mysqli_result $result, string $table, array $columnNames, $out): void {
+  $prefix = 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $columnNames)) . ") VALUES\n";
+  $batch = [];
+  $batchBytes = 0;
+  while (($row = $result->fetch_row()) !== null && $row !== false) {
+    $values = [];
+    foreach ($row as $value) $values[] = $value === null ? 'NULL' : qs($db, $value);
+    $tuple = '(' . implode(', ', $values) . ')';
+    $batch[] = $tuple;
+    $batchBytes += strlen($tuple);
+    if (count($batch) >= 100 || $batchBytes >= 1048576) {
+      ms_export_write($out, $prefix . implode(",\n", $batch) . ";\n");
+      $batch = [];
+      $batchBytes = 0;
+    }
+  }
+  if ($db->errno) throw new RuntimeException('MySQL export failed: ' . $db->error);
+  if ($batch) ms_export_write($out, $prefix . implode(",\n", $batch) . ";\n");
+}
+
+function ms_export_hidden_fields(array $query, string $prefix = ''): void {
+  foreach ($query as $key => $value) {
+    $name = $prefix === '' ? (string)$key : $prefix . '[' . (string)$key . ']';
+    if (is_array($value)) {
+      ms_export_hidden_fields($value, $name);
+    } elseif (is_scalar($value) || $value === null) {
+      echo '<input type="hidden" name="' . h($name) . '" value="' . h($value) . '">';
+    }
+  }
+}
+
+/** Native GET controls: ZIP works without browser-side file generation. */
+function ms_render_result_export_controls(array $query, bool $selectPage = false): void {
+  static $counter = 0;
+  $id = 'ms-result-zip-' . (++$counter);
+  unset($query['format'], $query['zip'], $query['export_scope']);
+  ?><form method="get" class="d-flex flex-wrap align-items-center gap-2 m-0 no-print" autocomplete="off" data-ms-download-form>
+    <?php ms_export_hidden_fields($query); ?>
+    <span class="small text-body-secondary"><?= $selectPage ? 'Download:' : 'Export all rows:' ?></span>
+    <?php if ($selectPage) { ?><select class="form-select form-select-sm w-auto" name="export_scope" aria-label="Rows to export"><option value="all">All matching rows</option><option value="page">Current page query</option></select><?php } ?>
+    <div class="form-check form-switch ms-ios-switch m-0 me-1"><input class="form-check-input" type="checkbox" role="switch" id="<?= h($id) ?>" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="<?= h($id) ?>">Zip</label></div>
+    <?php foreach (['sql' => 'SQL', 'csv' => 'CSV', 'tsv' => 'TSV'] as $format => $label) { ?><button class="btn btn-secondary btn-sm" type="submit" name="format" value="<?= h($format) ?>"><i class="fa-solid fa-download me-1"></i><?= h($label) ?></button><?php } ?>
+  </form><?php
+}
+
 function unique_result_names(array $names): array {
   $used = [];
   $unique = [];
@@ -2650,188 +2841,146 @@ function sql_result_export_entry(string $token): array {
   return ['database' => $database, 'statement' => $statement, 'created' => (int)$entry['created']];
 }
 
-function stream_sql_result_export(mysqli $db, array $entry, string $format): void {
-  if (!in_array($format, ['sql', 'csv', 'tsv'], true)) {
-    throw new RuntimeException('Unsupported query-result export format.');
-  }
-  if (!$db->select_db((string)$entry['database'])) {
-    throw new RuntimeException($db->error);
-  }
-  $result = $db->query((string)$entry['statement'], MYSQLI_USE_RESULT);
-  if (!$result instanceof mysqli_result) {
-    throw new RuntimeException($db->error ?: 'The statement did not return a result set.');
-  }
-  $fields = $result->fetch_fields();
-  $displayNames = unique_result_names(array_map(static function ($field): string {
-    return (string)$field->name;
-  }, $fields));
-  $stamp = gmdate('Ymd-His');
+function stream_sql_result_export(mysqli $db, array $entry, string $format, bool $zip = false, string $filenamePrefix = 'query-result'): void {
+  ms_export_content_type($format);
+  if (!$db->select_db((string)$entry['database'])) throw new RuntimeException($db->error);
+  $filename = $filenamePrefix . '-' . gmdate('Ymd-His') . '.' . $format;
+  ms_download_export($filename, $format, $zip, static function ($out) use ($db, $entry, $format): void {
+    $result = $db->query((string)$entry['statement'], MYSQLI_USE_RESULT);
+    if (!$result instanceof mysqli_result) {
+      throw new RuntimeException($db->error ?: 'The statement did not return a result set.');
+    }
+    try {
+      $fields = $result->fetch_fields();
+      $displayNames = unique_result_names(array_map(static function ($field): string {
+        return (string)$field->name;
+      }, $fields));
+      if ($format === 'csv' || $format === 'tsv') {
+        $delimiter = $format === 'tsv' ? "\t" : ',';
+        ms_export_write($out, "\xEF\xBB\xBF");
+        ms_export_csv_row($out, $displayNames, $delimiter);
+        while (($row = $result->fetch_row()) !== null && $row !== false) {
+          ms_export_csv_row($out, $row, $delimiter);
+        }
+        if ($db->errno) throw new RuntimeException('MySQL export failed: ' . $db->error);
+        return;
+      }
 
-  if ($format === 'csv' || $format === 'tsv') {
-    $delimiter = $format === 'tsv' ? "\t" : ',';
-    $contentType = $format === 'tsv' ? 'text/tab-separated-values; charset=UTF-8' : 'text/csv; charset=UTF-8';
-    download_headers('query-result-' . $stamp . '.' . $format, $contentType);
-    $out = fopen('php://output', 'wb');
-    if ($out === false) {
+      $originTable = '';
+      $originNames = [];
+      $useOrigin = count($fields) > 0;
+      foreach ($fields as $field) {
+        $table = (string)$field->orgtable;
+        $name = (string)$field->orgname;
+        if ($table === '' || $name === '' || ($originTable !== '' && $originTable !== $table)) $useOrigin = false;
+        if ($originTable === '') $originTable = $table;
+        $originNames[] = $name;
+      }
+      if (count(array_unique(array_map('strtolower', $originNames))) !== count($originNames)) $useOrigin = false;
+      $targetTable = $useOrigin ? $originTable : 'query_result';
+      $columnNames = $useOrigin ? $originNames : $displayNames;
+      ms_export_write($out, "-- MySQL Studio query-result export\n");
+      ms_export_write($out, '-- Database: ' . str_replace(["\r", "\n"], ' ', (string)$entry['database']) . "\n");
+      ms_export_write($out, '-- Generated: ' . gmdate('Y-m-d H:i:s') . " UTC\n\nSET NAMES utf8mb4;\n\n");
+      ms_export_insert_rows($db, $result, $targetTable, $columnNames, $out);
+    } finally {
       $result->free();
-      throw new RuntimeException('Cannot open the download stream.');
     }
-    fwrite($out, "\xEF\xBB\xBF");
-    fputcsv($out, $displayNames, $delimiter);
-    while ($row = $result->fetch_row()) {
-      fputcsv($out, $row, $delimiter);
-    }
-    $result->free();
-    fclose($out);
-    return;
-  }
-
-  $originTable = '';
-  $originNames = [];
-  $useOrigin = count($fields) > 0;
-  foreach ($fields as $field) {
-    $table = (string)$field->orgtable;
-    $name = (string)$field->orgname;
-    if ($table === '' || $name === '' || ($originTable !== '' && $originTable !== $table)) {
-      $useOrigin = false;
-    }
-    if ($originTable === '') {
-      $originTable = $table;
-    }
-    $originNames[] = $name;
-  }
-  if (count(array_unique(array_map('strtolower', $originNames))) !== count($originNames)) {
-    $useOrigin = false;
-  }
-  $targetTable = $useOrigin ? $originTable : 'query_result';
-  $columnNames = $useOrigin ? $originNames : $displayNames;
-  $columns = array_map('qi', $columnNames);
-  download_headers('query-result-' . $stamp . '.sql', 'application/sql; charset=UTF-8');
-  echo "-- MySQL Studio query-result export\n";
-  echo '-- Database: ' . str_replace(["\r", "\n"], ' ', (string)$entry['database']) . "\n";
-  echo '-- Generated: ' . gmdate('Y-m-d H:i:s') . " UTC\n\n";
-  echo "SET NAMES utf8mb4;\n\n";
-  $batch = [];
-  while ($row = $result->fetch_row()) {
-    $values = [];
-    foreach ($row as $value) {
-      $values[] = $value === null ? 'NULL' : qs($db, $value);
-    }
-    $batch[] = '(' . implode(', ', $values) . ')';
-    if (count($batch) >= 100) {
-      echo 'INSERT INTO ' . qi($targetTable) . ' (' . implode(', ', $columns) . ") VALUES\n" . implode(",\n", $batch) . ";\n";
-      $batch = [];
-    }
-  }
-  if ($batch) {
-    echo 'INSERT INTO ' . qi($targetTable) . ' (' . implode(', ', $columns) . ") VALUES\n" . implode(",\n", $batch) . ";\n";
-  }
-  $result->free();
+  });
 }
 
-function dump_database(mysqli $db, array $tables, bool $structure, bool $data, bool $drop): void {
-  $database = selected_db();
-  echo "-- MySQL Studio export\n-- Database: " . str_replace("\n", ' ', $database) . "\n-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n\n";
-  echo "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n";
-  $views = [];
-  foreach ($tables as $table) {
-    $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table));
-    if (($meta['TABLE_TYPE'] ?? '') === 'VIEW') {
-      $views[] = $table;
-      continue;
+function dump_database(mysqli $db, array $tables, bool $structure, bool $data, bool $drop, $out = null): void {
+  $ownsStream = $out === null;
+  if ($ownsStream) $out = @fopen('php://output', 'wb');
+  if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
+  try {
+    $database = selected_db();
+    ms_export_write($out, "-- MySQL Studio export\n-- Database: " . str_replace(["\r", "\n"], ' ', $database) . "\n-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n\n");
+    ms_export_write($out, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n");
+    $views = [];
+    foreach ($tables as $table) {
+      $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table));
+      if (($meta['TABLE_TYPE'] ?? '') === 'VIEW') {
+        $views[] = $table;
+        continue;
+      }
+      if ($structure) {
+        $create = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
+        if (empty($create['Create Table'])) throw new RuntimeException('Unable to export the structure of ' . $table . ': ' . $db->error);
+        if ($drop) ms_export_write($out, 'DROP TABLE IF EXISTS ' . qi($table) . ";\n");
+        ms_export_write($out, $create['Create Table'] . ";\n\n");
+      }
+      if ($data) {
+        $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
+        if (!$result instanceof mysqli_result) throw new RuntimeException('Unable to export ' . $table . ': ' . $db->error);
+        try {
+          $columns = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
+          ms_export_insert_rows($db, $result, $table, $columns, $out);
+        } finally {
+          $result->free();
+        }
+        ms_export_write($out, "\n");
+      }
     }
     if ($structure) {
-      $create = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
-      if ($drop) {
-        echo 'DROP TABLE IF EXISTS ' . qi($table) . ";\n";
+      foreach ($views as $view) {
+        $create = db_one($db, 'SHOW CREATE VIEW ' . qi($view));
+        if (empty($create['Create View'])) throw new RuntimeException('Unable to export view ' . $view . ': ' . $db->error);
+        if ($drop) ms_export_write($out, 'DROP VIEW IF EXISTS ' . qi($view) . ";\n");
+        ms_export_write($out, $create['Create View'] . ";\n\n");
       }
-      echo ($create['Create Table'] ?? '') . ";\n\n";
-    }
-    if ($data) {
-      $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
-      if ($result instanceof mysqli_result) {
-        $columns = [];
-        foreach ($result->fetch_fields() as $field) {
-          $columns[] = qi($field->name);
+      foreach (['PROCEDURE', 'FUNCTION'] as $kind) {
+        $routines = db_all($db, 'SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = ' . qs($db, $kind));
+        foreach ($routines as $routine) {
+          $name = (string)$routine['ROUTINE_NAME'];
+          $create = db_one($db, 'SHOW CREATE ' . $kind . ' ' . qi($name));
+          $key = 'Create ' . ucfirst(strtolower($kind));
+          if (empty($create[$key])) throw new RuntimeException('Unable to export ' . strtolower($kind) . ' ' . $name . ': ' . $db->error);
+          if ($drop) ms_export_write($out, 'DROP ' . $kind . ' IF EXISTS ' . qi($name) . ";\n");
+          ms_export_write($out, "DELIMITER ;;\n" . $create[$key] . ";;\nDELIMITER ;\n\n");
         }
-        $batch = [];
-        while ($row = $result->fetch_assoc()) {
-          $values = [];
-          foreach ($row as $value) {
-            $values[] = $value === null ? 'NULL' : qs($db, $value);
-          }
-          $batch[] = '(' . implode(', ', $values) . ')';
-          if (count($batch) >= 100) {
-            echo 'INSERT INTO ' . qi($table) . ' (' . implode(', ', $columns) . ") VALUES\n" . implode(",\n", $batch) . ";\n";
-            $batch = [];
-          }
-        }
-        if ($batch) {
-          echo 'INSERT INTO ' . qi($table) . ' (' . implode(', ', $columns) . ") VALUES\n" . implode(",\n", $batch) . ";\n";
-        }
-        $result->free();
-        echo "\n";
+      }
+      $events = db_all($db, 'SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()');
+      foreach ($events as $event) {
+        $name = (string)$event['EVENT_NAME'];
+        $create = db_one($db, 'SHOW CREATE EVENT ' . qi($name));
+        if (empty($create['Create Event'])) throw new RuntimeException('Unable to export event ' . $name . ': ' . $db->error);
+        if ($drop) ms_export_write($out, 'DROP EVENT IF EXISTS ' . qi($name) . ";\n");
+        ms_export_write($out, "DELIMITER ;;\n" . $create['Create Event'] . ";;\nDELIMITER ;\n\n");
+      }
+      $triggers = db_all($db, 'SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()');
+      foreach ($triggers as $trigger) {
+        $name = (string)$trigger['TRIGGER_NAME'];
+        $create = db_one($db, 'SHOW CREATE TRIGGER ' . qi($name));
+        if (empty($create['SQL Original Statement'])) throw new RuntimeException('Unable to export trigger ' . $name . ': ' . $db->error);
+        if ($drop) ms_export_write($out, 'DROP TRIGGER IF EXISTS ' . qi($name) . ";\n");
+        ms_export_write($out, "DELIMITER ;;\n" . $create['SQL Original Statement'] . ";;\nDELIMITER ;\n\n");
       }
     }
+    ms_export_write($out, "SET FOREIGN_KEY_CHECKS=1;\n");
+  } finally {
+    if ($ownsStream && is_resource($out)) fclose($out);
   }
-  if ($structure) {
-    foreach ($views as $view) {
-      $create = db_one($db, 'SHOW CREATE VIEW ' . qi($view));
-      if ($drop) {
-        echo 'DROP VIEW IF EXISTS ' . qi($view) . ";\n";
-      }
-      echo ($create['Create View'] ?? '') . ";\n\n";
-    }
-    foreach (['PROCEDURE', 'FUNCTION'] as $kind) {
-      $routines = db_all($db, 'SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = ' . qs($db, $kind));
-      foreach ($routines as $routine) {
-        $name = (string)$routine['ROUTINE_NAME'];
-        $create = db_one($db, 'SHOW CREATE ' . $kind . ' ' . qi($name));
-        $key = 'Create ' . ucfirst(strtolower($kind));
-        if ($drop) {
-          echo 'DROP ' . $kind . ' IF EXISTS ' . qi($name) . ";\n";
-        }
-        echo "DELIMITER ;;\n" . ($create[$key] ?? '') . ";;\nDELIMITER ;\n\n";
-      }
-    }
-    $events = db_all($db, 'SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()');
-    foreach ($events as $event) {
-      $name = (string)$event['EVENT_NAME'];
-      $create = db_one($db, 'SHOW CREATE EVENT ' . qi($name));
-      if ($drop) {
-        echo 'DROP EVENT IF EXISTS ' . qi($name) . ";\n";
-      }
-      echo "DELIMITER ;;\n" . ($create['Create Event'] ?? '') . ";;\nDELIMITER ;\n\n";
-    }
-    $triggers = db_all($db, 'SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()');
-    foreach ($triggers as $trigger) {
-      $name = (string)$trigger['TRIGGER_NAME'];
-      $create = db_one($db, 'SHOW CREATE TRIGGER ' . qi($name));
-      if ($drop) {
-        echo 'DROP TRIGGER IF EXISTS ' . qi($name) . ";\n";
-      }
-      echo "DELIMITER ;;\n" . ($create['SQL Original Statement'] ?? '') . ";;\nDELIMITER ;\n\n";
-    }
-  }
-  echo "SET FOREIGN_KEY_CHECKS=1;\n";
 }
 
-function csv_export(mysqli $db, string $table, string $delimiter = ','): void {
-  $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
-  if (!$result instanceof mysqli_result) {
-    throw new RuntimeException($db->error);
+function csv_export(mysqli $db, string $table, string $delimiter = ',', $out = null): void {
+  $ownsStream = $out === null;
+  if ($ownsStream) $out = @fopen('php://output', 'wb');
+  if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
+  $result = null;
+  try {
+    $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
+    if (!$result instanceof mysqli_result) throw new RuntimeException($db->error);
+    $headers = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
+    ms_export_csv_row($out, $headers, $delimiter);
+    while (($row = $result->fetch_row()) !== null && $row !== false) {
+      ms_export_csv_row($out, $row, $delimiter);
+    }
+    if ($db->errno) throw new RuntimeException('MySQL export failed: ' . $db->error);
+  } finally {
+    if ($result instanceof mysqli_result) $result->free();
+    if ($ownsStream && is_resource($out)) fclose($out);
   }
-  $out = fopen('php://output', 'wb');
-  $headers = [];
-  foreach ($result->fetch_fields() as $field) {
-    $headers[] = $field->name;
-  }
-  fputcsv($out, $headers, $delimiter);
-  while ($row = $result->fetch_row()) {
-    fputcsv($out, $row, $delimiter);
-  }
-  $result->free();
-  fclose($out);
 }
 
 function ms_import_cleanup(): void {
@@ -3347,7 +3496,23 @@ try {
     if (g('download') === 'sql_result') {
       $entry = sql_result_export_entry(g('token'));
       session_write_close();
-      stream_sql_result_export($db, $entry, g('format', 'csv'));
+      stream_sql_result_export($db, $entry, g('format', 'csv'), g('zip') === '1');
+      exit;
+    }
+
+    if (g('download') === 'select_result') {
+      if (selected_db() === '' || !$db->select_db(selected_db())) {
+        throw new RuntimeException('Choose a database first.');
+      }
+      $table = g('table');
+      if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+      $scope = g('export_scope', 'all');
+      if (!in_array($scope, ['all', 'page'], true)) throw new RuntimeException('Choose a valid export row range.');
+      $columns = table_columns($db, $table);
+      // Rebuild trusted SQL with the active filters, aggregation and ordering.
+      [$sql] = build_select_query($db, $table, $columns, null, null, $scope === 'all');
+      $entry = ['database' => selected_db(), 'statement' => $sql];
+      stream_sql_result_export($db, $entry, g('format', 'csv'), g('zip') === '1', $table . '-result');
       exit;
     }
 
@@ -3362,25 +3527,32 @@ try {
     }
 
     if (g('download') === 'export') {
-      $db->select_db(selected_db());
+      if (selected_db() === '' || !$db->select_db(selected_db())) {
+        throw new RuntimeException('Choose a database first.');
+      }
       $format = g('format', 'sql');
+      if ($format === 'xls') throw new RuntimeException('XLS export is generated in the browser from the Export page.');
+      ms_export_content_type($format);
+      $zip = g('zip') === '1';
       $selected = isset($_GET['tables']) && is_array($_GET['tables']) ? array_map('strval', $_GET['tables']) : [];
       $available = array_column(db_all($db, 'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME'), 'TABLE_NAME');
       $tables = $selected ? array_values(array_intersect($available, $selected)) : $available;
+      if ($selected && count(array_unique($selected)) !== count($tables)) throw new RuntimeException('One or more selected objects are no longer available.');
       if ($format === 'csv' || $format === 'tsv') {
-        if (count($tables) !== 1) {
-          throw new RuntimeException(strtoupper($format) . ' export requires exactly one table.');
-        }
-        $contentType = $format === 'tsv' ? 'text/tab-separated-values; charset=UTF-8' : 'text/csv; charset=UTF-8';
+        if (count($tables) !== 1) throw new RuntimeException(strtoupper($format) . ' export requires exactly one table.');
         $delimiter = $format === 'tsv' ? "\t" : ',';
-        download_headers($tables[0] . '.' . $format, $contentType);
-        echo "\xEF\xBB\xBF";
-        csv_export($db, $tables[0], $delimiter);
-      } elseif ($format === 'xls') {
-        throw new RuntimeException('XLS export is generated in the browser from the Export page.');
+        ms_download_export($tables[0] . '.' . $format, $format, $zip, static function ($out) use ($db, $tables, $delimiter): void {
+          ms_export_write($out, "\xEF\xBB\xBF");
+          csv_export($db, $tables[0], $delimiter, $out);
+        });
       } else {
-        download_headers((selected_db() ?: 'database') . '-' . gmdate('Ymd-His') . '.sql', 'application/sql; charset=UTF-8');
-        dump_database($db, $tables, g('structure', '1') === '1', g('data', '1') === '1', g('drop', '1') === '1');
+        $structure = g('structure', '1') === '1';
+        $data = g('data', '1') === '1';
+        $drop = g('drop', '1') === '1';
+        $filename = (selected_db() ?: 'database') . '-' . gmdate('Ymd-His') . '.sql';
+        ms_download_export($filename, 'sql', $zip, static function ($out) use ($db, $tables, $structure, $data, $drop): void {
+          dump_database($db, $tables, $structure, $data, $drop, $out);
+        });
       }
       exit;
     }
@@ -4352,6 +4524,19 @@ try {
     }
   }
 } catch (Throwable $e) {
+  if (in_array(g('download'), ['export', 'sql_result', 'select_result'], true)) {
+    if (!headers_sent()) {
+      header_remove('Content-Disposition');
+      header_remove('Content-Length');
+      http_response_code(500);
+      header('Content-Type: text/plain; charset=UTF-8');
+      header('Cache-Control: no-store');
+      echo 'Export failed: ' . $e->getMessage();
+    } else {
+      error_log('MySQL Studio export interrupted: ' . $e->getMessage());
+    }
+    exit;
+  }
   $error = $e->getMessage();
 }
 
@@ -4974,7 +5159,7 @@ function render_sql_results(array $results, float $time): void {
     ?><section class="card mb-3"><div class="card-header">Result <?= $i + 1 ?></div><div class="card-body p-0"><?php
     if ($result['fields']) {
       ?><div class="table-responsive"><table class="table table-sm table-striped mb-0 ms-data-table"><thead><tr><?php foreach ($result['fields'] as $field) { ?><th><?= h($field->name) ?></th><?php } ?></tr></thead><tbody><?php foreach ($result['rows'] as $row) { ?><tr><?php foreach ($row as $value) { ?><td><?= render_value($value) ?></td><?php } ?></tr><?php } ?></tbody></table></div>
-      <div class="p-2 small d-flex flex-wrap justify-content-between align-items-center gap-2"><span class="text-body-secondary"><?php if (!empty($result['capped'])) { ?><?= h(number_format((int)$result['count'])) ?> total row(s); showing the first <?= h(number_format((int)($result['display_limit'] ?? MS_SQL_ROWS_DEFAULT))) ?>. Enable <strong>Show all result rows</strong> and run again to display every row.<?php } else { ?><?= h(number_format((int)($result['shown'] ?? count($result['rows'])))) ?> row(s) displayed.<?php } ?></span><?php if (!empty($result['export_token'])) { ?><span class="d-flex flex-wrap align-items-center gap-1"><span class="text-body-secondary me-1">Export all rows:</span><?php foreach (['sql' => 'SQL', 'csv' => 'CSV', 'tsv' => 'TSV'] as $format => $label) { ?><a class="btn btn-secondary btn-sm" href="?download=sql_result&amp;format=<?= h($format) ?>&amp;token=<?= h((string)$result['export_token']) ?>"><i class="fa-solid fa-download me-1"></i><?= h($label) ?></a><?php } ?></span><?php } ?></div><?php
+      <div class="p-2 small d-flex flex-wrap justify-content-between align-items-center gap-2"><span class="text-body-secondary"><?php if (!empty($result['capped'])) { ?><?= h(number_format((int)$result['count'])) ?> total row(s); showing the first <?= h(number_format((int)($result['display_limit'] ?? MS_SQL_ROWS_DEFAULT))) ?>. Enable <strong>Show all result rows</strong> and run again to display every row.<?php } else { ?><?= h(number_format((int)($result['shown'] ?? count($result['rows'])))) ?> row(s) displayed.<?php } ?></span><?php if (!empty($result['export_token'])) { ms_render_result_export_controls(['download' => 'sql_result', 'token' => (string)$result['export_token']]); } ?></div><?php
     } else {
       ?><div class="p-3"><?= h((string)$result['affected']) ?> row(s) affected. <?= h((string)$result['info']) ?></div><?php
     }
@@ -5589,7 +5774,7 @@ function render_table_settings(mysqli $db,string $table,?array $status): void {
   <div class="card danger-zone"><div class="card-body"><h3 class="h5 text-danger">Danger zone</h3><div class="d-flex flex-wrap gap-2"><form method="post"><input type="hidden" name="action" value="truncate_table"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete every row but keep the table?">Empty table</button></form><form method="post" class="d-flex gap-2"><input type="hidden" name="action" value="drop_table"><?= csrf_field() ?><input class="form-control" name="confirm_name" placeholder="Type <?= h($table) ?>" required><button class="btn btn-danger text-nowrap" data-confirm="Permanently drop this table?">Drop table</button></form></div></div></div><?php
 }
 
-function build_select_query(mysqli $db,string $table,array $columns,?int $overrideOffset=null,?int $overrideLimit=null): array {
+function build_select_query(mysqli $db,string $table,array $columns,?int $overrideOffset=null,?int $overrideLimit=null,bool $withoutPagination=false): array {
   $allowed=array_column($columns,'COLUMN_NAME');
   $where=[]; $filterCols=$_GET['filter_col']??[]; $filterOps=$_GET['filter_op']??[]; $filterValues=$_GET['filter_val']??[];
   if(!is_array($filterCols))$filterCols=[]; if(!is_array($filterOps))$filterOps=[]; if(!is_array($filterValues))$filterValues=[];
@@ -5599,7 +5784,7 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
   $select='*';$group='';
   if(in_array($aggregate,$validAgg,true)&&in_array($aggregateColumn,$allowed,true)){$select=($groupColumn!==''&&in_array($groupColumn,$allowed,true)?qi($groupColumn).', ':'').$aggregate.'('.qi($aggregateColumn).') AS '.qi(strtolower($aggregate).'_'.$aggregateColumn);if($groupColumn!==''&&in_array($groupColumn,$allowed,true))$group=' GROUP BY '.qi($groupColumn);}
   $orderParts=[];$orderCols=$_GET['order_col']??[];$orderDirs=$_GET['order_dir']??[];if(!is_array($orderCols))$orderCols=[];if(!is_array($orderDirs))$orderDirs=[];foreach($orderCols as $i=>$column){if(in_array($column,$allowed,true))$orderParts[]=qi((string)$column).' '.(strtoupper((string)($orderDirs[$i]??'ASC'))==='DESC'?'DESC':'ASC');}
-  $defaultLimit=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
+  $defaultLimit=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=$withoutPagination||g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
   $from=' FROM '.qi($table).($where?' WHERE '.implode(' AND ',$where):'');
   $sql='SELECT '.$select.$from.$group.($orderParts?' ORDER BY '.implode(', ',$orderParts):'').($showAll?'':' LIMIT '.$offset.','.$queryLimit);
   $countSql=$group!==''?'SELECT COUNT(*) AS n FROM (SELECT 1'.$from.$group.') ms_groups':'SELECT COUNT(*) AS n'.$from;
@@ -5733,6 +5918,19 @@ function page_select(mysqli $db): void {
       <div class="col-md-auto"><button class="btn btn-outline-danger" type="button" data-ms-delete-search="<?= h($table) ?>" disabled><i class="fa-solid fa-trash me-1"></i>Delete</button></div>
     </div>
     <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
+  <div class="card mb-3 no-print"><div class="card-body py-2">
+    <?php
+      $exportQuery = array_intersect_key($returnQuery, array_flip(['filter_col', 'filter_op', 'filter_val', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
+      $exportQuery['limit'] = $limit;
+      $exportQuery['p'] = $page;
+      $exportQuery['show_all'] = $showAll ? '1' : '0';
+      $exportQuery['page'] = 'select';
+      $exportQuery['table'] = $table;
+      $exportQuery['download'] = 'select_result';
+      ms_render_result_export_controls($exportQuery, true);
+    ?>
+    <div class="form-text">Runs the query again on MySQL, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
+  </div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
   <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>" data-ms-layout="<?= h($savedLayoutJson) ?>"<?php } ?>><thead><tr><?php
     if(!$aggregated){if($editable){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><?php }?><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php }
@@ -6836,20 +7034,21 @@ function page_sql(mysqli $db, ?array $results, float $time): void {
 function page_export(mysqli $db): void {
   $tables=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');title_bar('Export',selected_db());
   $databaseJson=json_encode(selected_db(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'"database"';
-  ?><div class="card"><div class="card-body"><form method="get" id="msExportForm"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
+  ?><div class="card"><div class="card-body"><form method="get" id="msExportForm" autocomplete="off"><input type="hidden" name="page" value="export"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input type="hidden" name="structure" value="0"><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input type="hidden" name="data" value="0"><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input type="hidden" name="drop" value="0"><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><div class="form-check form-switch ms-ios-switch m-0 me-2" title="Compress the SQL, CSV or TSV file on the server"><input class="form-check-input" type="checkbox" role="switch" id="msExportZip" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="msExportZip">Zip</label></div><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script>
   (()=>{
     'use strict';
     const form=document.getElementById('msExportForm');
     const format=document.getElementById('msExportFormat');
+    const zip=document.getElementById('msExportZip');
     const tables=document.getElementById('msExportTables');
     const download=document.getElementById('msExportDownload');
     const copyCsv=document.getElementById('msCopyCsv');
     const copyTsv=document.getElementById('msCopyTsv');
     const status=document.getElementById('msExportStatus');
     const database=<?= $databaseJson ?> || 'database';
-    if(!form||!format||!tables||!download||!copyCsv||!copyTsv||!status)return;
+    if(!form||!format||!zip||!tables||!download||!copyCsv||!copyTsv||!status)return;
 
     const selectedTables=()=>Array.from(tables.selectedOptions).map(option=>option.value);
     const setStatus=(message,type='secondary')=>{
@@ -6860,6 +7059,7 @@ function page_export(mysqli $db): void {
       [download,copyCsv,copyTsv].forEach(button=>button.disabled=busy);
       tables.disabled=busy;
       format.disabled=busy;
+      zip.disabled=busy||format.value==='xls';
     };
     const exportUrl=(table,exportFormat)=>{
       const params=new URLSearchParams();
@@ -6911,7 +7111,9 @@ function page_export(mysqli $db): void {
       copyCsv.disabled=count!==1;
       copyTsv.disabled=count!==1;
       const isXls=format.value==='xls';
-      download.querySelector('span').textContent=isXls?'Download XLS':'Download export';
+      zip.disabled=isXls;
+      if(isXls)zip.checked=false;
+      download.querySelector('span').textContent=isXls?'Download XLS':(zip.checked?'Download ZIP':'Download export');
       download.querySelector('i').className=isXls?'fa-solid fa-file-excel me-1':'fa-solid fa-download me-1';
       if(isXls){
         form.querySelectorAll('input[name="structure"],input[name="drop"]').forEach(input=>input.disabled=true);
@@ -6979,6 +7181,7 @@ function page_export(mysqli $db): void {
     copyTsv.addEventListener('click',()=>copyFormat('tsv'));
     tables.addEventListener('change',refresh);
     format.addEventListener('change',refresh);
+    zip.addEventListener('change',refresh);
     form.addEventListener('submit',event=>{
       const selected=selectedTables();
       if(format.value==='xls'){
