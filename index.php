@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.0';
+const MS_VERSION = '1.15.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -690,7 +690,7 @@ function ms_profile_set_sidebar_visibility(string $database, string $table, bool
 }
 
 function ms_default_table_icon(bool $isBaseTable): array {
-  return ['style' => 'solid', 'name' => $isBaseTable ? 'table' : 'eye'];
+  return ['style' => 'solid', 'name' => $isBaseTable ? 'table' : 'eye', 'color' => ''];
 }
 
 function ms_normalize_table_icon($source, bool $isBaseTable): array {
@@ -698,8 +698,10 @@ function ms_normalize_table_icon($source, bool $isBaseTable): array {
   if (!is_array($source)) return $default;
   $style = (string)($source['style'] ?? '');
   $name = trim((string)($source['name'] ?? ''));
+  $color = strtolower(trim((string)($source['color'] ?? '')));
   if (!in_array($style, ['solid', 'regular', 'brands'], true) || preg_match('/\A[a-z0-9][a-z0-9-]{0,79}\z/', $name) !== 1) return $default;
-  return ['style' => $style, 'name' => $name];
+  if ($color !== '' && preg_match('/\A#[0-9a-f]{6}\z/', $color) !== 1) $color = '';
+  return ['style' => $style, 'name' => $name, 'color' => $color];
 }
 
 function ms_profile_table_icon(string $database, string $table, bool $isBaseTable): array {
@@ -707,9 +709,10 @@ function ms_profile_table_icon(string $database, string $table, bool $isBaseTabl
   return ms_normalize_table_icon($tableConfig['icon'] ?? [], $isBaseTable);
 }
 
-function ms_profile_set_table_icon(string $database, string $table, string $style, string $name, bool $isBaseTable): void {
-  $icon = ms_normalize_table_icon(['style' => $style, 'name' => $name], $isBaseTable);
-  if ($icon['style'] !== $style || $icon['name'] !== $name) throw new RuntimeException('Invalid Font Awesome icon.');
+function ms_profile_set_table_icon(string $database, string $table, string $style, string $name, string $color, bool $isBaseTable): void {
+  $color = strtolower(trim($color));
+  $icon = ms_normalize_table_icon(['style' => $style, 'name' => $name, 'color' => $color], $isBaseTable);
+  if ($icon['style'] !== $style || $icon['name'] !== $name || $icon['color'] !== $color) throw new RuntimeException('Invalid Font Awesome icon or color.');
   ms_profile_update_table($database, $table, static function (array $tableConfig) use ($icon): array {
     $tableConfig['icon'] = $icon;
     return $tableConfig;
@@ -3359,7 +3362,7 @@ try {
           $table = p('table');
           if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
           $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
-          ms_profile_set_table_icon($database, $table, p('icon_style'), p('icon_name'), (string)($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE');
+          ms_profile_set_table_icon($database, $table, p('icon_style'), p('icon_name'), p('icon_color'), (string)($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE');
         } elseif ($configAction === 'save_table_order') {
           $database = selected_db();
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
@@ -4670,7 +4673,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-bs-theme="dark"]{--ms-link:color-mix(in srgb,var(--ms-accent) 55%,white)}
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
     body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;display:flex;justify-content:center}.ms-raw-db-switch .form-check{min-height:0;padding-left:0!important;width:max-content}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.ms-col-header-name:hover,.ms-col-header-name:focus{color:var(--ms-accent);text-decoration:underline}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}.ms-sidebar-object-row{display:flex;align-items:center;gap:.2rem;padding:0}.ms-sidebar-object-name{display:flex;align-items:center;min-width:0;flex:1;padding:.5rem .32rem;line-height:1.2;color:var(--bs-body-color);text-decoration:none;border-radius:.25rem}.ms-sidebar-object-name:hover,.ms-sidebar-object-name:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-object-actions{display:inline-flex;flex:0 0 auto;align-items:center;gap:.05rem}.ms-sidebar-object-action{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;height:auto;padding:.5rem .12rem;line-height:1.2;border-radius:.25rem;color:var(--bs-secondary-color);text-decoration:none}.ms-sidebar-object-action:hover,.ms-sidebar-object-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-section-divider{margin:.55rem 0;border:0;border-top:2px solid var(--bs-border-color);opacity:1}.ms-db-tools .nav-link{padding-left:.32rem;padding-right:.32rem}
-    .ms-table-icon-trigger{display:inline-flex;align-items:center;justify-content:center;width:2.75rem;height:2.75rem;padding:0;border-radius:.65rem}.ms-table-icon-trigger i{pointer-events:none}.ms-icon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(8.75rem,1fr));gap:.5rem;max-height:54vh;overflow:auto;padding:.15rem}.ms-icon-choice{position:relative;display:flex;min-width:0;min-height:5.6rem;flex-direction:column;align-items:center;justify-content:center;gap:.45rem;padding:.65rem .4rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);color:var(--bs-body-color);text-align:center;transition:border-color .12s,background-color .12s,box-shadow .12s,transform .12s}.ms-icon-choice:hover,.ms-icon-choice:focus{border-color:rgba(var(--ms-accent-rgb),.7);background:rgba(var(--ms-accent-rgb),.07);transform:translateY(-1px)}.ms-icon-choice.active{border-color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.12);box-shadow:0 0 0 .15rem rgba(var(--ms-accent-rgb),.14)}.ms-icon-choice[hidden]{display:none!important}.ms-icon-choice i{font-size:1.55rem;line-height:1.2}.ms-icon-choice-name{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem}.ms-icon-choice-style{position:absolute;top:.25rem;right:.3rem;color:var(--bs-secondary-color);font-size:.58rem;line-height:1;text-transform:uppercase}.ms-icon-empty{min-height:9rem}.ms-selected-icon{display:inline-flex;align-items:center;gap:.55rem;min-width:0}.ms-selected-icon code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ms-table-icon-trigger{display:inline-flex;align-items:center;justify-content:center;width:2.75rem;height:2.75rem;padding:0;border-radius:.65rem}.ms-table-icon-trigger i{pointer-events:none}.ms-icon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(8.75rem,1fr));gap:.5rem;max-height:54vh;overflow:auto;padding:.15rem}.ms-icon-choice{position:relative;display:flex;min-width:0;min-height:5.6rem;flex-direction:column;align-items:center;justify-content:center;gap:.45rem;padding:.65rem .4rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);color:var(--bs-body-color);text-align:center;transition:border-color .12s,background-color .12s,box-shadow .12s,transform .12s}.ms-icon-choice:hover,.ms-icon-choice:focus{border-color:rgba(var(--ms-accent-rgb),.7);background:rgba(var(--ms-accent-rgb),.07);transform:translateY(-1px)}.ms-icon-choice.active{border-color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.12);box-shadow:0 0 0 .15rem rgba(var(--ms-accent-rgb),.14)}.ms-icon-choice[hidden]{display:none!important}.ms-icon-choice i{font-size:1.55rem;line-height:1.2}.ms-icon-choice-name{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem}.ms-icon-choice-style{position:absolute;top:.25rem;right:.3rem;color:var(--bs-secondary-color);font-size:.58rem;line-height:1;text-transform:uppercase}.ms-icon-empty{min-height:9rem}.ms-selected-icon{display:inline-flex;align-items:center;gap:.55rem;min-width:0}.ms-selected-icon code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-icon-grid .ms-icon-choice i,.ms-selected-icon i{color:var(--ms-icon-preview-color,inherit)}.ms-icon-color-palette{display:flex;flex-wrap:wrap;align-items:center;gap:.55rem}.ms-icon-color-choice{display:inline-flex;align-items:center;justify-content:center;width:2.35rem;height:2.35rem;padding:.22rem;border:2px solid transparent;border-radius:50%;background:transparent;transition:border-color .12s,box-shadow .12s,transform .12s}.ms-icon-color-choice:hover,.ms-icon-color-choice:focus{transform:translateY(-1px);border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-color-choice.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-color-swatch{display:block;width:100%;height:100%;border-radius:50%;background:var(--ms-icon-color);box-shadow:inset 0 0 0 1px rgba(0,0,0,.18)}.ms-icon-color-choice.ms-icon-color-auto{width:auto;border-radius:.55rem;padding:.25rem .6rem;gap:.38rem;color:var(--bs-body-color);background:var(--bs-body-bg)}.ms-icon-color-auto-swatch{display:inline-flex;align-items:center;justify-content:center;width:1.45rem;height:1.45rem;border-radius:50%;border:1px solid var(--bs-border-color);background:linear-gradient(135deg,var(--bs-body-bg) 0 46%,var(--bs-secondary-bg) 46% 54%,var(--bs-body-bg) 54% 100%);font-size:.65rem}.ms-icon-custom-color{display:inline-flex;align-items:center;gap:.45rem;padding:.2rem .55rem .2rem .25rem;border:2px solid var(--bs-border-color);border-radius:.55rem;cursor:pointer;background:var(--bs-body-bg);transition:border-color .12s,box-shadow .12s}.ms-icon-custom-color:hover{border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-custom-color.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-custom-color input[type="color"]{width:2rem;height:2rem;padding:.1rem;border:0;border-radius:.35rem;background:transparent;cursor:pointer}.ms-icon-custom-color span{font-size:.82rem;font-weight:600}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -5134,7 +5137,7 @@ function render_sidebar(): void {
           $sidebarIcon=ms_normalize_table_icon($tableConfig['icon']??[],$isBaseTable);
           $sidebarObjectHidden=!empty($hiddenSidebar[$name]);
           ?><div class="ms-sidebar-object-row" data-ms-sidebar-object-key="<?= h($name) ?>"<?= (!$rawDbView && $sidebarObjectHidden) ? ' hidden' : '' ?>>
-            <a class="ms-sidebar-object-name text-truncate" title="<?= h($name) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="<?= h(ms_table_icon_class($sidebarIcon)) ?> fa-fw me-1" data-ms-sidebar-object-icon data-icon-style="<?= h($sidebarIcon['style']) ?>" data-icon-name="<?= h($sidebarIcon['name']) ?>"></i><span class="text-truncate"><?= h($name) ?></span></a>
+            <a class="ms-sidebar-object-name text-truncate" title="<?= h($name) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="<?= h(ms_table_icon_class($sidebarIcon)) ?> fa-fw me-1" style="color:<?= h($sidebarIcon['color'] !== '' ? $sidebarIcon['color'] : 'inherit') ?>" data-ms-sidebar-object-icon data-icon-style="<?= h($sidebarIcon['style']) ?>" data-icon-name="<?= h($sidebarIcon['name']) ?>" data-icon-color="<?= h($sidebarIcon['color']) ?>"></i><span class="text-truncate"><?= h($name) ?></span></a>
             <span class="ms-sidebar-object-actions">
               <a class="ms-sidebar-object-action" href="?page=select&amp;table=<?= urlencode($name) ?>" title="Show content: <?= h($name) ?>" aria-label="Show content of <?= h($name) ?>"><i class="fa-solid fa-table-cells" aria-hidden="true"></i></a>
               <?php if ($isBaseTable) { ?><a class="ms-sidebar-object-action" href="?page=structure&amp;table=<?= urlencode($name) ?>" title="Alter structure: <?= h($name) ?>" aria-label="Alter structure of <?= h($name) ?>"><i class="fa-solid fa-screwdriver-wrench" aria-hidden="true"></i></a><?php } ?>
@@ -5936,6 +5939,12 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
 function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $tableIcon=ms_profile_table_icon(selected_db(),$table,$editable);
+  $iconPalette=[
+    '#ef4444'=>'Red','#f97316'=>'Orange','#f59e0b'=>'Amber','#eab308'=>'Yellow',
+    '#84cc16'=>'Lime','#22c55e'=>'Green','#10b981'=>'Emerald','#14b8a6'=>'Teal',
+    '#06b6d4'=>'Cyan','#0ea5e9'=>'Sky','#3b82f6'=>'Blue','#6366f1'=>'Indigo',
+    '#8b5cf6'=>'Violet','#a855f7'=>'Purple','#ec4899'=>'Pink','#64748b'=>'Slate'
+  ];
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
@@ -5949,7 +5958,7 @@ function page_select(mysqli $db): void {
   $layoutColumns=$allColumnNames;$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';$savedLayout=ms_profile_table_layout(selected_db(),$table);$savedLayoutJson=json_encode($savedLayout,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'{}';$sidebarHidden=!empty(ms_profile_hidden_sidebar(selected_db())[$table]);$savedSearches=ms_profile_table_saved_searches(selected_db(),$table);
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
-  $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" title="Change table icon" aria-label="Change icon for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" data-ms-current-table-icon aria-hidden="true"></i></button>';
+  $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" data-icon-color="'.h($tableIcon['color']).'" title="Change table icon" aria-label="Change icon for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" style="color:'.h($tableIcon['color'] !== '' ? $tableIcon['color'] : 'inherit').'" data-ms-current-table-icon aria-hidden="true"></i></button>';
   $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
@@ -5959,6 +5968,14 @@ function page_select(mysqli $db): void {
     <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
       <div class="modal-header"><h2 class="modal-title fs-5" id="ms-table-icon-modal-title"><i class="fa-solid fa-icons me-2"></i>Choose table icon</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body">
+        <section class="border rounded p-3 mb-3" aria-labelledby="ms-table-icon-color-title">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2"><div class="fw-semibold" id="ms-table-icon-color-title"><i class="fa-solid fa-palette me-2"></i>Icon color</div><span class="small text-body-secondary" id="ms-table-icon-color-value">Theme/default</span></div>
+          <div class="ms-icon-color-palette" role="group" aria-label="Icon color choices">
+            <button class="ms-icon-color-choice ms-icon-color-auto" type="button" data-ms-icon-color="" title="Use the theme color" aria-label="Use the theme default color"><span class="ms-icon-color-auto-swatch"><i class="fa-solid fa-a"></i></span><span class="small fw-semibold">Default</span></button>
+            <?php foreach($iconPalette as $color=>$label){ ?><button class="ms-icon-color-choice" type="button" data-ms-icon-color="<?= h($color) ?>" style="--ms-icon-color:<?= h($color) ?>" title="<?= h($label) ?>" aria-label="<?= h($label) ?>"><span class="ms-icon-color-swatch" aria-hidden="true"></span></button><?php } ?>
+            <label class="ms-icon-custom-color" id="ms-table-icon-custom-color"><input type="color" id="ms-table-icon-color-picker" value="#3b82f6" aria-label="Choose a custom icon color"><span>Custom</span></label>
+          </div>
+        </section>
         <div class="input-group mb-3"><span class="input-group-text"><i class="fa-solid fa-magnifying-glass"></i></span><input class="form-control" type="search" id="ms-table-icon-search" autocomplete="off" placeholder="Search all Font Awesome icons…" aria-label="Search icons"><button class="btn btn-outline-secondary" type="button" id="ms-table-icon-search-clear" title="Clear search" aria-label="Clear icon search"><i class="fa-solid fa-xmark"></i></button></div>
         <div class="d-flex justify-content-between align-items-center gap-2 mb-2 small text-body-secondary"><span id="ms-table-icon-count"></span><span>Solid, regular and brands</span></div>
         <div class="ms-icon-grid" id="ms-table-icon-grid" role="listbox" aria-label="Font Awesome icons"></div>
@@ -5981,10 +5998,18 @@ function page_select(mysqli $db): void {
     const empty=document.getElementById('ms-table-icon-empty');
     const selectedLabel=document.getElementById('ms-table-icon-selected');
     const save=document.getElementById('ms-table-icon-save');
+    const colorChoices=Array.from(modal.querySelectorAll('[data-ms-icon-color]'));
+    const colorPicker=document.getElementById('ms-table-icon-color-picker');
+    const customColor=document.getElementById('ms-table-icon-custom-color');
+    const colorValue=document.getElementById('ms-table-icon-color-value');
+    const fixedColors=colorChoices.map(choice=>choice.dataset.msIconColor||'').filter(Boolean);
     const entries=[];
+    const normalizeColor=value=>/^#[0-9a-f]{6}$/i.test(value||'')?String(value).toLowerCase():'';
     let selectedStyle=trigger.dataset.iconStyle||'solid';
     let selectedName=trigger.dataset.iconName||'table';
+    let selectedColor=normalizeColor(trigger.dataset.iconColor||'');
     const iconClass=(style,name)=>'fa-'+style+' fa-'+name;
+    const applyColor=(element,color)=>{if(element)element.style.color=color||'inherit';};
     const readable=name=>name.replace(/-/g,' ');
     const updateSelectedLabel=()=>{
       selectedLabel.replaceChildren();
@@ -5992,8 +6017,22 @@ function page_select(mysqli $db): void {
       icon.className=iconClass(selectedStyle,selectedName)+' fs-5';
       icon.setAttribute('aria-hidden','true');
       const code=document.createElement('code');
-      code.textContent='fa-'+selectedStyle+' fa-'+selectedName;
+      applyColor(icon,selectedColor);
+      code.textContent='fa-'+selectedStyle+' fa-'+selectedName+(selectedColor!==''?' · '+selectedColor.toUpperCase():' · theme color');
       selectedLabel.append(icon,code);
+    };
+    const updateColorSelection=()=>{
+      colorChoices.forEach(choice=>{
+        const active=(choice.dataset.msIconColor||'')===selectedColor;
+        choice.classList.toggle('active',active);
+        choice.setAttribute('aria-pressed',active?'true':'false');
+      });
+      const customActive=selectedColor!==''&&!fixedColors.includes(selectedColor);
+      customColor.classList.toggle('active',customActive);
+      if(selectedColor!=='')colorPicker.value=selectedColor;
+      colorValue.textContent=selectedColor!==''?selectedColor.toUpperCase():'Theme/default';
+      if(selectedColor!=='')modal.style.setProperty('--ms-icon-preview-color',selectedColor);
+      else modal.style.removeProperty('--ms-icon-preview-color');
     };
     const updateSelection=()=>{
       entries.forEach(entry=>{
@@ -6001,6 +6040,7 @@ function page_select(mysqli $db): void {
         entry.button.classList.toggle('active',active);
         entry.button.setAttribute('aria-selected',active?'true':'false');
       });
+      updateColorSelection();
       updateSelectedLabel();
     };
     const buildGrid=()=>{
@@ -6045,9 +6085,21 @@ function page_select(mysqli $db): void {
       grid.hidden=visible===0;
       count.textContent=visible.toLocaleString()+' of '+entries.length.toLocaleString()+' icons';
     };
+    colorChoices.forEach(choice=>choice.addEventListener('click',()=>{
+      selectedColor=normalizeColor(choice.dataset.msIconColor||'');
+      updateColorSelection();
+      updateSelectedLabel();
+    }));
+    colorPicker.addEventListener('input',()=>{
+      selectedColor=normalizeColor(colorPicker.value);
+      updateColorSelection();
+      updateSelectedLabel();
+    });
     modal.addEventListener('show.bs.modal',()=>{
       selectedStyle=trigger.dataset.iconStyle||'solid';
       selectedName=trigger.dataset.iconName||'table';
+      selectedColor=normalizeColor(trigger.dataset.iconColor||'');
+      colorPicker.value=selectedColor||'#3b82f6';
       search.value='';
       buildGrid();
       applyFilter();
@@ -6065,18 +6117,24 @@ function page_select(mysqli $db): void {
       const original=save.innerHTML;
       save.innerHTML='<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>Saving…';
       try{
-        await window.msConfigPost('table_icon',{table:trigger.dataset.msTable||'',icon_style:selectedStyle,icon_name:selectedName});
+        await window.msConfigPost('table_icon',{table:trigger.dataset.msTable||'',icon_style:selectedStyle,icon_name:selectedName,icon_color:selectedColor});
         trigger.dataset.iconStyle=selectedStyle;
         trigger.dataset.iconName=selectedName;
+        trigger.dataset.iconColor=selectedColor;
         const titleIcon=trigger.querySelector('[data-ms-current-table-icon]');
-        if(titleIcon)titleIcon.className=iconClass(selectedStyle,selectedName)+' fs-5';
+        if(titleIcon){
+          titleIcon.className=iconClass(selectedStyle,selectedName)+' fs-5';
+          applyColor(titleIcon,selectedColor);
+        }
         document.querySelectorAll('[data-ms-sidebar-object-key]').forEach(row=>{
           if(row.dataset.msSidebarObjectKey!==(trigger.dataset.msTable||''))return;
           const sidebarIcon=row.querySelector('[data-ms-sidebar-object-icon]');
           if(!sidebarIcon)return;
           sidebarIcon.className=iconClass(selectedStyle,selectedName)+' fa-fw me-1';
+          applyColor(sidebarIcon,selectedColor);
           sidebarIcon.dataset.iconStyle=selectedStyle;
           sidebarIcon.dataset.iconName=selectedName;
+          sidebarIcon.dataset.iconColor=selectedColor;
         });
         bootstrap.Modal.getOrCreateInstance(modal).hide();
       }catch(error){
