@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.2';
+const MS_VERSION = '1.15.3';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -33,7 +33,7 @@ session_start();
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('Referrer-Policy: no-referrer');
-header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https: http:");
+header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdn.sheetjs.com; font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https: http:");
 
 if (empty($_SESSION['ms_csrf'])) {
   $_SESSION['ms_csrf'] = bin2hex(random_bytes(32));
@@ -2835,6 +2835,7 @@ function ms_render_result_export_controls(array $query, bool $selectPage = false
     <?php if ($selectPage) { ?><select class="form-select form-select-sm w-auto" name="export_scope" aria-label="Rows to export"><option value="all">All matching rows</option><option value="page">Current page query</option></select><?php } ?>
     <div class="form-check form-switch ms-ios-switch m-0 me-1"><input class="form-check-input" type="checkbox" role="switch" id="<?= h($id) ?>" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="<?= h($id) ?>">Zip</label></div>
     <?php foreach (['sql' => 'SQL', 'csv' => 'CSV', 'tsv' => 'TSV'] as $format => $label) { ?><button class="btn btn-secondary btn-sm" type="submit" name="format" value="<?= h($format) ?>"><i class="fa-solid fa-download me-1"></i><?= h($label) ?></button><?php } ?>
+    <?php if ($selectPage) { ?><button class="btn btn-secondary btn-sm" type="button" data-ms-select-xlsx title="Create XLSX in the browser. XLSX is already compressed; Zip is ignored."><i class="fa-solid fa-file-excel me-1"></i>XLSX</button><span class="small text-body-secondary" data-ms-xlsx-status role="status" aria-live="polite"></span><?php } ?>
   </form><?php
 }
 
@@ -6187,6 +6188,64 @@ function page_select(mysqli $db): void {
       $exportQuery['download'] = 'select_result';
       ms_render_result_export_controls($exportQuery, true);
     ?>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+    <script>
+    (()=>{
+      'use strict';
+      const button=document.querySelector('[data-ms-select-xlsx]');
+      if(!button)return;
+      const form=button.closest('form');
+      const status=form.querySelector('[data-ms-xlsx-status]');
+      const setStatus=(message,error=false)=>{
+        status.className='small '+(error?'text-danger':'text-body-secondary');
+        status.textContent=message;
+      };
+      const safeFileName=value=>String(value||'table').replace(/[\\/:*?"<>|\x00-\x1F]+/g,'_').replace(/[. ]+$/g,'')||'table';
+      button.addEventListener('click',async()=>{
+        if(typeof XLSX==='undefined'){
+          setStatus('The XLSX library could not be loaded from the CDN.',true);
+          return;
+        }
+        button.disabled=true;
+        try{
+          const params=new URLSearchParams(new FormData(form));
+          params.set('format','csv');
+          params.delete('zip');
+          const request=new URL(form.action,window.location.href);
+          request.search=params.toString();
+          setStatus('Loading '+(params.get('export_scope')==='page'?'the current page':'all matching rows')+'...');
+          const response=await fetch(request.toString(),{credentials:'same-origin',cache:'no-store'});
+          if(!response.ok){
+            const message=(await response.text()).replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+            throw new Error(message.slice(0,300)||'CSV export failed (HTTP '+response.status+').');
+          }
+          if(!/^text\/csv(?:\s*;|$)/i.test(response.headers.get('Content-Type')||'')){
+            throw new Error('The export returned a page instead of CSV. Sign in and try again.');
+          }
+          let csv=(await response.text()).replace(/^\uFEFF/,'');
+          if(!csv)throw new Error('The CSV export was empty.');
+          setStatus('Creating XLSX...');
+          await new Promise(resolve=>setTimeout(resolve,0));
+          const workbook=XLSX.read(csv,{type:'string',raw:true,dense:true});
+          csv='';
+          const sheet=workbook.Sheets[workbook.SheetNames[0]];
+          if(!sheet||!sheet['!ref'])throw new Error('The CSV export has no columns.');
+          const range=XLSX.utils.decode_range(sheet['!ref']);
+          if(range.e.r>=1048576||range.e.c>=16384){
+            throw new Error('This result exceeds Excel’s worksheet limit. Download CSV instead.');
+          }
+          const table=form.querySelector('input[name="table"]').value;
+          const stamp=new Date().toISOString().replace(/[-:]/g,'').replace(/T/,'-').replace(/\..+$/,'');
+          XLSX.writeFile(workbook,safeFileName(table)+'-result-'+stamp+'.xlsx',{bookType:'xlsx',compression:true});
+          setStatus('XLSX downloaded.'+(form.querySelector('input[name="zip"]').checked?' Zip was ignored because XLSX is already compressed.':''));
+        }catch(error){
+          setStatus(error instanceof Error?error.message:String(error),true);
+        }finally{
+          button.disabled=false;
+        }
+      });
+    })();
+    </script>
     <div class="form-text">Runs the query again on MySQL, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
   </div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
@@ -7293,7 +7352,7 @@ function page_export(mysqli $db): void {
   $tables=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');title_bar('Export',selected_db());
   $databaseJson=json_encode(selected_db(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'"database"';
   ?><div class="card"><div class="card-body"><form method="get" id="msExportForm" autocomplete="off"><input type="hidden" name="page" value="export"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input type="hidden" name="structure" value="0"><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input type="hidden" name="data" value="0"><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input type="hidden" name="drop" value="0"><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><div class="form-check form-switch ms-ios-switch m-0 me-2" title="Compress the SQL, CSV or TSV file on the server"><input class="form-check-input" type="checkbox" role="switch" id="msExportZip" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="msExportZip">Zip</label></div><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
   <script>
   (()=>{
     'use strict';
@@ -7481,7 +7540,7 @@ function page_import(mysqli $db): void {
       <div class="col-lg-2"><button class="btn btn-primary w-100" type="submit"><i class="fa-solid fa-eye me-1"></i>Preview</button></div>
     </form>
   </div></section>
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
   <script>
   (()=>{
     'use strict';
