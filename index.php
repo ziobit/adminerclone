@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.12';
+const MS_VERSION = '1.15.13';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5077,12 +5077,15 @@ function page_head(string $title, bool $authenticated): void {
   $clientSettingsJson = json_encode($clientSettings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
   $defaultSettingsJson = json_encode(ms_profile_default_settings(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
   $csrfJson = json_encode((string)($_SESSION['ms_csrf'] ?? ''), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '""';
+  // The same Font Awesome Free 7.0.1 cube used by the sidebar brand.
+  $faviconSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.0.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0) Copyright 2025 Fonticons, Inc. --><path fill="#0d6efd" d="M224.3-2.5c19.8-11.4 44.2-11.4 64 0L464.2 99c19.8 11.4 32 32.6 32 55.4l0 203c0 22.9-12.2 44-32 55.4L288.3 514.5c-19.8 11.4-44.2 11.4-64 0L48.5 413c-19.8-11.4-32-32.6-32-55.4l0-203c0-22.9 12.2-44 32-55.4L224.3-2.5zm207.8 360l0-166.1-143.8 83 0 166.1 143.8-83z"/></svg>';
   ?><!doctype html>
 <html lang="en" data-bs-theme="light" data-density="standard" data-scheme="ocean" data-raw-db-view="<?= ms_raw_db_view() ? 'true' : 'false' ?>">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title><?= h($title) ?> · <?= h(MS_APP_NAME) ?></title>
+  <link rel="icon" type="image/svg+xml" sizes="any" href="data:image/svg+xml;base64,<?= base64_encode($faviconSvg) ?>">
   <script>
     (() => {
       'use strict';
