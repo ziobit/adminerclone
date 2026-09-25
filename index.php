@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.7';
+const MS_VERSION = '1.15.8';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -734,6 +734,50 @@ function ms_profile_master_relation(string $database, string $table): ?array {
     if (!isset($relation[$key]) || !is_string($relation[$key]) || $relation[$key] === '') return null;
   }
   return $relation;
+}
+
+function ms_pdf_template_default_field(int $index, string $orientation): array {
+  $pageWidth = $orientation === 'landscape' ? 297.0 : 210.0;
+  $pageHeight = $orientation === 'landscape' ? 210.0 : 297.0;
+  $columnWidth = ($pageWidth - 36.0) / 2.0;
+  $rowsPerPage = (int)floor(($pageHeight - 32.0) / 18.0);
+  $row = intdiv($index, 2);
+  return ['x' => 12.0 + ($index % 2) * ($columnWidth + 12.0), 'y' => intdiv($row, $rowsPerPage) * $pageHeight + 16.0 + ($row % $rowsPerPage) * 18.0, 'width' => $columnWidth, 'height' => 15.5, 'font_size' => 10.0];
+}
+
+function ms_profile_pdf_template(string $database, string $table): array {
+  $source = ms_profile_table_config($database, $table)['pdf_template'] ?? [];
+  if (!is_array($source)) $source = [];
+  $orientation = ($source['orientation'] ?? '') === 'landscape' ? 'landscape' : 'portrait';
+  $fields = isset($source['fields']) && is_array($source['fields']) ? $source['fields'] : [];
+  foreach ($fields as $column => $field) if (is_array($field) && !isset($field['height'])) $fields[$column]['height'] = 15.5;
+  return ['orientation' => $orientation, 'fields' => $fields];
+}
+
+function ms_profile_save_pdf_template(string $database, string $table, array $source, array $allowedColumns): void {
+  $orientation = $source['orientation'] ?? null;
+  if (!in_array($orientation, ['portrait', 'landscape'], true)) throw new RuntimeException('Choose a valid PDF page orientation.');
+  if (!isset($source['fields']) || !is_array($source['fields']) || count($source['fields']) > count($allowedColumns)) throw new RuntimeException('Invalid PDF template fields.');
+  $pageWidth = $orientation === 'landscape' ? 297.0 : 210.0;
+  $pageHeight = $orientation === 'landscape' ? 210.0 : 297.0;
+  $fields = [];
+  foreach ($source['fields'] as $column => $position) {
+    if (!is_string($column) || !in_array($column, $allowedColumns, true) || !is_array($position)) throw new RuntimeException('Invalid PDF template field.');
+    foreach (['x', 'y', 'width', 'height', 'font_size'] as $key) {
+      if (!isset($position[$key]) || !is_numeric($position[$key]) || !is_finite((float)$position[$key])) throw new RuntimeException('Invalid PDF field dimensions.');
+    }
+    $x = (float)$position['x'];
+    $y = (float)$position['y'];
+    $width = (float)$position['width'];
+    $height = (float)$position['height'];
+    $size = (float)$position['font_size'];
+    if ($x < 0 || $y < 0 || $y >= $pageHeight * 100 || $width < 20 || $height < 8 || $size < 6 || $size > 36 || $x + $width > $pageWidth + 0.01 || fmod($y, $pageHeight) + $height > $pageHeight - 2 + 0.01) throw new RuntimeException('A PDF field is outside the A4 page or has an invalid size.');
+    $fields[$column] = ['x' => round($x, 2), 'y' => round($y, 2), 'width' => round($width, 2), 'height' => round($height, 2), 'font_size' => round($size, 2)];
+  }
+  ms_profile_update_table($database, $table, static function (array $config) use ($orientation, $fields): array {
+    $config['pdf_template'] = ['orientation' => $orientation, 'fields' => $fields];
+    return $config;
+  });
 }
 
 function ms_profile_set_table_options(string $database, string $table, string $style, string $name, string $color, bool $isBaseTable, string $displayName, ?array $relation): void {
@@ -3531,6 +3575,15 @@ try {
             $relation = ['slave_table' => $slaveTable, 'slave_field' => $slaveField, 'master_field' => $masterField];
           }
           ms_profile_set_table_options($database, $table, p('icon_style'), p('icon_name'), p('icon_color'), (string)($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE', $displayName, $relation);
+        } elseif ($configAction === 'pdf_template') {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+          $template = json_decode(p('template_json'), true);
+          if (!is_array($template) || json_last_error() !== JSON_ERROR_NONE) throw new RuntimeException('Invalid PDF template.');
+          ms_profile_save_pdf_template($database, $table, $template, $columns);
         } elseif ($configAction === 'save_table_order') {
           $database = selected_db();
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
@@ -3574,6 +3627,75 @@ try {
       } catch (Throwable $ajaxError) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      exit;
+    }
+
+    if (g('ajax') === 'pdf_row') {
+      header('Content-Type: application/json; charset=UTF-8');
+      header('Cache-Control: no-store');
+      try {
+        $database = selected_db();
+        if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+        $table = g('table');
+        if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+        $columns = table_columns($db, $table);
+        $names = array_values(array_map('strval', array_column($columns, 'COLUMN_NAME')));
+        $keys = primary_columns($db, $table) ?: $names;
+        $identity = decode_identity(g('id'));
+        if (!is_array($identity) || !$keys) throw new RuntimeException('Invalid row identity.');
+        $where = [];
+        foreach ($keys as $key) {
+          if (!array_key_exists($key, $identity) || (is_array($identity[$key]) || is_object($identity[$key]))) throw new RuntimeException('Invalid row identity.');
+          $where[] = qi((string)$key) . ($identity[$key] === null ? ' IS NULL' : ' = ' . qs($db, $identity[$key]));
+        }
+        $row = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . implode(' AND ', $where) . ' LIMIT 1');
+        if ($row === null) throw new RuntimeException('The row was not found. Reload the table and try again.');
+        $view = ms_column_view_table_config($database, $table);
+        $hidden = $view['hidden'];
+        $labels = $view['labels'];
+        $formats = $view['formats'];
+        $images = $view['images'];
+        $softFk = $view['soft_fk'];
+        $softMaps = $softFk ? ms_soft_fk_maps($db, [$row], $softFk) : [];
+        $layout = ms_profile_table_layout($database, $table);
+        $ordered = [];
+        foreach (($layout['order'] ?? []) as $name) {
+          if (is_string($name) && in_array($name, $names, true) && !in_array($name, $ordered, true)) $ordered[] = $name;
+        }
+        foreach ($names as $name) if (!in_array($name, $ordered, true)) $ordered[] = $name;
+        $template = ms_profile_pdf_template($database, $table);
+        $fields = [];
+        $totalBytes = 0;
+        foreach ($ordered as $name) {
+          if (!empty($hidden[$name])) continue;
+          $value = $row[$name] ?? null;
+          $rule = is_array($formats[$name] ?? null) ? $formats[$name] : [];
+          $display = ms_pdf_display_text($value, $rule);
+          $imageUrl = null;
+          if ($value !== null && (string)$value !== '') {
+            if (($rule['kind'] ?? '') === 'image_url' && ms_safe_image_base_url((string)$value)) {
+              $imageUrl = (string)$value;
+            } elseif (!$rule && isset($images[$name]) && is_array($images[$name])) {
+              $candidate = (string)($images[$name]['base_url'] ?? '') . (string)$value;
+              if (ms_safe_image_base_url($candidate)) $imageUrl = $candidate;
+            }
+          }
+          if (!$rule && isset($softFk[$name]) && is_array($softFk[$name]) && $value !== null) {
+            $match = $softMaps[$name][(string)$value] ?? null;
+            if (is_array($match) && empty($match['ambiguous']) && isset($match['display'])) $display = (string)$match['display'];
+          }
+          $label = trim((string)($labels[$name] ?? ''));
+          $position = $template['fields'][$name] ?? null;
+          if (!is_array($position)) $position = ms_pdf_template_default_field(count($fields), $template['orientation']);
+          $fields[] = ['column' => $name, 'label' => $label !== '' ? $label : $name, 'value' => $display, 'image_url' => $imageUrl, 'position' => $position];
+          $totalBytes += strlen($display);
+          if ($totalBytes > 2097152) throw new RuntimeException('This row is too large to render as a browser PDF (over 2 MB of text).');
+        }
+        echo json_encode(['ok' => true, 'table' => $table, 'display_name' => ms_profile_table_display_name($database, $table), 'orientation' => $template['orientation'], 'fields' => $fields], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+      } catch (Throwable $ajaxError) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
       }
       exit;
     }
@@ -4974,6 +5096,7 @@ function page_head(string $title, bool $authenticated): void {
     html[data-bs-theme="dark"][data-scheme="contrast"]{--ms-accent:#facc15;--ms-accent-hover:#eab308;--ms-accent-rgb:250,204,21;--ms-accent-text:#111;--ms-link:#fde047}
     body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;display:flex;justify-content:center}.ms-raw-db-switch .form-check{min-height:0;padding-left:0!important;width:max-content}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.ms-col-header-name:hover,.ms-col-header-name:focus{color:var(--ms-accent);text-decoration:underline}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}.ms-sidebar-object-row{display:flex;align-items:center;gap:.2rem;padding:0}.ms-sidebar-object-name{display:flex;align-items:center;min-width:0;flex:1;padding:.5rem .32rem;line-height:1.2;color:var(--bs-body-color);text-decoration:none;border-radius:.25rem}.ms-sidebar-object-name:hover,.ms-sidebar-object-name:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-object-actions{display:inline-flex;flex:0 0 auto;align-items:center;gap:.05rem}.ms-sidebar-object-action{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;height:auto;padding:.5rem .12rem;line-height:1.2;border-radius:.25rem;color:var(--bs-secondary-color);text-decoration:none}.ms-sidebar-object-action:hover,.ms-sidebar-object-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-section-divider{margin:.55rem 0;border:0;border-top:2px solid var(--bs-border-color);opacity:1}.ms-db-tools .nav-link{padding-left:.32rem;padding-right:.32rem}
     .ms-table-icon-trigger{display:inline-flex;align-items:center;justify-content:center;width:2.75rem;height:2.75rem;padding:0;border-radius:.65rem}.ms-table-icon-trigger i{pointer-events:none}.ms-icon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(8.75rem,1fr));gap:.5rem;max-height:54vh;overflow:auto;padding:.15rem}.ms-icon-choice{position:relative;display:flex;min-width:0;min-height:5.6rem;flex-direction:column;align-items:center;justify-content:center;gap:.45rem;padding:.65rem .4rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);color:var(--bs-body-color);text-align:center;transition:border-color .12s,background-color .12s,box-shadow .12s,transform .12s}.ms-icon-choice:hover,.ms-icon-choice:focus{border-color:rgba(var(--ms-accent-rgb),.7);background:rgba(var(--ms-accent-rgb),.07);transform:translateY(-1px)}.ms-icon-choice.active{border-color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.12);box-shadow:0 0 0 .15rem rgba(var(--ms-accent-rgb),.14)}.ms-icon-choice[hidden]{display:none!important}.ms-icon-choice i{font-size:1.55rem;line-height:1.2}.ms-icon-choice-name{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem}.ms-icon-choice-style{position:absolute;top:.25rem;right:.3rem;color:var(--bs-secondary-color);font-size:.58rem;line-height:1;text-transform:uppercase}.ms-icon-empty{min-height:9rem}.ms-selected-icon{display:inline-flex;align-items:center;gap:.55rem;min-width:0}.ms-selected-icon code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-icon-grid .ms-icon-choice i,.ms-selected-icon i{color:var(--ms-icon-preview-color,inherit)}.ms-icon-color-palette{display:flex;flex-wrap:wrap;align-items:center;gap:.55rem}.ms-icon-color-choice{display:inline-flex;align-items:center;justify-content:center;width:2.35rem;height:2.35rem;padding:.22rem;border:2px solid transparent;border-radius:50%;background:transparent;transition:border-color .12s,box-shadow .12s,transform .12s}.ms-icon-color-choice:hover,.ms-icon-color-choice:focus{transform:translateY(-1px);border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-color-choice.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-color-swatch{display:block;width:100%;height:100%;border-radius:50%;background:var(--ms-icon-color);box-shadow:inset 0 0 0 1px rgba(0,0,0,.18)}.ms-icon-color-choice.ms-icon-color-auto{width:auto;border-radius:.55rem;padding:.25rem .6rem;gap:.38rem;color:var(--bs-body-color);background:var(--bs-body-bg)}.ms-icon-color-auto-swatch{display:inline-flex;align-items:center;justify-content:center;width:1.45rem;height:1.45rem;border-radius:50%;border:1px solid var(--bs-border-color);background:linear-gradient(135deg,var(--bs-body-bg) 0 46%,var(--bs-secondary-bg) 46% 54%,var(--bs-body-bg) 54% 100%);font-size:.65rem}.ms-icon-custom-color{display:inline-flex;align-items:center;gap:.45rem;padding:.2rem .55rem .2rem .25rem;border:2px solid var(--bs-border-color);border-radius:.55rem;cursor:pointer;background:var(--bs-body-bg);transition:border-color .12s,box-shadow .12s}.ms-icon-custom-color:hover{border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-custom-color.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-custom-color input[type="color"]{width:2rem;height:2rem;padding:.1rem;border:0;border-radius:.35rem;background:transparent;cursor:pointer}.ms-icon-custom-color span{font-size:.82rem;font-weight:600}
+    .ms-pdf-template-workspace{max-height:70vh;overflow:auto;background:var(--bs-tertiary-bg);border-radius:.5rem;padding:1.25rem}.ms-pdf-template-page{position:relative;width:min(100%,680px);aspect-ratio:210/297;margin:0 auto 1.7rem;background:#fff;color:#212529;box-shadow:0 .5rem 2rem rgba(0,0,0,.22);overflow:hidden;user-select:none}.ms-pdf-template-page.ms-pdf-landscape{width:min(100%,860px);aspect-ratio:297/210}.ms-pdf-template-field{position:absolute;box-sizing:border-box;display:block;overflow:hidden;padding:0;border:1px dashed #adb5bd;background:#f8f9fa;color:#212529;cursor:grab;touch-action:none;text-align:left;font-family:Arial,sans-serif;line-height:1.24}.ms-pdf-template-field:active{cursor:grabbing}.ms-pdf-template-field.ms-selected{border:2px solid #0d6efd;background:#e7f1ff;z-index:2}.ms-pdf-template-label,.ms-pdf-template-value{display:block;overflow-wrap:anywhere;white-space:pre-wrap}.ms-pdf-template-label{font-weight:600;font-size:.9em;line-height:1.15}.ms-pdf-template-value{font-weight:400}.ms-pdf-template-field.ms-pdf-overflow::after{content:'continued…';position:absolute;right:12px;bottom:0;padding:0 2px;background:#fff;color:#6c757d;font:9px system-ui,sans-serif}.ms-pdf-template-resizer{position:absolute;right:0;top:0;bottom:0;width:10px;background:rgba(13,110,253,.25);cursor:ew-resize;touch-action:none}.ms-pdf-template-resizer-corner{position:absolute;right:0;bottom:0;width:13px;height:13px;background:#0d6efd;cursor:nwse-resize;touch-action:none}.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer,.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer-corner{display:none}.ms-pdf-template-page-number{position:absolute;bottom:3px;right:8px;font:11px system-ui,sans-serif;color:#adb5bd;pointer-events:none}.ms-pdf-template-inspector{min-width:0}.ms-pdf-template-inspector input{min-width:0}.ms-pdf-template-field:focus-visible{outline:3px solid #0d6efd;outline-offset:1px}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -4985,7 +5108,12 @@ function page_head(string $title, bool $authenticated): void {
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name{cursor:default}
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:hover,
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:focus{color:inherit;text-decoration:none}
+    .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
+    .ms-select-table-name:hover{color:var(--ms-accent);text-decoration:underline}
+    .ms-select-table-name:focus-visible{outline:2px solid var(--ms-accent);outline-offset:3px;border-radius:.15rem}
+    .ms-select-row-count{font-size:.7rem;line-height:1.1}
     .ms-pretty-toggle{display:inline-flex;align-items:center;justify-content:center;width:1.75rem;height:1.75rem;padding:0;border-radius:50%;color:var(--bs-secondary-color);font-size:.8rem;line-height:1}
+    .ms-select-heading .ms-pretty-toggle{width:1.375rem;height:1.375rem;margin-left:.35rem;font-size:.4rem}
     .ms-pretty-toggle:hover,.ms-pretty-toggle:focus,.ms-pretty-toggle[aria-pressed="true"]{color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.1)}
     [data-ms-save-widths][hidden]{display:none!important}
     .ms-data-table tr.ms-soft-deleted td[data-ms-column],.ms-data-table tr.ms-soft-deleted td[data-ms-column] :is(a,.cell-value,.badge,code,pre){color:var(--bs-secondary-color)!important;text-decoration:line-through}
@@ -5025,7 +5153,7 @@ function page_head(string $title, bool $authenticated): void {
       .main{margin-left:0;padding-top:3.75rem}
       body.ms-mobile-sidebar-open .sidebar{display:block}
       body.ms-mobile-sidebar-open .main{visibility:hidden}
-      .ms-mobile-sidebar-toggle{position:fixed;z-index:1039;top:calc(.5rem + env(safe-area-inset-top,0px));left:calc(.5rem + env(safe-area-inset-left,0px));display:inline-flex;align-items:center;justify-content:center;width:2.85rem;height:2.85rem;padding:0;border:0;border-radius:.5rem;background:transparent;color:var(--bs-body-color);font-size:1.45rem;line-height:1;touch-action:none;user-select:none;cursor:grab}
+      .ms-mobile-sidebar-toggle{position:fixed;z-index:1039;top:calc(.5rem + env(safe-area-inset-top,0px));right:calc(.5rem + env(safe-area-inset-right,0px));display:inline-flex;align-items:center;justify-content:center;width:2.85rem;height:2.85rem;padding:0;border:1px solid var(--bs-secondary-color);border-radius:.5rem;background:transparent;color:var(--bs-body-color);font-size:1.45rem;line-height:1;touch-action:none;user-select:none;cursor:grab}
       .ms-mobile-sidebar-toggle i{filter:drop-shadow(0 1px 1px var(--bs-body-bg))}
       .ms-mobile-sidebar-toggle:hover,.ms-mobile-sidebar-toggle:focus-visible{background:var(--bs-tertiary-bg)}
       .ms-mobile-sidebar-toggle:focus-visible,.ms-mobile-sidebar-close:focus-visible{outline:3px solid var(--ms-accent);outline-offset:2px}
@@ -5078,7 +5206,7 @@ function page_foot(): void {
   const main=document.querySelector('main.main');
   if(!sidebar||!toggle||!closeButton||!main)return;
   const mobile=window.matchMedia('(max-width: 991.98px)');
-  const positionKey='ms-mobile-sidebar-toggle-position';
+  const positionKey='ms-mobile-sidebar-toggle-position-v2';
   let savedOverflow='';
   let drag=null;
   let suppressPointerClickUntil=0;
@@ -5086,6 +5214,7 @@ function page_foot(): void {
     const margin=4;
     const maxX=Math.max(margin,window.innerWidth-toggle.offsetWidth-margin);
     const maxY=Math.max(margin,window.innerHeight-toggle.offsetHeight-margin);
+    toggle.style.right='auto';
     toggle.style.left=Math.min(maxX,Math.max(margin,x))+'px';
     toggle.style.top=Math.min(maxY,Math.max(margin,y))+'px';
   };
@@ -5573,6 +5702,202 @@ function page_foot(): void {
   }
 })();
 </script>
+<script>
+(() => {
+  'use strict';
+  let jsPdfLoader;
+  const loadJsPdf=()=>{
+    if(window.jspdf&&window.jspdf.jsPDF)return Promise.resolve(window.jspdf.jsPDF);
+    if(!jsPdfLoader){
+      jsPdfLoader=new Promise((resolve,reject)=>{
+        const script=document.createElement('script');
+        script.src='https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js';
+        script.onload=()=>window.jspdf&&window.jspdf.jsPDF?resolve(window.jspdf.jsPDF):reject(new Error('The PDF library did not initialize.'));
+        script.onerror=()=>reject(new Error('The PDF library could not load from the CDN.'));
+        document.head.appendChild(script);
+      }).catch(error=>{jsPdfLoader=null;throw error;});
+    }
+    return jsPdfLoader;
+  };
+  const fitLabel=(ctx,value,width)=>{
+    const text=String(value||'');
+    if(ctx.measureText(text).width<=width)return text;
+    let low=0,high=Array.from(text).length;
+    const chars=Array.from(text);
+    while(low<high){const middle=Math.ceil((low+high)/2);if(ctx.measureText(chars.slice(0,middle).join('')+'…').width<=width)low=middle;else high=middle-1;}
+    return chars.slice(0,low).join('')+'…';
+  };
+  const wrapText=(ctx,value,width)=>{
+    const lines=[];
+    for(const paragraph of String(value).replace(/\r\n?/g,'\n').split('\n')){
+      if(!paragraph){lines.push('');continue;}
+      let line='';
+      for(const word of paragraph.split(/(\s+)/)){
+        if(!word)continue;
+        if(ctx.measureText(line+word).width<=width){line+=word;continue;}
+        if(line){lines.push(line.trimEnd());line='';}
+        if(ctx.measureText(word).width<=width){line=word.trimStart();continue;}
+        const chars=Array.from(word);
+        let start=0;
+        while(start<chars.length){
+          let low=start+1,high=chars.length;
+          while(low<high){const mid=Math.ceil((low+high)/2);if(ctx.measureText(chars.slice(start,mid).join('')).width<=width)low=mid;else high=mid-1;}
+          const end=Math.max(start+1,low);
+          const chunk=chars.slice(start,end).join('');
+          if(end<chars.length)lines.push(chunk);else line=chunk;
+          start=end;
+          if(lines.length>25000)throw new Error('This row contains too much text for a browser PDF.');
+        }
+      }
+      lines.push(line.trimEnd());
+    }
+    return lines;
+  };
+  const safeFileName=value=>String(value||'row').replace(/[\\/:*?"<>|\x00-\x1F]+/g,'_').replace(/[. ]+$/g,'').slice(0,70)||'row';
+  const loadImages=async fields=>{
+    const urls=[...new Set(fields.map(field=>field.image_url).filter(url=>typeof url==='string'&&url))];
+    const pictures=new Map();
+    await Promise.all(urls.map(url=>new Promise(resolve=>{
+      const image=new Image();
+      const timer=setTimeout(()=>{image.onload=null;image.onerror=null;pictures.set(url,null);resolve();},7000);
+      image.crossOrigin='anonymous';
+      image.onload=()=>{clearTimeout(timer);pictures.set(url,image);resolve();};
+      image.onerror=()=>{clearTimeout(timer);pictures.set(url,null);resolve();};
+      image.src=url;
+    })));
+    return pictures;
+  };
+  const renderPdf=async(data,JsPDF)=>{
+    const orientation=data.orientation==='landscape'?'landscape':'portrait';
+    const pageWidth=orientation==='landscape'?297:210;
+    const pageHeight=orientation==='landscape'?210:297;
+    const fields=Array.isArray(data.fields)?data.fields:[];
+    if(!fields.length)throw new Error('There are no visible fields to print.');
+    const pictures=await loadImages(fields);
+    const grouped=new Map();
+    for(const field of fields){
+      const pos=field.position||{};
+      const globalY=Number(pos.y);
+      if(!Number.isFinite(globalY)||globalY<0||globalY>=100*pageHeight)throw new Error('A field position is outside the PDF template.');
+      const pageIndex=Math.floor(globalY/pageHeight);
+      const fieldData={...field,x:Number(pos.x),y:globalY-pageIndex*pageHeight,width:Number(pos.width),height:Number(pos.height||15.5),size:Number(pos.font_size)};
+      if(![fieldData.x,fieldData.width,fieldData.height,fieldData.size].every(Number.isFinite)||fieldData.x<0||fieldData.width<20||fieldData.x+fieldData.width>pageWidth+.1)throw new Error('A field size is outside the PDF template.');
+      if(!grouped.has(pageIndex))grouped.set(pageIndex,[]);
+      grouped.get(pageIndex).push(fieldData);
+    }
+    const lastPage=Math.max(...grouped.keys());
+    const pdf=new JsPDF({orientation,unit:'mm',format:'a4',compress:true});
+    const dotsPerMm=150/25.4;
+    const canvas=document.createElement('canvas');
+    canvas.width=Math.round(pageWidth*dotsPerMm);
+    canvas.height=Math.round(pageHeight*dotsPerMm);
+    const ctx=canvas.getContext('2d');
+    if(!ctx)throw new Error('Your browser could not create the PDF canvas.');
+    const prepare=()=>{
+      ctx.setTransform(dotsPerMm,0,0,dotsPerMm,0,0);
+      ctx.fillStyle='#ffffff';ctx.fillRect(0,0,pageWidth,pageHeight);
+      ctx.textBaseline='top';
+    };
+    const addPage=()=>pdf.addImage(canvas.toDataURL('image/jpeg',.9),'JPEG',0,0,pageWidth,pageHeight,undefined,'FAST');
+    const overflow=[];
+    for(let index=0;index<=lastPage;index++){
+      prepare();
+      for(const field of grouped.get(index)||[]){
+        const size=Math.max(6,Math.min(36,field.size));
+        const labelMm=Math.max(2.1,(size-1)*25.4/72);
+        const valueMm=size*25.4/72;
+        const lineHeight=valueMm*1.24;
+        const textX=field.x,textY=field.y,space=Math.min(field.width,pageWidth-field.x);
+        const available=Math.max(0,Math.min(Math.max(8,field.height),pageHeight-2-textY));
+        ctx.fillStyle='#555555';ctx.font=`600 ${labelMm}px Arial, sans-serif`;
+        const labelLines=wrapText(ctx,field.label,space);
+        const labelHeight=labelMm*1.15;
+        const maxLabels=Math.max(0,Math.floor(available/labelHeight));
+        const shownLabels=Math.min(labelLines.length,maxLabels);
+        for(let n=0;n<shownLabels;n++)ctx.fillText(labelLines[n],textX,textY+n*labelHeight);
+        ctx.fillStyle='#111111';ctx.font=`${valueMm}px Arial, sans-serif`;
+        const valueY=textY+shownLabels*labelHeight+1.25;
+        const image=field.image_url?pictures.get(field.image_url):null;
+        if(image&&image.naturalWidth&&image.naturalHeight){
+          const boxHeight=Math.max(0,available-(valueY-textY));
+          const scale=Math.min(space/image.naturalWidth,boxHeight/image.naturalHeight);
+          if(scale>0&&image.naturalHeight*scale>=3){
+            ctx.drawImage(image,textX,valueY,image.naturalWidth*scale,image.naturalHeight*scale);
+            if(labelLines.length>shownLabels)overflow.push({label:String(field.label||field.column||''),value:String(field.value??''),size});
+            continue;
+          }
+        }
+        const lines=wrapText(ctx,field.value,space);
+        const maxLines=Math.max(0,Math.floor((available-(valueY-textY))/lineHeight));
+        const needsAppendix=lines.length>maxLines||labelLines.length>shownLabels;
+        const markerSize=Math.min(valueMm,2.7);
+        const markerFits=needsAppendix&&available-(valueY-textY)>=markerSize+.3;
+        const fitCount=needsAppendix?Math.max(0,Math.floor((available-(valueY-textY)-(markerFits?markerSize+.3:0))/lineHeight)):lines.length;
+        for(let n=0;n<fitCount;n++)ctx.fillText(lines[n],textX,valueY+n*lineHeight);
+        if(needsAppendix){
+          if(markerFits){
+            ctx.fillStyle='#6b7280';ctx.font=`${markerSize}px Arial, sans-serif`;
+            ctx.fillText(fitLabel(ctx,'Continued in appendix',space),textX,textY+available-markerSize);
+          }
+          overflow.push({label:String(field.label||field.column||''),value:String(field.value??''),size});
+        }
+      }
+      if(index)pdf.addPage('a4',orientation);
+      addPage();
+    }
+    // Long values are printed in full on appendix pages, so other fields cannot overlap them.
+    for(const item of overflow){
+      const size=Math.min(12,Math.max(7,item.size));
+      const mm=size*25.4/72;
+      const lineHeight=mm*1.35;
+      ctx.font=`${mm}px Arial, sans-serif`;
+      const lines=wrapText(ctx,item.label+'\n\n'+item.value,pageWidth-24);
+      let offset=0;
+      while(offset<lines.length){
+        if(pdf.getNumberOfPages()>=200)throw new Error('This row needs too many PDF pages to generate in the browser.');
+        pdf.addPage('a4',orientation);
+        prepare();
+        ctx.font=`600 ${Math.min(4,mm*1.1)}px Arial, sans-serif`;
+        ctx.fillStyle='#333333';
+        ctx.fillText(fitLabel(ctx,`${item.label} (continued)`,pageWidth-24),12,12);
+        ctx.font=`${mm}px Arial, sans-serif`;
+        ctx.fillStyle='#111111';
+        let y=19;
+        while(offset<lines.length&&y+lineHeight<=pageHeight-12){ctx.fillText(lines[offset++],12,y);y+=lineHeight;}
+        addPage();
+      }
+    }
+    const identity=fields.find(field=>/^(?:id|uuid)$/i.test(field.column||''));
+    const suffix=identity&&String(identity.value||'').length<=40?'-'+safeFileName(identity.value):'-row';
+    pdf.save(safeFileName(data.table)+suffix+'.pdf');
+  };
+  document.addEventListener('click',async event=>{
+    const button=event.target instanceof Element?event.target.closest('[data-ms-pdf-row]'):null;
+    if(!button||button.disabled)return;
+    event.preventDefault();
+    button.disabled=true;
+    const old=button.innerHTML;
+    button.innerHTML='<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+    try{
+      const request=new URL(window.location.href);
+      request.search=new URLSearchParams({ajax:'pdf_row',table:button.dataset.msPdfTable||'',id:button.dataset.msPdfId||''}).toString();
+      const response=await fetch(request.toString(),{credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}});
+      if(!(response.headers.get('Content-Type')||'').includes('application/json'))throw new Error('The PDF request returned a page. Sign in again and retry.');
+      const data=await response.json();
+      if(!response.ok||!data.ok)throw new Error(data.error||'The row could not be loaded.');
+      const JsPDF=await loadJsPdf();
+      await new Promise(resolve=>setTimeout(resolve,0));
+      await renderPdf(data,JsPDF);
+    }catch(error){
+      const message=error instanceof Error?error.message:String(error);
+      if(window.Swal&&typeof window.Swal.fire==='function')window.Swal.fire({icon:'error',title:'Unable to create PDF',text:message});
+      else alert(message);
+    }finally{
+      if(button.isConnected){button.disabled=false;button.innerHTML=old;}
+    }
+  });
+})();
+</script>
 </body></html><?php
 }
 
@@ -5688,8 +6013,8 @@ function render_sidebar(): void {
   </script><?php
 }
 
-function title_bar(string $title, string $subtitle = '', string $actions = '', string $titlePrefix = '', string $titleSuffix = ''): void {
-  ?><div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4"><div class="d-flex align-items-start gap-2"><?php if ($titlePrefix !== '') echo $titlePrefix; ?><div><h1 class="h3 mb-1<?= $titleSuffix !== '' ? ' d-flex align-items-center gap-2' : '' ?>"><span class="text-break"><?= h($title) ?></span><?php if ($titleSuffix !== '') echo $titleSuffix; ?></h1><?php if ($subtitle !== '') { ?><div class="text-body-secondary"><?= h($subtitle) ?></div><?php } ?></div></div><div class="no-print"><?= $actions ?></div></div><?php
+function title_bar(string $title, string $subtitle = '', string $actions = '', string $titlePrefix = '', string $titleSuffix = '', bool $selectTitle = false): void {
+  ?><div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4"><div class="d-flex align-items-start gap-2"><?php if ($titlePrefix !== '') echo $titlePrefix; ?><div><h1 class="h3 mb-1<?= $titleSuffix !== '' ? ' d-flex align-items-center gap-2' : '' ?><?= $selectTitle ? ' flex-wrap ms-select-heading' : '' ?>"><?php if ($selectTitle) { ?><button class="ms-select-table-name text-break" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-select-table-name title="Change displayed table name and settings" aria-label="Change displayed name and settings for <?= h($title) ?>"><?= h($title) ?></button><?php } else { ?><span class="text-break"><?= h($title) ?></span><?php } ?><?php if ($titleSuffix !== '') echo $titleSuffix; ?></h1><?php if ($subtitle !== '') { ?><div class="text-body-secondary"><?= h($subtitle) ?></div><?php } ?></div></div><div class="no-print"><?= $actions ?></div></div><?php
 }
 
 function render_sql_results(array $results, float $time): void {
@@ -6370,6 +6695,27 @@ function render_select_pagination(int $page, int $pages, string $position): void
   ?></ul></nav><?php
 }
 
+function ms_pdf_display_text($value, array $rule = []): string {
+  if ($value === null && ($rule['kind'] ?? '') !== 'null_display') return 'NULL';
+  if ($value !== null && preg_match('//u', (string)$value) !== 1) return '[Binary data: ' . strlen((string)$value) . ' bytes]';
+  $kind = (string)($rule['kind'] ?? '');
+  if ($kind === '' || $kind === 'truncate' || $kind === 'image_url') return (string)($value ?? 'NULL');
+  if ($kind === 'json' && $value !== null) {
+    $decoded = json_decode((string)$value);
+    if (json_last_error() === JSON_ERROR_NONE) {
+      $pretty = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      if (is_string($pretty)) return $pretty;
+    }
+    return (string)$value;
+  }
+  $html = ms_render_formatted_value($value, $rule, false);
+  $html = preg_replace('/<i\b[^>]*>.*?<\/i>/is', '', $html) ?? $html;
+  $html = preg_replace('/<br\s*\/?>|<\/(?:p|div|pre|li)>/i', "\n", $html) ?? $html;
+  $plain = trim(html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+  if ($value !== null && strlen((string)$value) > 500 && substr($plain, -strlen('…')) === '…') return (string)$value;
+  return $plain;
+}
+
 function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken): string {
   $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
   $columnMap = [];
@@ -6398,6 +6744,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
       <?php if ($editable) { ?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><?php } ?>
       <td class="ms-row-actions-cell" data-ms-static-column="actions"><span class="ms-row-actions"><?php if ($isSoftDeleted) { ?><span class="visually-hidden">Soft-deleted row. </span><?php } ?>
         <a class="ms-row-action" href="<?= h($viewUrl) ?>" title="View row" aria-label="View row"><i class="fa-solid fa-eye"></i></a>
+        <?php if (!$aggregated) { ?><button class="ms-row-action" type="button" data-ms-pdf-row data-ms-pdf-table="<?= h($table) ?>" data-ms-pdf-id="<?= h($encoded) ?>" title="Download this row as PDF" aria-label="Download row as PDF"><i class="fa-solid fa-file-pdf" aria-hidden="true"></i></button><?php } ?>
         <?php if ($editable) { ?>
           <a class="ms-row-action" href="<?= h($editUrl) ?>" title="Edit row" aria-label="Edit row"><i class="fa-solid fa-pen"></i></a>
           <a class="ms-row-action" href="<?= h($cloneUrl) ?>" title="Clone row" aria-label="Clone row"><i class="fa-solid fa-clone"></i></a>
@@ -6633,18 +6980,45 @@ function page_select(mysqli $db): void {
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
   $prettyEdit=!$aggregated&&ms_profile_edit_pretty_view(selected_db(),$table);
+  $pdfFieldOrder=$allColumnNames;
+  if(is_array($savedLayout['order']??null)){
+    $pdfFieldOrder=[];
+    foreach($savedLayout['order'] as $orderedName)if(is_string($orderedName)&&in_array($orderedName,$allColumnNames,true)&&!in_array($orderedName,$pdfFieldOrder,true))$pdfFieldOrder[]=$orderedName;
+    foreach($allColumnNames as $columnName)if(!in_array($columnName,$pdfFieldOrder,true))$pdfFieldOrder[]=$columnName;
+  }
+  $pdfEditorColumns=[];
+  $pdfSampleSoftMaps=(!$aggregated&&$rows&&ms_raw_db_view()&&$storedSoftFkRules)?ms_soft_fk_maps($db,array_slice($rows,0,1),$storedSoftFkRules):$softFkMaps;
+  foreach($pdfFieldOrder as $columnName){
+    if(!empty($storedHiddenColumns[$columnName]))continue;
+    $pdfLabel=trim((string)($storedLabelRules[$columnName]??''));
+    if(!$aggregated&&isset($rows[0])&&array_key_exists($columnName,$rows[0])){
+      $pdfValue=$rows[0][$columnName];
+      $pdfRule=is_array($storedFormatRules[$columnName]??null)?$storedFormatRules[$columnName]:[];
+      $pdfSample=ms_pdf_display_text($pdfValue,$pdfRule);
+      if(!$pdfRule&&isset($storedSoftFkRules[$columnName])&&$pdfValue!==null){
+        $pdfMatch=$pdfSampleSoftMaps[$columnName][(string)$pdfValue]??null;
+        if(is_array($pdfMatch)&&empty($pdfMatch['ambiguous'])&&isset($pdfMatch['display']))$pdfSample=(string)$pdfMatch['display'];
+      }
+      if(ms_text_length($pdfSample)>100)$pdfSample=ms_text_slice($pdfSample,0,100).'…';
+    }else $pdfSample='Sample value';
+    $pdfEditorColumns[]=['name'=>$columnName,'label'=>$pdfLabel!==''?$pdfLabel:$columnName,'sample'=>$pdfSample];
+  }
+  $pdfEditorDataJson=json_encode(['table'=>$table,'all_columns'=>$allColumnNames,'columns'=>$pdfEditorColumns,'template'=>ms_profile_pdf_template(selected_db(),$table)],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT);
+  if(!is_string($pdfEditorDataJson))$pdfEditorDataJson='{}';
   $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" data-icon-color="'.h($tableIcon['color']).'" data-display-name="'.h($tableDisplayName===$table?'':$tableDisplayName).'" data-master-enabled="'.($masterRelation===null?'0':'1').'" data-slave-table="'.h((string)($masterRelation['slave_table']??'')).'" data-slave-field="'.h((string)($masterRelation['slave_field']??'')).'" data-master-field="'.h((string)($masterRelation['master_field']??'')).'" title="Table display and relations" aria-label="Edit display and relations for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" style="color:'.h($tableIcon['color'] !== '' ? $tableIcon['color'] : 'inherit').'" data-ms-current-table-icon aria-hidden="true"></i></button>';
   $prettyToggle=$aggregated?'':'<button class="btn btn-sm ms-pretty-toggle no-print" type="button" data-ms-pretty-toggle data-ms-table="'.h($table).'" aria-pressed="'.($prettyEdit?'true':'false').'" title="'.($prettyEdit?'Edit Pretty View: switch to Pretty View':'Pretty View: edit header layout and appearance').'" aria-label="'.($prettyEdit?'Edit Pretty View. Switch to Pretty View':'Pretty View. Enable Edit Pretty View').'"><i class="fa-solid '.($prettyEdit?'fa-pen-to-square':'fa-eye').'" aria-hidden="true"></i></button>';
   $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
-  title_bar($table,number_format($total).' result(s)',$actions,$tableIconButton,$prettyToggle);
+  $rowCount=number_format($total);
+  $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" aria-label="'.h($rowCount).' rows">'.h($rowCount).'</span>';
+  title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
   ?>
   <div class="modal fade" id="ms-table-icon-modal" tabindex="-1" aria-labelledby="ms-table-icon-modal-title" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
       <div class="modal-header"><h2 class="modal-title fs-5" id="ms-table-icon-modal-title"><i class="fa-solid fa-table me-2"></i>Table display and relations</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body">
-        <div class="mb-3"><label class="form-label" for="ms-table-display-name">Displayed table name</label><input class="form-control" id="ms-table-display-name" type="text" maxlength="120" placeholder="<?= h($table) ?>" autocomplete="off"><div class="form-text">Shown in the left sidebar. Leave blank to use the table name.</div></div>
+        <div class="mb-3"><label class="form-label" for="ms-table-display-name">Displayed table name</label><input class="form-control" id="ms-table-display-name" type="text" maxlength="120" placeholder="<?= h($table) ?>" autocomplete="off"><div class="form-text">Shown in the left sidebar and above the table. Leave blank to use the table name.</div></div>
         <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" role="switch" id="ms-table-master-enabled"><label class="form-check-label" for="ms-table-master-enabled">Master table</label></div>
         <div id="ms-table-master-fields" class="border rounded p-3 mb-3" hidden>
           <div class="row g-3">
@@ -6666,9 +7040,40 @@ function page_select(mysqli $db): void {
         <div class="ms-icon-grid" id="ms-table-icon-grid" role="listbox" aria-label="Font Awesome icons"></div>
         <div class="ms-icon-empty d-flex align-items-center justify-content-center text-body-secondary" id="ms-table-icon-empty" hidden><div class="text-center"><i class="fa-solid fa-magnifying-glass fa-2x mb-2"></i><div>No icons match your search.</div></div></div>
       </div>
-      <div class="modal-footer justify-content-between"><span class="ms-selected-icon small" id="ms-table-icon-selected" aria-live="polite"></span><div><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-primary" type="button" id="ms-table-icon-save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
+      <div class="modal-footer justify-content-between flex-wrap gap-2"><span class="ms-selected-icon small" id="ms-table-icon-selected" aria-live="polite"></span><div class="d-flex flex-wrap gap-2"><button class="btn btn-outline-primary" type="button" id="ms-table-pdf-open"><i class="fa-solid fa-file-pdf me-1"></i>Open PDF template</button><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary" type="button" id="ms-table-icon-save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
     </div></div>
   </div>
+  <div class="modal fade" id="ms-pdf-template-modal" tabindex="-1" aria-labelledby="ms-pdf-template-title" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-fullscreen-lg-down modal-dialog-scrollable"><div class="modal-content">
+      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-pdf-template-title"><i class="fa-solid fa-file-pdf me-2"></i>PDF template · <?= h($table) ?></h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <div class="d-flex flex-wrap align-items-end gap-2 mb-3">
+          <div><label class="form-label" for="ms-pdf-orientation">A4 orientation</label><select class="form-select" id="ms-pdf-orientation"><option value="portrait">Portrait</option><option value="landscape">Landscape</option></select></div>
+          <button class="btn btn-outline-secondary" type="button" id="ms-pdf-add-page"><i class="fa-solid fa-file-circle-plus me-1"></i>Add page</button>
+          <button class="btn btn-outline-secondary" type="button" id="ms-pdf-reset"><i class="fa-solid fa-rotate-left me-1"></i>Reset layout</button>
+          <span class="small text-body-secondary" id="ms-pdf-page-count" aria-live="polite"></span>
+        </div>
+        <div class="row g-3">
+          <div class="col-lg-3 ms-pdf-template-inspector">
+            <div class="card"><div class="card-body">
+              <div class="fw-semibold mb-2" id="ms-pdf-selected-name">Select a field</div>
+              <div class="small text-body-secondary mb-3">Click to select. Ctrl/Cmd or Shift click selects several fields; drag to move them together. Drag the blue right edge to change width or the blue corner to change width and height. Arrow keys move selected fields by 1 mm (Shift: 5 mm). Y runs across pages.</div>
+              <div class="row g-2">
+                <div class="col-6"><label class="form-label" for="ms-pdf-x">X (mm)</label><input class="form-control form-control-sm" id="ms-pdf-x" type="number" min="0" step="0.1" disabled></div>
+                <div class="col-6"><label class="form-label" for="ms-pdf-y">Y (mm)</label><input class="form-control form-control-sm" id="ms-pdf-y" type="number" min="0" step="0.1" disabled></div>
+                <div class="col-6"><label class="form-label" for="ms-pdf-width">Width (mm)</label><input class="form-control form-control-sm" id="ms-pdf-width" type="number" min="20" step="0.1" disabled></div>
+                <div class="col-6"><label class="form-label" for="ms-pdf-height">Height (mm)</label><input class="form-control form-control-sm" id="ms-pdf-height" type="number" min="8" step="0.1" disabled></div>
+                <div class="col-6"><label class="form-label" for="ms-pdf-font-size">Font size (pt)</label><input class="form-control form-control-sm" id="ms-pdf-font-size" type="number" min="6" max="36" step="0.5" disabled></div>
+              </div>
+            </div></div>
+          </div>
+          <div class="col-lg-9"><div class="ms-pdf-template-workspace" id="ms-pdf-template-workspace" aria-label="PDF page preview"></div></div>
+        </div>
+      </div>
+      <div class="modal-footer"><span class="small text-body-secondary me-auto" id="ms-pdf-save-status" role="status"></span><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Close</button><button class="btn btn-primary" type="button" id="ms-pdf-save"><i class="fa-solid fa-floppy-disk me-1"></i>Save PDF template</button></div>
+    </div></div>
+  </div>
+  <script type="application/json" id="ms-pdf-editor-data"><?= $pdfEditorDataJson ?></script>
   <script>
   (() => {
     'use strict';
@@ -6851,6 +7256,8 @@ function page_select(mysqli $db): void {
         trigger.dataset.iconName=selectedName;
         trigger.dataset.iconColor=selectedColor;
         trigger.dataset.displayName=alias;
+        const heading=document.querySelector('[data-ms-select-table-name]');
+        if(heading){heading.textContent=alias||trigger.dataset.msTable||'';heading.setAttribute('aria-label','Change displayed name and settings for '+heading.textContent);}
         trigger.dataset.masterEnabled=masterEnabled.checked?'1':'0';
         trigger.dataset.slaveTable=masterEnabled.checked?slaveTable.value:'';
         trigger.dataset.slaveField=masterEnabled.checked?slaveField.value:'';
@@ -6884,11 +7291,286 @@ function page_select(mysqli $db): void {
     });
   })();
   </script>
+  <script>
+  (()=>{
+    'use strict';
+    const iconModal=document.getElementById('ms-table-icon-modal');
+    const editor=document.getElementById('ms-pdf-template-modal');
+    const open=document.getElementById('ms-table-pdf-open');
+    const dataElement=document.getElementById('ms-pdf-editor-data');
+    if(!iconModal||!editor||!open||!dataElement)return;
+    const data=JSON.parse(dataElement.textContent);
+    const columns=Array.isArray(data.columns)?data.columns:[];
+    const workspace=document.getElementById('ms-pdf-template-workspace');
+    const orientationInput=document.getElementById('ms-pdf-orientation');
+    const pageCountLabel=document.getElementById('ms-pdf-page-count');
+    const selectedLabel=document.getElementById('ms-pdf-selected-name');
+    const status=document.getElementById('ms-pdf-save-status');
+    const inputs={x:document.getElementById('ms-pdf-x'),y:document.getElementById('ms-pdf-y'),width:document.getElementById('ms-pdf-width'),height:document.getElementById('ms-pdf-height'),font_size:document.getElementById('ms-pdf-font-size')};
+    let seed=data.template&&typeof data.template==='object'?data.template:{orientation:'portrait',fields:{}};
+    let state,selected=new Set(),lastSelected=-1,extraPages=1,drag=null,edited=false;
+    const dimensions=()=>orientationInput.value==='landscape'?{width:297,height:210}:{width:210,height:297};
+    const rounded=value=>Math.round(value*100)/100;
+    const defaultField=index=>{
+      const size=dimensions(),width=(size.width-36)/2,perPage=Math.floor((size.height-32)/18),row=Math.floor(index/2);
+      return {x:12+(index%2)*(width+12),y:Math.floor(row/perPage)*size.height+16+(row%perPage)*18,width,height:15.5,font_size:10};
+    };
+    const clampField=field=>{
+      const size=dimensions();
+      field.width=rounded(Math.max(20,Math.min(size.width,Number(field.width)||20)));
+      field.x=rounded(Math.max(0,Math.min(size.width-field.width,Number(field.x)||0)));
+      field.height=rounded(Math.max(8,Math.min(size.height-2,Number(field.height)||15.5)));
+      field.y=rounded(Math.max(0,Math.min(size.height*100-field.height-2,Number(field.y)||0)));
+      const page=Math.floor(field.y/size.height),within=field.y-page*size.height;
+      field.y=rounded(page*size.height+Math.min(size.height-field.height-2,within));
+      field.font_size=rounded(Math.max(6,Math.min(36,Number(field.font_size)||10)));
+      return field;
+    };
+    const resetFromSeed=()=>{
+      orientationInput.value=seed.orientation==='landscape'?'landscape':'portrait';
+      const stored=seed.fields&&typeof seed.fields==='object'?seed.fields:{};
+      const physicalNames=new Set(Array.isArray(data.all_columns)?data.all_columns:columns.map(column=>column.name));
+      const knownFields=Object.create(null);
+      Object.entries(stored).forEach(([name,field])=>{if(physicalNames.has(name)&&field&&typeof field==='object')knownFields[name]=clampField({...field});});
+      state={orientation:orientationInput.value,fields:knownFields};
+      columns.forEach((column,index)=>{
+        const item=state.fields[column.name];
+        state.fields[column.name]=clampField(item&&typeof item==='object'?{...item}:defaultField(index));
+      });
+      selected=new Set();lastSelected=-1;extraPages=1;edited=false;
+      status.textContent='';
+      render();
+    };
+    const pageCount=()=>Math.min(100,Math.max(extraPages,1,...columns.map(column=>Math.floor((state.fields[column.name]?.y||0)/dimensions().height)+1)));
+    const updateInspector=()=>{
+      const names=columns.filter(column=>selected.has(column.name)).map(column=>column.name);
+      selectedLabel.textContent=names.length===1?(columns.find(column=>column.name===names[0])?.label||names[0]):names.length?names.length+' fields selected':'Select a field';
+      const one=names.length===1?state.fields[names[0]]:null;
+      Object.entries(inputs).forEach(([key,input])=>{
+        input.disabled=!names.length||(names.length>1&&(key==='x'||key==='y'));
+        const common=names.length&&names.every(name=>state.fields[name][key]===state.fields[names[0]][key]);
+        input.value=one?String(one[key]):common?String(state.fields[names[0]][key]):'';
+        input.placeholder=names.length>1?'Mixed':'';
+      });
+    };
+    const createPage=index=>{
+      const page=document.createElement('div');
+      page.className='ms-pdf-template-page'+(orientationInput.value==='landscape'?' ms-pdf-landscape':'');
+      page.dataset.pageIndex=String(index);
+      page.setAttribute('aria-label','A4 '+orientationInput.value+' page '+(index+1));
+      const number=document.createElement('span');
+      number.className='ms-pdf-template-page-number';number.textContent='Page '+(index+1);
+      page.appendChild(number);
+      workspace.appendChild(page);
+      return page;
+    };
+    const render=()=>{
+      if(!state)return;
+      const size=dimensions(),count=pageCount();
+      workspace.replaceChildren();
+      const pages=[];
+      for(let i=0;i<count;i++)pages.push(createPage(i));
+      columns.forEach(column=>{
+        const field=state.fields[column.name],pageIndex=Math.floor(field.y/size.height),page=pages[pageIndex];
+        if(!page)return;
+        const element=document.createElement('button');
+        element.type='button';element.className='ms-pdf-template-field'+(selected.has(column.name)?' ms-selected':'');
+        element.dataset.pdfField=column.name;
+        element.setAttribute('aria-label',(column.label||column.name)+'; '+field.x+' millimeters from left, '+field.y+' millimeters from top');
+        element.setAttribute('aria-pressed',selected.has(column.name)?'true':'false');
+        element.style.left=field.x/size.width*100+'%';
+        element.style.top=(field.y-pageIndex*size.height)/size.height*100+'%';
+        element.style.width=field.width/size.width*100+'%';
+        element.style.height=field.height/size.height*100+'%';
+        element.style.fontSize=field.font_size*25.4/72*(page.clientWidth/size.width)+'px';
+        const label=document.createElement('span');label.className='ms-pdf-template-label';label.textContent=column.label||column.name;
+        const value=document.createElement('span');value.className='ms-pdf-template-value';value.textContent=String(column.sample??'Sample value');
+        const resizer=document.createElement('span');resizer.className='ms-pdf-template-resizer';resizer.setAttribute('aria-hidden','true');
+        const corner=document.createElement('span');corner.className='ms-pdf-template-resizer-corner';corner.setAttribute('aria-hidden','true');
+        element.append(label,value,resizer,corner);
+        page.appendChild(element);
+      });
+      workspace.querySelectorAll('[data-pdf-field]').forEach(element=>{
+        const label=element.querySelector('.ms-pdf-template-label'),value=element.querySelector('.ms-pdf-template-value');
+        element.classList.toggle('ms-pdf-overflow',Boolean(label&&value&&label.offsetHeight+value.offsetHeight>element.clientHeight-4));
+      });
+      pageCountLabel.textContent=count+' A4 '+(count===1?'page':'pages')+' · '+columns.length+' visible '+(columns.length===1?'field':'fields');
+      updateInspector();
+    };
+    const syncPositions=()=>{
+      const size=dimensions();
+      workspace.querySelectorAll('[data-pdf-field]').forEach(button=>{
+        const field=state.fields[button.dataset.pdfField],index=Math.floor(field.y/size.height);
+        let page=workspace.querySelector('[data-page-index="'+index+'"]');
+        while(!page&&workspace.querySelectorAll('.ms-pdf-template-page').length<=index){
+          if(workspace.querySelectorAll('.ms-pdf-template-page').length>=100)break;
+          createPage(workspace.querySelectorAll('.ms-pdf-template-page').length);
+          page=workspace.querySelector('[data-page-index="'+index+'"]');
+        }
+        if(!page)return;
+        if(button.parentNode!==page){page.appendChild(button);if(drag&&drag.name===button.dataset.pdfField&&button.hasPointerCapture&&drag.pointerId!==undefined)try{button.setPointerCapture(drag.pointerId);}catch(error){}}
+        button.style.left=field.x/size.width*100+'%';
+        button.style.top=(field.y-index*size.height)/size.height*100+'%';
+        button.style.width=field.width/size.width*100+'%';
+        button.style.height=field.height/size.height*100+'%';
+        button.style.fontSize=field.font_size*25.4/72*(page.clientWidth/size.width)+'px';
+      });
+      const count=workspace.querySelectorAll('.ms-pdf-template-page').length;
+      pageCountLabel.textContent=count+' A4 '+(count===1?'page':'pages')+' · '+columns.length+' visible '+(columns.length===1?'field':'fields');
+      updateInspector();
+    };
+    const chooseField=(name,index,event)=>{
+      if(event.shiftKey&&lastSelected>=0){
+        if(!event.ctrlKey&&!event.metaKey)selected.clear();
+        const start=Math.min(index,lastSelected),end=Math.max(index,lastSelected);
+        for(let i=start;i<=end;i++)selected.add(columns[i].name);
+      }else if(event.ctrlKey||event.metaKey){
+        if(selected.has(name))selected.delete(name);else selected.add(name);
+        lastSelected=index;
+      }else if(!selected.has(name)||selected.size<=1){
+        selected=new Set([name]);lastSelected=index;
+      }
+    };
+    open.addEventListener('click',()=>{
+      iconModal.addEventListener('hidden.bs.modal',()=>bootstrap.Modal.getOrCreateInstance(editor).show(),{once:true});
+      bootstrap.Modal.getOrCreateInstance(iconModal).hide();
+    });
+    editor.addEventListener('shown.bs.modal',resetFromSeed);
+    workspace.addEventListener('pointerdown',event=>{
+      const element=event.target.closest('[data-pdf-field]');
+      if(!element){
+        if(event.target.closest('.ms-pdf-template-page')){selected.clear();render();}
+        return;
+      }
+      if(event.button!==0)return;
+      const name=element.dataset.pdfField,index=columns.findIndex(column=>column.name===name);
+      if(index<0)return;
+      const resizing=event.target.closest('.ms-pdf-template-resizer-corner')?'both':event.target.closest('.ms-pdf-template-resizer')?'width':'';
+      if(resizing){if(!selected.has(name)){selected=new Set([name]);lastSelected=index;}}
+      else chooseField(name,index,event);
+      const page=element.closest('.ms-pdf-template-page');
+      const pageRect=page.getBoundingClientRect(),scale=dimensions().width/pageRect.width;
+      const initial={};selected.forEach(key=>{initial[key]={...state.fields[key]};});
+      drag={pointerId:event.pointerId,startX:event.clientX,startY:event.clientY,pageIndex:Number(page.dataset.pageIndex),pageTop:pageRect.top,scale,initial,resizing,name,target:element};
+      event.preventDefault();
+      element.setPointerCapture(event.pointerId);
+      workspace.querySelectorAll('[data-pdf-field]').forEach(button=>{
+        const chosen=selected.has(button.dataset.pdfField);
+        button.classList.toggle('ms-selected',chosen);
+        button.setAttribute('aria-pressed',chosen?'true':'false');
+      });
+      updateInspector();
+    });
+    window.addEventListener('pointermove',event=>{
+      if(!drag||drag.pointerId!==event.pointerId)return;
+      const size=dimensions(),dx=(event.clientX-drag.startX)*drag.scale;
+      const hovered=document.elementFromPoint(event.clientX,event.clientY)?.closest('.ms-pdf-template-page');
+      const rect=hovered?.getBoundingClientRect();
+      const startY=drag.pageIndex*size.height+(drag.startY-drag.pageTop)*drag.scale;
+      const currentY=rect?Number(hovered.dataset.pageIndex)*size.height+(event.clientY-rect.top)*(size.width/rect.width):startY+(event.clientY-drag.startY)*drag.scale;
+      const dy=currentY-startY;
+      if(drag.resizing){
+        const start=drag.initial[drag.name]||state.fields[drag.name];
+        state.fields[drag.name].width=rounded(Math.max(20,Math.min(size.width-start.x,start.width+dx)));
+        if(drag.resizing==='both')state.fields[drag.name].height=rounded(Math.max(8,Math.min(size.height-(start.y%size.height)-2,start.height+dy)));
+      }else{
+        Object.entries(drag.initial).forEach(([name,start])=>{
+          state.fields[name].x=rounded(Math.max(0,Math.min(size.width-start.width,start.x+dx)));
+          state.fields[name].y=Math.max(0,start.y+dy);
+          clampField(state.fields[name]);
+        });
+      }
+      edited=true;status.textContent='Unsaved changes';syncPositions();
+    });
+    const endDrag=event=>{
+      if(!drag||drag.pointerId!==event.pointerId)return;
+      const focusName=drag.name;
+      if(drag.target.hasPointerCapture(event.pointerId))drag.target.releasePointerCapture(event.pointerId);
+      drag=null;
+      render();
+      workspace.querySelectorAll('[data-pdf-field]').forEach(button=>{if(button.dataset.pdfField===focusName)button.focus({preventScroll:true});});
+    };
+    window.addEventListener('pointerup',endDrag);
+    window.addEventListener('pointercancel',endDrag);
+    workspace.addEventListener('keydown',event=>{
+      const element=event.target.closest('[data-pdf-field]');
+      if(!element)return;
+      const name=element.dataset.pdfField,index=columns.findIndex(column=>column.name===name);
+      if(event.key===' '||event.key==='Enter'){
+        event.preventDefault();chooseField(name,index,event);render();
+        workspace.querySelectorAll('[data-pdf-field]').forEach(button=>{if(button.dataset.pdfField===name)button.focus({preventScroll:true});});
+        return;
+      }
+      const moves={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]};
+      if(!moves[event.key])return;
+      event.preventDefault();
+      if(!selected.has(name))selected=new Set([name]);
+      const step=event.shiftKey?5:1;
+      selected.forEach(key=>{
+        const field=state.fields[key];field.x+=moves[event.key][0]*step;field.y+=moves[event.key][1]*step;
+        clampField(field);
+      });
+      edited=true;status.textContent='Unsaved changes';render();
+      workspace.querySelectorAll('[data-pdf-field]').forEach(button=>{if(button.dataset.pdfField===name)button.focus({preventScroll:true});});
+    });
+    Object.entries(inputs).forEach(([key,input])=>input.addEventListener('change',()=>{
+      const numeric=Number(input.value);
+      if(!Number.isFinite(numeric)||!selected.size){updateInspector();return;}
+      selected.forEach(name=>{
+        if(selected.size>1&&(key==='x'||key==='y'))return;
+        state.fields[name][key]=numeric;
+        clampField(state.fields[name]);
+      });
+      edited=true;status.textContent='Unsaved changes';render();
+    }));
+    orientationInput.addEventListener('change',()=>{
+      if(!state)return;
+      const oldSize=state.orientation==='landscape'?{width:297,height:210}:{width:210,height:297};
+      const newSize=dimensions();
+      columns.forEach((column,index)=>{
+        const field=state.fields[column.name];
+        if(!edited&&Object.keys(seed.fields||{}).length===0){state.fields[column.name]=defaultField(index);return;}
+        const oldPage=Math.floor(field.y/oldSize.height);
+        field.x*=newSize.width/oldSize.width;
+        field.width*=newSize.width/oldSize.width;
+        field.y=oldPage*newSize.height+(field.y-oldPage*oldSize.height)*newSize.height/oldSize.height;
+        clampField(field);
+      });
+      state.orientation=orientationInput.value;
+      selected.clear();edited=true;status.textContent='Unsaved changes';render();
+    });
+    document.getElementById('ms-pdf-add-page').addEventListener('click',()=>{extraPages=pageCount()+1;render();workspace.lastElementChild?.scrollIntoView({block:'nearest',behavior:'smooth'});});
+    document.getElementById('ms-pdf-reset').addEventListener('click',()=>{
+      columns.forEach((column,index)=>{state.fields[column.name]=defaultField(index);});
+      selected.clear();extraPages=1;edited=true;status.textContent='Unsaved changes';render();
+    });
+    document.getElementById('ms-pdf-save').addEventListener('click',async event=>{
+      const button=event.currentTarget;
+      button.disabled=true;status.classList.remove('text-danger');status.textContent='Saving PDF template…';
+      try{
+        const template={orientation:orientationInput.value,fields:state.fields};
+        await window.msConfigPost('pdf_template',{table:data.table,template_json:JSON.stringify(template)});
+        seed=JSON.parse(JSON.stringify(template));
+        edited=false;status.textContent='PDF template saved.';
+      }catch(error){status.classList.add('text-danger');status.textContent=error?.message||'Could not save PDF template.';}
+      finally{button.disabled=false;}
+    });
+  })();
+  </script>
+  <style>
+    .ms-global-search-field{position:relative;flex:1 1 auto;min-width:0}
+    .ms-global-search-field .form-control{padding-right:2rem;border-top-right-radius:0;border-bottom-right-radius:0}
+    .ms-global-search-field input::-webkit-search-cancel-button{display:none}
+    .ms-global-search-clear{position:absolute;top:50%;right:.375rem;z-index:2;transform:translateY(-50%);border:0;background:transparent;color:var(--bs-secondary-color);padding:.125rem .25rem;line-height:1}
+    .ms-global-search-clear:hover,.ms-global-search-clear:focus-visible{color:var(--bs-body-color)}
+    .ms-global-search-clear:focus-visible{outline:2px solid var(--bs-primary);outline-offset:1px;border-radius:.125rem}
+    .ms-global-search-clear[hidden]{display:none}
+  </style>
   <div class="card mb-3 no-print"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
     <button class="btn btn-sm btn-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button>
     <div class="input-group input-group-sm" style="width:min(100%,24rem)">
       <label class="visually-hidden" for="ms-global-search">Search all columns</label>
-      <input class="form-control" type="search" id="ms-global-search" name="global_search" form="ms-query-builder-form" value="<?= h(g('global_search')) ?>" placeholder="Search all columns" aria-label="Search all columns in this table">
+      <span class="ms-global-search-field"><input class="form-control form-control-sm" type="search" id="ms-global-search" name="global_search" form="ms-query-builder-form" value="<?= h(g('global_search')) ?>" placeholder="Search all columns" aria-label="Search all columns in this table"><button class="ms-global-search-clear" type="button" id="ms-global-search-clear" title="Clear search and refresh" aria-label="Clear search and refresh"<?= g('global_search')!==''?'':' hidden' ?>><i class="fa-solid fa-xmark" aria-hidden="true"></i></button></span>
       <button class="btn btn-outline-primary" type="submit" form="ms-query-builder-form" title="Search all columns" aria-label="Search all columns"><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i></button>
     </div>
   </div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body">
@@ -6900,6 +7582,24 @@ function page_select(mysqli $db): void {
       <div class="col-md-auto"><button class="btn btn-outline-danger" type="button" data-ms-delete-search="<?= h($table) ?>" disabled><i class="fa-solid fa-trash me-1"></i>Delete</button></div>
     </div>
     <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
+  <script>
+  (()=>{
+    const input=document.getElementById('ms-global-search');
+    const clear=document.getElementById('ms-global-search-clear');
+    const form=document.getElementById('ms-query-builder-form');
+    if(!input||!clear||!form)return;
+    const updateClear=()=>{clear.hidden=input.value.length===0;};
+    input.addEventListener('input',updateClear);
+    input.addEventListener('search',updateClear);
+    updateClear();
+    clear.addEventListener('click',()=>{
+      input.value='';
+      updateClear();
+      if(typeof form.requestSubmit==='function')form.requestSubmit();
+      else form.submit();
+    });
+  })();
+  </script>
   <div class="card mb-3 no-print"><div class="card-body py-2">
     <?php
       $exportQuery = array_intersect_key($returnQuery, array_flip(['global_search', 'filter_col', 'filter_op', 'filter_val', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
