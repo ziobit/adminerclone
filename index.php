@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.15';
+const MS_VERSION = '1.15.16';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5337,6 +5337,12 @@ function page_head(string $title, bool $authenticated): void {
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     .ms-settings-save-sticky{position:sticky;top:0;z-index:1030;display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"title save" "subtitle save";align-items:center;column-gap:1rem;row-gap:.1rem;margin-bottom:1rem;padding:.75rem 1rem;border:1px solid var(--bs-border-color);border-radius:.5rem;background:var(--bs-body-bg);box-shadow:0 .25rem .75rem rgba(0,0,0,.08)}
     .ms-settings-save-sticky h1{grid-area:title}.ms-settings-subtitle{grid-area:subtitle;min-width:0}.ms-settings-save-sticky button{grid-area:save}
+    #ms-settings-page [data-ms-settings-collapsible] > .card-body{display:none}
+    #ms-settings-page [data-ms-settings-collapsible].ms-settings-card-open > .card-body{display:block}
+    .ms-settings-card-toggle{display:inline-flex;align-items:center;gap:.5rem;padding:0;border:0;background:none;color:inherit;font:inherit;font-weight:inherit;text-align:left;cursor:pointer}
+    .ms-settings-card-toggle:hover{color:var(--ms-link)}.ms-settings-card-toggle:focus-visible{outline:2px solid var(--ms-link);outline-offset:3px;border-radius:2px}
+    .ms-settings-card-toggle .ms-settings-collapse-icon{font-size:.75em;transition:transform .15s ease}
+    .ms-settings-card-toggle[aria-expanded="true"] .ms-settings-collapse-icon{transform:rotate(90deg)}
     @media(max-width:991.98px){.ms-settings-save-sticky{top:3.75rem}}
     @media(max-width:575.98px){.ms-settings-save-sticky{grid-template-areas:"title save" "subtitle subtitle";padding:.65rem .75rem}}
     html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
@@ -5835,6 +5841,45 @@ function page_foot(): void {
     input.addEventListener('change', goToPage);
   });
 
+  const settingsPage=document.getElementById('ms-settings-page');
+  if(settingsPage){
+    const collapsibleCards=Array.from(settingsPage.querySelectorAll('[data-ms-settings-collapsible]'));
+    collapsibleCards.forEach((card,index)=>{
+      const header=Array.from(card.children).find(child=>child.classList.contains('card-header'));
+      const panel=Array.from(card.children).find(child=>child.classList.contains('card-body'));
+      const heading=header&&header.querySelector('h2, strong');
+      if(!heading||!panel)return;
+      const toggle=document.createElement('button');
+      toggle.type='button';
+      toggle.className='ms-settings-card-toggle';
+      toggle.id='ms-settings-toggle-'+(index+1);
+      toggle.setAttribute('aria-expanded','false');
+      panel.id='ms-settings-panel-'+(index+1);
+      toggle.setAttribute('aria-controls',panel.id);
+      panel.setAttribute('role','region');
+      panel.setAttribute('aria-labelledby',toggle.id);
+      while(heading.firstChild)toggle.appendChild(heading.firstChild);
+      const indicator=document.createElement('i');
+      indicator.className='fa-solid fa-chevron-right ms-settings-collapse-icon';
+      indicator.setAttribute('aria-hidden','true');
+      toggle.appendChild(indicator);
+      heading.appendChild(toggle);
+      toggle.addEventListener('click',()=>{
+        const open=card.classList.toggle('ms-settings-card-open');
+        toggle.setAttribute('aria-expanded',open?'true':'false');
+      });
+    });
+    settingsPage.addEventListener('invalid',event=>{
+      let card=event.target.closest('[data-ms-settings-collapsible]');
+      while(card&&settingsPage.contains(card)){
+        card.classList.add('ms-settings-card-open');
+        const header=Array.from(card.children).find(child=>child.classList.contains('card-header'));
+        const toggle=header&&header.querySelector('.ms-settings-card-toggle');
+        if(toggle)toggle.setAttribute('aria-expanded','true');
+        card=card.parentElement.closest('[data-ms-settings-collapsible]');
+      }
+    },true);
+  }
   const settingsForm=document.getElementById('ms-settings-form');
   if(settingsForm){
     const selectCurrent=()=>{
@@ -9999,7 +10044,7 @@ function page_users(mysqli $db): void {
 
 function render_column_display_settings(): void {
   $database = selected_db();
-  ?><section class="card mt-4 mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
+  ?><section class="card mt-4 mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
   if ($database === '') {
     ?><div class="alert alert-info mb-0">Choose a database first to manage hidden columns, custom field names, formatting, image displays and soft foreign keys.</div><?php
   } else {
@@ -10021,17 +10066,17 @@ function render_column_display_settings(): void {
       }
     }
     ?><p class="text-body-secondary">These rules are stored inside the active profile in <code><?= h(ms_profile_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
-    <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
+    <div class="card mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
       <strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong>
       <div class="d-flex flex-wrap gap-2">
         <form method="post" class="m-0"><input type="hidden" name="action" value="column_view_hide_primary_keys"><?= csrf_field() ?><button class="btn btn-outline-secondary btn-sm" type="submit" title="Hide primary-key columns in every table of the selected database"><i class="fa-solid fa-key me-1" aria-hidden="true"></i>Hide all primary keys</button></form>
         <?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?>
       </div>
     </div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All column names and cells use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Cell alignment</th><th>Column name alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$headerAlignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= h(ucfirst($headerAlignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
+    <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All column names and cells use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Cell alignment</th><th>Column name alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$headerAlignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= h(ucfirst($headerAlignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
   }
   ?></div></section><?php
 }
@@ -10102,12 +10147,12 @@ function page_settings(): void {
     'check_failed' => 'Check failed'
   ];
   $updateStatusLabel = $updateStatusLabels[$updateStatus] ?? ucfirst(str_replace('_', ' ', $updateStatus));
-  ?><header class="ms-settings-save-sticky">
+  ?><div id="ms-settings-page"><header class="ms-settings-save-sticky">
     <h1 class="h3 mb-0">Settings</h1>
     <div class="ms-settings-subtitle text-body-secondary">Profile: <?= h($activeProfile) ?> · all preferences and database display customizations are profile-specific.</div>
     <button class="btn btn-primary" type="submit" form="ms-settings-form"><i class="fa-solid fa-floppy-disk me-1" aria-hidden="true"></i>Save all</button>
   </header>
-  <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-cloud-arrow-down me-2"></i>Software update</h2><a class="btn btn-primary btn-sm" href="<?= h(url(['ms_check_update' => '1'])) ?>"><i class="fa-solid fa-rotate me-1"></i>Check for new version</a></div><div class="card-body">
+  <section class="card mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-cloud-arrow-down me-2"></i>Software update</h2><a class="btn btn-primary btn-sm" href="<?= h(url(['ms_check_update' => '1'])) ?>"><i class="fa-solid fa-rotate me-1"></i>Check for new version</a></div><div class="card-body">
     <div class="row g-3">
       <div class="col-md-3"><div class="small text-body-secondary">Installed version</div><div class="fw-semibold">v<?= h(MS_VERSION) ?></div></div>
       <div class="col-md-3"><div class="small text-body-secondary">Last checked</div><div class="fw-semibold"><?= $updateCheckedAt > 0 ? h(date('Y-m-d H:i:s', $updateCheckedAt)) : 'Never' ?></div></div>
@@ -10117,27 +10162,27 @@ function page_settings(): void {
       <div class="col-12"><div class="small text-body-secondary">The automatic check runs at most once every <?= h((string)(MS_UPDATE_CHECK_SECONDS / 3600)) ?> hours. The shared update state is stored in <code><?= h(ms_update_runtime_file('update.json')) ?></code>. Clicking the version number or this button bypasses the cache and checks GitHub immediately.</div></div>
     </div>
   </div></section>
-  <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-user-gear me-2"></i>Profiles</h2></div><div class="card-body">
+  <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-user-gear me-2"></i>Profiles</h2></div><div class="card-body">
     <div class="row g-3 align-items-end"><div class="col-lg-4"><div class="small text-body-secondary">Active profile</div><div class="fs-5 fw-semibold"><?= h($activeProfile) ?></div><div class="form-text">Configuration file: <code><?= h(ms_profile_config_file()) ?></code></div></div>
     <div class="col-lg-4"><form method="post" class="row g-2"><input type="hidden" name="action" value="create_profile"><?= csrf_field() ?><div class="col-12"><label class="form-label">New profile</label><div class="input-group"><input class="form-control" name="profile_name" maxlength="80" required><button class="btn btn-primary"><i class="fa-solid fa-plus me-1"></i>Create</button></div></div><div class="col-12"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="copy_current" id="profile-copy-current" value="1" checked><label class="form-check-label" for="profile-copy-current">Copy current settings to new profile</label></div></div></form></div>
     <?php if($activeProfile!=='Default'){ ?><div class="col-lg-4"><div class="d-flex flex-wrap gap-2"><form method="post" class="d-flex gap-2 flex-grow-1"><input type="hidden" name="action" value="rename_profile"><?= csrf_field() ?><input class="form-control" name="profile_name" value="<?= h($activeProfile) ?>" maxlength="80" required><button class="btn btn-secondary text-nowrap"><i class="fa-solid fa-pen me-1"></i>Rename</button></form><form method="post"><input type="hidden" name="action" value="delete_profile"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete profile <?= h($activeProfile) ?> and all of its settings?"><i class="fa-solid fa-trash"></i></button></form></div></div><?php } ?>
     </div><div class="form-text mt-3">Default always exists. New profiles copy the complete active profile by default; turn the switch off to start from clean defaults. No legacy configuration is imported.</div>
   </div></section>
   <form id="ms-settings-form" method="post"><input type="hidden" name="action" value="save_profile_settings"><?= csrf_field() ?>
-    <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-circle-half-stroke me-2"></i>Appearance mode</h2></div><div class="card-body"><div class="row g-3">
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-circle-half-stroke me-2"></i>Appearance mode</h2></div><div class="card-body"><div class="row g-3">
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-light" value="light"><label class="settings-choice card h-100" for="theme-light"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-warning"><i class="fa-solid fa-sun"></i></span><span><strong class="d-block">Light</strong><span class="text-body-secondary">Bright background for well-lit environments.</span></span></div></label></div>
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-dark" value="dark"><label class="settings-choice card h-100" for="theme-dark"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-primary"><i class="fa-solid fa-moon"></i></span><span><strong class="d-block">Dark</strong><span class="text-body-secondary">Reduced glare for low-light environments.</span></span></div></label></div>
     </div></div></section>
 
-    <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-arrows-up-down-left-right me-2"></i>Interface spacing</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($densities as $key => [$label, $description]) { ?>
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-arrows-up-down-left-right me-2"></i>Interface spacing</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($densities as $key => [$label, $description]) { ?>
       <div class="col-sm-6 col-xl-3"><input class="btn-check" type="radio" name="density" id="density-<?= h($key) ?>" value="<?= h($key) ?>"><label class="settings-choice card h-100" for="density-<?= h($key) ?>"><div class="card-body"><strong class="d-block mb-1"><?= h($label) ?></strong><span class="small text-body-secondary"><?= h($description) ?></span></div></label></div>
     <?php } ?></div></div></section>
 
-    <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-palette me-2"></i>Color scheme</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($schemes as $key => [$label, $color, $description]) { ?>
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-palette me-2"></i>Color scheme</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($schemes as $key => [$label, $color, $description]) { ?>
       <div class="col-sm-6 col-lg-4 col-xl-3 col-xxl-2"><input class="btn-check" type="radio" name="scheme" id="scheme-<?= h($key) ?>" value="<?= h($key) ?>"><label class="settings-choice card h-100" for="scheme-<?= h($key) ?>"><div class="card-body"><div class="scheme-swatch mb-2" style="--swatch:<?= h($color) ?>"></div><strong class="d-block"><?= h($label) ?></strong><span class="small text-body-secondary"><?= h($description) ?></span></div></label></div>
     <?php } ?></div></div></section>
 
-    <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-table-list me-2"></i>Data display</h2></div><div class="card-body"><div class="row g-3">
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-table-list me-2"></i>Data display</h2></div><div class="card-body"><div class="row g-3">
       <div class="col-md-6"><label class="form-label" for="settings-sql-rows">Default number of rows in Execute SQL</label><input class="form-control" type="number" name="sqlRows" id="settings-sql-rows" min="1" max="100000" step="1" required><div class="form-text">Result sets display this many rows unless “Show all result rows” is enabled. Exports still include the complete result.</div></div>
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
@@ -10145,11 +10190,11 @@ function page_settings(): void {
       <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules, saved searches and query history are also profile-specific. Restore defaults resets the complete active profile.</div></div>
     </div></div></section>
 
-    <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
       <div class="col-md-6 col-xl-4"><label class="border rounded p-3 d-flex align-items-center gap-3 h-100"><input class="form-check-input mt-0" type="checkbox" name="menu[<?= h($key) ?>]" value="1"><i class="fa-solid <?= h($icon) ?> fa-fw text-primary"></i><span><?= h($label) ?></span></label></div>
     <?php } ?></div><div class="border rounded p-3 mt-3"><div class="form-check form-switch ms-ios-switch"><input class="form-check-input" type="checkbox" role="switch" name="displayObjectsBeforeDb" value="1" id="settings-objects-before-db"><label class="form-check-label fw-semibold" for="settings-objects-before-db">Display objects before DB</label></div><div class="form-text ms-4">Show the Tables/Views object list before the database-level navigation items in the left sidebar.</div></div></div></section>
 
-    <section class="card mb-3" id="ms-hidden-sidebar-section"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-eye-slash me-2"></i>Hidden sidebar tables</h2><button class="btn btn-secondary btn-sm" type="button" id="ms-sidebar-show-all-hidden"><i class="fa-solid fa-eye me-1"></i>Show all</button></div><div class="card-body">
+    <section class="card mb-3" id="ms-hidden-sidebar-section" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-eye-slash me-2"></i>Hidden sidebar tables</h2><button class="btn btn-secondary btn-sm" type="button" id="ms-sidebar-show-all-hidden"><i class="fa-solid fa-eye me-1"></i>Show all</button></div><div class="card-body">
       <p class="text-body-secondary">Tables and views hidden from the normal left sidebar are listed here so they can be re-enabled individually. Raw DB view always shows every object regardless of this setting.</p>
       <?php if ($settingsDbName === '') { ?><div class="alert alert-secondary mb-0">Choose a database first to manage hidden sidebar tables.</div><?php } else { ?>
         <div id="ms-hidden-sidebar-empty" class="alert alert-success mb-0"><i class="fa-solid fa-circle-check me-2"></i>No tables or views are hidden in <strong><?= h($settingsDbName) ?></strong>.</div>
@@ -10162,6 +10207,7 @@ function page_settings(): void {
     <div class="d-flex flex-wrap gap-2"><button class="btn btn-primary" type="submit"><i class="fa-solid fa-floppy-disk me-1"></i>Save settings</button><button class="btn btn-secondary" type="button" id="ms-settings-reset"><i class="fa-solid fa-rotate-left me-1"></i>Restore defaults</button></div>
   </form><?php
   render_column_display_settings();
+  ?></div><?php
 }
 
 if (empty($_SESSION['ms_login'])) {
