@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.8';
+const MS_VERSION = '1.15.9';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5111,9 +5111,9 @@ function page_head(string $title, bool $authenticated): void {
     .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
     .ms-select-table-name:hover{color:var(--ms-accent);text-decoration:underline}
     .ms-select-table-name:focus-visible{outline:2px solid var(--ms-accent);outline-offset:3px;border-radius:.15rem}
-    .ms-select-row-count{font-size:.7rem;line-height:1.1}
+    .ms-select-row-count{padding-inline:.7rem;font-size:.7rem;line-height:1.1}
     .ms-pretty-toggle{display:inline-flex;align-items:center;justify-content:center;width:1.75rem;height:1.75rem;padding:0;border-radius:50%;color:var(--bs-secondary-color);font-size:.8rem;line-height:1}
-    .ms-select-heading .ms-pretty-toggle{width:1.375rem;height:1.375rem;margin-left:.35rem;font-size:.4rem}
+    .ms-select-heading .ms-pretty-toggle{width:1.25rem;height:1.25rem;margin-left:.35rem;font-size:.35rem}
     .ms-pretty-toggle:hover,.ms-pretty-toggle:focus,.ms-pretty-toggle[aria-pressed="true"]{color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.1)}
     [data-ms-save-widths][hidden]{display:none!important}
     .ms-data-table tr.ms-soft-deleted td[data-ms-column],.ms-data-table tr.ms-soft-deleted td[data-ms-column] :is(a,.cell-value,.badge,code,pre){color:var(--bs-secondary-color)!important;text-decoration:line-through}
@@ -7010,8 +7010,16 @@ function page_select(mysqli $db): void {
   $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
-  $rowCount=number_format($total);
-  $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" aria-label="'.h($rowCount).' rows">'.h($rowCount).'</span>';
+  $allRowsTotal=$total;
+  if($where||$aggregated){
+    $allRowsCount=db_one($db,'SELECT COUNT(*) AS n FROM '.qi($table));
+    $allRowsTotal=(int)($allRowsCount['n']??0);
+  }
+  $shownRows=count($rows);
+  $partialRows=$where||$aggregated||$shownRows!==$allRowsTotal;
+  $rowCount=number_format($shownRows).($partialRows?'/'.number_format($allRowsTotal):'');
+  $rowCountLabel=$partialRows?($aggregated?'displayed result rows':'displayed rows').' of '.number_format($allRowsTotal).' total table rows':'total table rows';
+  $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" data-ms-row-count-pill data-ms-total-rows="'.h((string)$allRowsTotal).'" data-ms-count-partial="'.($where||$aggregated?'1':'0').'" data-ms-result-unit="'.($aggregated?'result rows':'rows').'" aria-label="'.h(number_format($shownRows).' '.$rowCountLabel).'">'.h($rowCount).'</span>';
   title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
   ?>
   <div class="modal fade" id="ms-table-icon-modal" tabindex="-1" aria-labelledby="ms-table-icon-modal-title" aria-hidden="true">
@@ -8081,9 +8089,18 @@ function page_select(mysqli $db): void {
     const input=wrap.querySelector('[data-ms-show-more-count]');
     const table=document.querySelector('#ms-select-row-form .ms-data-table');
     const tbody=table?table.querySelector('tbody'):null;
+    const countPill=document.querySelector('[data-ms-row-count-pill]');
     if(!button||!input||!table||!tbody)return;
     let nextOffset=Math.max(0,Number.parseInt(wrap.dataset.nextOffset||'0',10)||0);
     const total=Math.max(0,Number.parseInt(wrap.dataset.total||'0',10)||0);
+    const updateRowCount=()=>{
+      if(!countPill)return;
+      const shown=tbody.children.length;
+      const allTotal=Math.max(0,Number.parseInt(countPill.dataset.msTotalRows||'0',10)||0);
+      const partial=countPill.dataset.msCountPartial==='1'||shown!==allTotal;
+      countPill.textContent=shown.toLocaleString('en-US')+(partial?'/'+allTotal.toLocaleString('en-US'):'');
+      countPill.setAttribute('aria-label',partial?`${shown.toLocaleString('en-US')} displayed ${countPill.dataset.msResultUnit||'rows'} of ${allTotal.toLocaleString('en-US')} total table rows`:`${shown.toLocaleString('en-US')} total table rows`);
+    };
     const applyCurrentLayout=rows=>{
       const headerMap=new Map(Array.from(table.querySelectorAll('thead th[data-ms-column]')).map(th=>[th.dataset.msColumn||'',th]));
       const headerColumns=Array.from(headerMap.keys()).filter(Boolean);
@@ -8122,6 +8139,7 @@ function page_select(mysqli $db): void {
         const newRows=Array.from(holder.children);
         newRows.forEach(row=>tbody.appendChild(row));
         applyCurrentLayout(newRows);
+        updateRowCount();
         nextOffset=Math.max(nextOffset,Number.parseInt(data.next_offset,10)||nextOffset);
         wrap.dataset.nextOffset=String(nextOffset);
         if(!data.has_more||!newRows.length)wrap.remove();
