@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.5';
+const MS_VERSION = '1.15.6';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1278,6 +1278,10 @@ function ms_update_install(string $source, string $remoteVersion): ?string {
   if (!is_string($installed) || !hash_equals(hash('sha256', $source), hash('sha256', $installed))) {
     @copy($backupFile, $currentFile);
     return 'The installed file failed verification. The previous version has been restored.';
+  }
+
+  if (function_exists('opcache_invalidate')) {
+    @opcache_invalidate($currentFile, true);
   }
 
   return null;
