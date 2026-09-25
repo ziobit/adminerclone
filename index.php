@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.10';
+const MS_VERSION = '1.15.11';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -923,7 +923,7 @@ function ms_profile_delete_search(string $database, string $table, string $name)
 
 function ms_column_view_table_config(string $database, string $table): array {
   $tableConfig = ms_profile_table_config($database, $table);
-  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) {
+  foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'header_alignments', 'fixed_fonts'] as $key) {
     if (!isset($tableConfig[$key]) || !is_array($tableConfig[$key])) $tableConfig[$key] = [];
   }
   return $tableConfig;
@@ -935,11 +935,11 @@ function ms_column_view_database_config(string $database): array {
 
 function ms_column_view_update_table(string $database, string $table, callable $mutator): void {
   ms_profile_update_table($database, $table, static function (array $current) use ($mutator): array {
-    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) {
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'header_alignments', 'fixed_fonts'] as $key) {
       if (!isset($current[$key]) || !is_array($current[$key])) $current[$key] = [];
     }
     $current = $mutator($current);
-    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) if (empty($current[$key])) unset($current[$key]);
+    foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'header_alignments', 'fixed_fonts'] as $key) if (empty($current[$key])) unset($current[$key]);
     return $current;
   });
 }
@@ -1087,13 +1087,18 @@ function ms_column_view_clear_display(string $database, string $table, string $c
   });
 }
 
-function ms_column_view_set_presentation(string $database, string $table, string $column, string $alignment, bool $fixedFont): void {
+function ms_column_view_set_presentation(string $database, string $table, string $column, string $alignment, string $headerAlignment, bool $fixedFont): void {
   if (!in_array($alignment, ['left', 'center', 'right'], true)) {
     $alignment = 'left';
   }
-  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $alignment, $fixedFont): array {
+  if (!in_array($headerAlignment, ['left', 'center', 'right'], true)) {
+    $headerAlignment = 'left';
+  }
+  ms_column_view_update_table($database, $table, static function (array $config) use ($column, $alignment, $headerAlignment, $fixedFont): array {
     if ($alignment === 'left') unset($config['alignments'][$column]);
     else $config['alignments'][$column] = $alignment;
+    if ($headerAlignment === 'left') unset($config['header_alignments'][$column]);
+    else $config['header_alignments'][$column] = $headerAlignment;
     if ($fixedFont) $config['fixed_fonts'][$column] = true;
     else unset($config['fixed_fonts'][$column]);
     return $config;
@@ -1102,7 +1107,7 @@ function ms_column_view_set_presentation(string $database, string $table, string
 
 function ms_column_view_clear_presentation(string $database, string $table, string $column): void {
   ms_column_view_update_table($database, $table, static function (array $config) use ($column): array {
-    unset($config['alignments'][$column], $config['fixed_fonts'][$column]);
+    unset($config['alignments'][$column], $config['header_alignments'][$column], $config['fixed_fonts'][$column]);
     return $config;
   });
 }
@@ -1112,6 +1117,19 @@ function ms_safe_image_base_url(string $url): bool {
     return false;
   }
   return preg_match('#\A(?:https?://|/|\./|\.\./)#i', $url) === 1;
+}
+
+function ms_safe_download_base_url(string $url): bool {
+  if ($url === '' || strlen($url) > 2048 || preg_match('//u', $url) !== 1 || preg_match('/[\x00-\x20\x7F#<>"\'\\\\]/', $url) === 1) return false;
+  if (preg_match('#\Ahttps?://#i', $url) === 1) {
+    $parts = parse_url($url);
+    return is_array($parts) && !empty($parts['host']);
+  }
+  if (substr($url, 0, 2) === '//') return false;
+  if (preg_match('#\A(?:/(?!/)|\./|\.\./|[a-z0-9_.~-])#i', $url) !== 1) return false;
+  // Browsers interpret a colon before the first slash, query, or fragment as a URL scheme.
+  $firstSegment = substr($url, 0, strcspn($url, '/?#'));
+  return strpos($firstSegment, ':') === false;
 }
 
 function ms_update_set_notice(string $key, string $message, string $type = 'info'): void {
@@ -1591,6 +1609,9 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
       $key = (string)($targetRow[$idColumn] ?? '');
       if (array_key_exists($key, $map)) {
         // A non-unique lookup value does not identify a specific target row.
+        if (trim((string)($map[$key]['display'] ?? '')) === '' && trim((string)($targetRow[$valueColumn] ?? '')) !== '') {
+          $map[$key]['display'] = $targetRow[$valueColumn];
+        }
         $map[$key]['identity'] = null;
         $map[$key]['ambiguous'] = true;
         continue;
@@ -1602,6 +1623,14 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     $maps[$sourceColumn] = $map;
   }
   return $maps;
+}
+
+function ms_soft_fk_display($value, ?array $match): ?string {
+  if ($value === null || trim((string)$value) === '' || $match === null || trim((string)($match['display'] ?? '')) === '') {
+    return null;
+  }
+  // An ambiguous lookup can still show its source key, but cannot claim one particular target label.
+  return !empty($match['ambiguous']) ? (string)$value : (string)$match['display'];
 }
 
 function ms_soft_fk_link(array $rule, $value, ?array $match): array {
@@ -1715,6 +1744,36 @@ function ms_render_formatted_value($value, array $rule, bool $selectCell = false
     return render_value($value);
   }
   if ($value === null && !($kind === 'json' && $selectCell)) return render_value(null);
+
+  if ($kind === 'downloadable_file') {
+    $filename = (string)$value;
+    $baseUrl = trim((string)($rule['base_url'] ?? ''));
+    if (trim($filename) === '' || strpos($filename, '/') === 0 || !ms_safe_download_base_url($baseUrl) || strlen($filename) > 2048 ||
+        preg_match('/[\x00-\x1F\x7F\\\\]/', $filename) || preg_match('//u', $filename) !== 1) {
+      return render_value($value);
+    }
+    // A URL ending at its authority needs a slash before the filename, or a
+    // filename beginning with a dot could change the destination host.
+    $baseParts = preg_match('#\Ahttps?://#i', $baseUrl) === 1 ? parse_url($baseUrl) : null;
+    if (is_array($baseParts)) {
+      if (!isset($baseParts['path']) && !isset($baseParts['query'])) $baseUrl .= '/';
+    }
+    $segments = explode('/', $filename);
+    foreach ($segments as $segment) {
+      if ($segment === '.' || $segment === '..') return render_value($value);
+    }
+    $encodedValue = strpos($baseUrl, '?') === false
+      ? implode('/', array_map('rawurlencode', $segments)) : rawurlencode($filename);
+    $url = $baseUrl . $encodedValue;
+    if (is_array($baseParts)) {
+      $targetParts = parse_url($url);
+      if (!is_array($targetParts) || strcasecmp((string)($targetParts['host'] ?? ''), (string)$baseParts['host']) !== 0 ||
+          ($targetParts['port'] ?? null) !== ($baseParts['port'] ?? null)) return render_value($value);
+    }
+    $downloadName = basename($filename);
+    return '<a class="text-break" href="' . h($url) . '" download="' . h($downloadName) . '" target="_blank" rel="noopener noreferrer" title="Download ' . h($filename) . '">' .
+      '<i class="fa-solid fa-file-arrow-down me-1" aria-hidden="true"></i>' . h($filename) . '</a>';
+  }
 
   if ($kind === 'date' || $kind === 'datetime') {
     $format = (string)($rule['format'] ?? ($kind === 'date' ? 'd-m-Y' : 'd-m-Y H:i:s'));
@@ -2019,6 +2078,11 @@ function ms_display_rule_from_post(string $style): array {
     $display = p('url_display', 'full');
     if (!in_array($display, ['full', 'domain'], true)) throw new RuntimeException('Choose a valid URL display.');
     return ['kind' => 'url', 'display' => $display];
+  }
+  if ($style === 'downloadable_file') {
+    $baseUrl = trim(p('download_base_url'));
+    if (!ms_safe_download_base_url($baseUrl)) throw new RuntimeException('Enter a valid Base URL starting with HTTP(S), /, ./, ../, or a relative file path.');
+    return ['kind' => 'downloadable_file', 'base_url' => $baseUrl];
   }
   if ($style === 'json') return ['kind' => 'json'];
   if ($style === 'truncate') return ['kind' => 'truncate', 'length' => max(10, min(2000, (int)p('truncate_length', '120')))];
@@ -3681,9 +3745,9 @@ try {
               if (ms_safe_image_base_url($candidate)) $imageUrl = $candidate;
             }
           }
-          if (!$rule && isset($softFk[$name]) && is_array($softFk[$name]) && $value !== null) {
+          if (!$rule && isset($softFk[$name]) && is_array($softFk[$name])) {
             $match = $softMaps[$name][(string)$value] ?? null;
-            if (is_array($match) && empty($match['ambiguous']) && isset($match['display'])) $display = (string)$match['display'];
+            $display = ms_soft_fk_display($value, is_array($match) ? $match : null) ?? '';
           }
           $label = trim((string)($labels[$name] ?? ''));
           $position = $template['fields'][$name] ?? null;
@@ -4094,7 +4158,11 @@ try {
           if (!in_array($alignment, ['left', 'center', 'right'], true)) {
             throw new RuntimeException('Choose a valid column alignment.');
           }
-          ms_column_view_set_presentation($database, $configTable, $configColumn, $alignment, p('fixed_font') === '1');
+          $headerAlignment = p('header_alignment', 'left');
+          if (!in_array($headerAlignment, ['left', 'center', 'right'], true)) {
+            throw new RuntimeException('Choose a valid column name alignment.');
+          }
+          ms_column_view_set_presentation($database, $configTable, $configColumn, $alignment, $headerAlignment, p('fixed_font') === '1');
           $hideColumn = p('hide_column') === '1';
           $style = p('display_style');
           if ($style === '' || $style === 'default') {
@@ -4132,7 +4200,7 @@ try {
             go([], $configTable . '.' . $configColumn . ' money display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif (in_array($style, [
             'relative_date', 'date_relative', 'elapsed_date', 'boolean', 'value_map', 'percentage', 'duration', 'file_size',
-            'phone', 'email', 'url', 'whatsapp', 'color', 'json', 'truncate', 'multiline', 'html', 'image_url',
+            'phone', 'email', 'url', 'downloadable_file', 'whatsapp', 'color', 'json', 'truncate', 'multiline', 'html', 'image_url',
             'accounting', 'compact_number', 'number', 'unit', 'ip', 'coordinates', 'null_display', 'masked'
           ], true)) {
             ms_column_view_set_format($database, $configTable, $configColumn, ms_display_rule_from_post($style));
@@ -5108,6 +5176,11 @@ function page_head(string $title, bool $authenticated): void {
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name{cursor:default}
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:hover,
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:focus{color:inherit;text-decoration:none}
+    .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main,.ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{display:flex;width:100%;max-width:100%}
+    .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main{justify-content:center}
+    .ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{justify-content:flex-end}
+    .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-drag-handle,.ms-layout-table[data-ms-pretty-mode="edit"] th.text-end[data-ms-header-alignment="right"] .ms-col-drag-handle{position:absolute;left:var(--ms-table-pad-x);top:50%;transform:translateY(-50%);margin-right:0}
+    .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-header-name{max-width:calc(100% - 2rem)}
     .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
     .ms-select-table-name:hover{color:var(--ms-accent);text-decoration:underline}
     .ms-select-table-name:focus-visible{outline:2px solid var(--ms-accent);outline-offset:3px;border-radius:.15rem}
@@ -6770,14 +6843,16 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
         echo ms_render_formatted_value($value, $formatRules[$name], true, $name);
       } elseif (!$aggregated && isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
         echo ms_render_image_value($value, $imageColumns[$name]);
-      } elseif (!$aggregated && isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
+      } elseif (!$aggregated && isset($softFkRules[$name]) && is_array($softFkRules[$name])) {
         $soft = $softFkRules[$name];
         $map = $softFkMaps[$name] ?? [];
         $key = (string)$value;
         $match = is_array($map[$key] ?? null) ? $map[$key] : null;
-        $display = $match !== null && empty($match['ambiguous']) ? $match['display'] : $value;
-        [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
-        ?><a class="ms-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
+        $display = ms_soft_fk_display($value, $match);
+        if ($display !== null) {
+          [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
+          ?><a class="ms-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
+        }
       } elseif ($colMeta && preg_match('/blob|binary/i', (string)$colMeta['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -6972,7 +7047,9 @@ function page_select(mysqli $db): void {
   $softDeleteRule=$aggregated?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
   $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];$alignmentRules=is_array($viewConfig['alignments']??null)?$viewConfig['alignments']:[];$fixedFontRules=is_array($viewConfig['fixed_fonts']??null)?$viewConfig['fixed_fonts']:[];
+  $headerAlignmentRules=is_array($viewConfig['header_alignments']??null)?$viewConfig['header_alignments']:[];
   $storedHiddenColumns=is_array($storedViewConfig['hidden']??null)?$storedViewConfig['hidden']:[];$storedImageColumns=is_array($storedViewConfig['images']??null)?$storedViewConfig['images']:[];$storedSoftFkRules=is_array($storedViewConfig['soft_fk']??null)?$storedViewConfig['soft_fk']:[];$storedFormatRules=is_array($storedViewConfig['formats']??null)?$storedViewConfig['formats']:[];$storedLabelRules=is_array($storedViewConfig['labels']??null)?$storedViewConfig['labels']:[];$storedAlignmentRules=is_array($storedViewConfig['alignments']??null)?$storedViewConfig['alignments']:[];$storedFixedFontRules=is_array($storedViewConfig['fixed_fonts']??null)?$storedViewConfig['fixed_fonts']:[];
+  $storedHeaderAlignmentRules=is_array($storedViewConfig['header_alignments']??null)?$storedViewConfig['header_alignments']:[];
   $columnMetaMap=[];foreach($columns as $columnMeta)$columnMetaMap[(string)$columnMeta['COLUMN_NAME']]=$columnMeta;
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
@@ -6996,9 +7073,9 @@ function page_select(mysqli $db): void {
       $pdfValue=$rows[0][$columnName];
       $pdfRule=is_array($storedFormatRules[$columnName]??null)?$storedFormatRules[$columnName]:[];
       $pdfSample=ms_pdf_display_text($pdfValue,$pdfRule);
-      if(!$pdfRule&&isset($storedSoftFkRules[$columnName])&&$pdfValue!==null){
+      if(!$pdfRule&&isset($storedSoftFkRules[$columnName])){
         $pdfMatch=$pdfSampleSoftMaps[$columnName][(string)$pdfValue]??null;
-        if(is_array($pdfMatch)&&empty($pdfMatch['ambiguous'])&&isset($pdfMatch['display']))$pdfSample=(string)$pdfMatch['display'];
+        $pdfSample=ms_soft_fk_display($pdfValue,is_array($pdfMatch)?$pdfMatch:null)??'';
       }
       if(ms_text_length($pdfSample)>100)$pdfSample=ms_text_slice($pdfSample,0,100).'…';
     }else $pdfSample='Sample value';
@@ -7694,13 +7771,15 @@ function page_select(mysqli $db): void {
       $storedFormatRule=is_array($storedFormatRules[$header]??null)?$storedFormatRules[$header]:[];
       $storedFormatJson=json_encode($storedFormatRule,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($storedFormatJson))$storedFormatJson='{}';
       $storedDisplayLabel=trim((string)($storedLabelRules[$header]??''));
-      $alignment=(string)($alignmentRules[$header]??'left');$headerClasses=[];if($alignment==='center')$headerClasses[]='text-center';elseif($alignment==='right')$headerClasses[]='text-end';else $headerClasses[]='text-start';if(!empty($fixedFontRules[$header]))$headerClasses[]='font-monospace';
+      $headerAlignment=(string)($headerAlignmentRules[$header]??'left');if(!in_array($headerAlignment,['left','center','right'],true))$headerAlignment='left';
+      $headerClasses=[];if($headerAlignment==='center')$headerClasses[]='text-center';elseif($headerAlignment==='right')$headerClasses[]='text-end';else $headerClasses[]='text-start';if(!empty($fixedFontRules[$header]))$headerClasses[]='font-monospace';
       $storedAlignment=(string)($storedAlignmentRules[$header]??'left');if(!in_array($storedAlignment,['left','center','right'],true))$storedAlignment='left';
+      $storedHeaderAlignment=(string)($storedHeaderAlignmentRules[$header]??'left');if(!in_array($storedHeaderAlignment,['left','center','right'],true))$storedHeaderAlignment='left';
       $headerMeta=$columnMetaMap[$header]??[];
       $enumValues=(string)($headerMeta['DATA_TYPE']??'')==='enum'?ms_enum_values((string)($headerMeta['COLUMN_TYPE']??'')):[];
       $enumJson=json_encode($enumValues,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($enumJson))$enumJson='[]';
       $isSoftDeleteColumn=$softDeleteRule!==null&&$softDeleteRule['column']===$header;
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
@@ -7725,8 +7804,9 @@ function page_select(mysqli $db): void {
           <div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-hide-column" name="hide_column" value="1"><label class="form-check-label" for="ms-hide-column"><span data-ms-hide-label>Visible</span></label></div>
         </div>
         <div class="mb-3"><label class="form-label" for="ms-display-label">Custom field name</label><input class="form-control" id="ms-display-label" name="display_label" maxlength="200" placeholder="Leave blank to use the database field name"><div class="form-text">Display-only alias. It does not rename the MySQL column.</div></div>
+        <div class="mb-3"><label class="form-label d-block">Column name alignment</label><div class="btn-group" role="group" aria-label="Column name alignment"><input class="btn-check" type="radio" name="header_alignment" id="ms-header-align-left" value="left" checked><label class="btn btn-outline-secondary" for="ms-header-align-left"><i class="fa-solid fa-align-left me-1"></i>Left</label><input class="btn-check" type="radio" name="header_alignment" id="ms-header-align-center" value="center"><label class="btn btn-outline-secondary" for="ms-header-align-center"><i class="fa-solid fa-align-center me-1"></i>Center</label><input class="btn-check" type="radio" name="header_alignment" id="ms-header-align-right" value="right"><label class="btn btn-outline-secondary" for="ms-header-align-right"><i class="fa-solid fa-align-right me-1"></i>Right</label></div></div>
         <div class="row g-3 mb-3">
-          <div class="col-md-7"><label class="form-label d-block">Alignment</label><div class="btn-group" role="group" aria-label="Column alignment"><input class="btn-check" type="radio" name="alignment" id="ms-align-left" value="left" checked><label class="btn btn-outline-secondary" for="ms-align-left"><i class="fa-solid fa-align-left me-1"></i>Left</label><input class="btn-check" type="radio" name="alignment" id="ms-align-center" value="center"><label class="btn btn-outline-secondary" for="ms-align-center"><i class="fa-solid fa-align-center me-1"></i>Center</label><input class="btn-check" type="radio" name="alignment" id="ms-align-right" value="right"><label class="btn btn-outline-secondary" for="ms-align-right"><i class="fa-solid fa-align-right me-1"></i>Right</label></div></div>
+          <div class="col-md-7"><label class="form-label d-block">Cell alignment</label><div class="btn-group" role="group" aria-label="Cell alignment"><input class="btn-check" type="radio" name="alignment" id="ms-align-left" value="left" checked><label class="btn btn-outline-secondary" for="ms-align-left"><i class="fa-solid fa-align-left me-1"></i>Left</label><input class="btn-check" type="radio" name="alignment" id="ms-align-center" value="center"><label class="btn btn-outline-secondary" for="ms-align-center"><i class="fa-solid fa-align-center me-1"></i>Center</label><input class="btn-check" type="radio" name="alignment" id="ms-align-right" value="right"><label class="btn btn-outline-secondary" for="ms-align-right"><i class="fa-solid fa-align-right me-1"></i>Right</label></div></div>
           <div class="col-md-5"><label class="form-label d-block">Font</label><div class="border rounded px-3 py-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-fixed-font" name="fixed_font" value="1"><label class="form-check-label" for="ms-fixed-font">Display as fixed font</label></div></div></div>
         </div>
         <label class="form-label" for="ms-display-style">Viewing style</label>
@@ -7750,6 +7830,7 @@ function page_select(mysqli $db): void {
           <option value="phone">Clickable phone number</option>
           <option value="email">Clickable email address</option>
           <option value="url">Clickable URL</option>
+          <option value="downloadable_file">Downloadable file</option>
           <option value="whatsapp">Clickable WhatsApp number</option>
           <option value="coordinates">Coordinates → map</option>
           <option value="ip">IP address</option>
@@ -7884,6 +7965,11 @@ function page_select(mysqli $db): void {
           <label class="form-label" for="ms-url-display">Link label</label><select class="form-select" id="ms-url-display" name="url_display"><option value="full">Full URL</option><option value="domain">Domain + path</option></select>
         </div>
 
+        <div class="border rounded p-3 mt-3" data-ms-display-section="downloadable_file" hidden>
+          <label class="form-label" for="ms-download-base-url">Base URL</label><input class="form-control code" id="ms-download-base-url" name="download_base_url" maxlength="2048" placeholder="https://example.com/files/" autocomplete="off">
+          <div class="form-text">The cell value is URL encoded and appended to this base. Include a trailing slash or parameter prefix when needed. For files on another domain, downloading can depend on the file server's response headers.</div>
+        </div>
+
         <div class="border rounded p-3 mt-3" data-ms-display-section="json" hidden>
           <div class="small text-body-secondary">Table cells show a View JSON button. Click it to inspect a tree of the stored value. Invalid JSON opens the same viewer with an error and the original value.</div>
         </div>
@@ -7962,6 +8048,7 @@ function page_select(mysqli $db): void {
     const displayLabel=document.getElementById('ms-display-label');
     const hideColumn=document.getElementById('ms-hide-column');
     const alignmentInputs=Array.from(viewForm.querySelectorAll('input[name="alignment"]'));
+    const headerAlignmentInputs=Array.from(viewForm.querySelectorAll('input[name="header_alignment"]'));
     const fixedFont=document.getElementById('ms-fixed-font');
     const hideLabel=document.querySelector('[data-ms-hide-label]');
     const dateFormat=document.getElementById('ms-date-format');
@@ -7970,6 +8057,7 @@ function page_select(mysqli $db): void {
     const moneyDecimals=document.getElementById('ms-money-decimals');
     const imageBase=document.getElementById('ms-image-base-url');
     const imageWidth=document.getElementById('ms-image-width');
+    const downloadBase=document.getElementById('ms-download-base-url');
     const softTable=document.getElementById('ms-soft-fk-table');
     const softId=document.getElementById('ms-soft-fk-id');
     const softValue=document.getElementById('ms-soft-fk-value');
@@ -8002,6 +8090,7 @@ function page_select(mysqli $db): void {
     const updateSections=()=>{
       const style=displayStyle.value;
       sections.forEach(section=>section.hidden=section.dataset.msDisplaySection!==style);
+      downloadBase.required=style==='downloadable_file';
     };
     const updateHideLabel=()=>{if(hideLabel)hideLabel.textContent=hideColumn&&hideColumn.checked?'Hidden':'Visible';};
     const updateSoftDeleteFields=()=>{
@@ -8034,6 +8123,7 @@ function page_select(mysqli $db): void {
       updateSoftDeleteFields();
       displayLabel.value=header.dataset.msDisplayLabel||'';
       const alignment=header.dataset.msAlignment||'left';alignmentInputs.forEach(input=>input.checked=input.value===alignment);
+      const headerAlignment=header.dataset.msHeaderAlignment||'left';headerAlignmentInputs.forEach(input=>input.checked=input.value===headerAlignment);
       fixedFont.checked=header.dataset.msFixedFont==='1';
       hideColumn.checked=header.dataset.msHidden==='1';updateHideLabel();
       let style=header.dataset.msDisplayKind||'';
@@ -8053,6 +8143,7 @@ function page_select(mysqli $db): void {
       setField('duration_input',rule.input||'seconds');
       setField('file_size_input',rule.input||'bytes');setField('file_size_decimals',rule.decimals!==undefined?rule.decimals:2);
       setField('url_display',rule.display||'full');setField('truncate_length',rule.length||120);
+      downloadBase.value=rule.base_url||'';
       setField('image_url_width',rule.width||96);
       setField('accounting_currency',rule.currency||'');setField('accounting_decimals',rule.decimals!==undefined?rule.decimals:2);
       setField('compact_decimals',rule.decimals!==undefined?rule.decimals:2);setField('number_decimals',rule.decimals!==undefined?rule.decimals:0);
@@ -8294,6 +8385,7 @@ function page_row(mysqli $db): void {
     $softFkRules = is_array($viewConfig['soft_fk'] ?? null) ? $viewConfig['soft_fk'] : [];
     $formatRules = is_array($viewConfig['formats'] ?? null) ? $viewConfig['formats'] : [];
     $labelRules = is_array($viewConfig['labels'] ?? null) ? $viewConfig['labels'] : [];
+    $headerAlignmentRules = is_array($viewConfig['header_alignments'] ?? null) ? $viewConfig['header_alignments'] : [];
     $softFkMaps = ms_soft_fk_maps($db, [$values], $softFkRules);
     $relations = [];
     foreach (db_all($db, "SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=" . qs($db,$table) . " AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation) {
@@ -8315,19 +8407,23 @@ function page_row(mysqli $db): void {
       $value = $values[$name] ?? null;
       $customLabel = trim((string)($labelRules[$name] ?? ''));
       $visibleLabel = $customLabel !== '' ? $customLabel : $name;
-      ?><tr><th><div><?= h($visibleLabel) ?></div><?php if ($customLabel !== '') { ?><div class="small text-body-secondary code"><?= h($name) ?></div><?php } ?></th><td><?php
+      $fieldNameAlignment = (string)($headerAlignmentRules[$name] ?? 'left');
+      $fieldNameClass = $fieldNameAlignment === 'center' ? 'text-center' : ($fieldNameAlignment === 'right' ? 'text-end' : 'text-start');
+      ?><tr><th class="<?= $fieldNameClass ?>"><div><?= h($visibleLabel) ?></div><?php if ($customLabel !== '') { ?><div class="small text-body-secondary code"><?= h($name) ?></div><?php } ?></th><td><?php
       if (isset($formatRules[$name]) && is_array($formatRules[$name])) {
         echo ms_render_formatted_value($value, $formatRules[$name], true, $name);
       } elseif (isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
         echo ms_render_image_value($value, $imageColumns[$name]);
-      } elseif (isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
+      } elseif (isset($softFkRules[$name]) && is_array($softFkRules[$name])) {
         $soft = $softFkRules[$name];
         $map = $softFkMaps[$name] ?? [];
         $key = (string)$value;
         $match = is_array($map[$key] ?? null) ? $map[$key] : null;
-        $display = $match !== null && empty($match['ambiguous']) ? $match['display'] : $value;
-        [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
-        ?><a class="ms-soft-fk-link ms-row-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display, MS_MAX_CELL_BYTES) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
+        $display = ms_soft_fk_display($value, $match);
+        if ($display !== null) {
+          [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
+          ?><a class="ms-soft-fk-link ms-row-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display, MS_MAX_CELL_BYTES) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
+        }
       } elseif (preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -8361,6 +8457,7 @@ function page_row(mysqli $db): void {
         $slaveFormatRules = is_array($slaveViewConfig['formats'] ?? null) ? $slaveViewConfig['formats'] : [];
         $slaveLabelRules = is_array($slaveViewConfig['labels'] ?? null) ? $slaveViewConfig['labels'] : [];
         $slaveAlignmentRules = is_array($slaveViewConfig['alignments'] ?? null) ? $slaveViewConfig['alignments'] : [];
+        $slaveHeaderAlignmentRules = is_array($slaveViewConfig['header_alignments'] ?? null) ? $slaveViewConfig['header_alignments'] : [];
         $slaveFixedFontRules = is_array($slaveViewConfig['fixed_fonts'] ?? null) ? $slaveViewConfig['fixed_fonts'] : [];
         $slaveVisibleColumns = array_values(array_filter($slaveColumnNames, static function (string $name) use ($slaveHiddenColumns): bool { return empty($slaveHiddenColumns[$name]); }));
         $slaveLayoutColumnsJson = json_encode($slaveColumnNames, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '[]';
@@ -8385,10 +8482,11 @@ function page_row(mysqli $db): void {
         }
         ?><div class="card mt-3"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Slave rows: <?= h($slaveTable) ?></strong><span class="small text-body-secondary"><?= h($slaveField) ?> = <?= h($masterField) ?></span></div><div class="table-responsive"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table ms-layout-table" data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($slaveTable) ?>" data-ms-pretty-mode="view" data-ms-columns="<?= h($slaveLayoutColumnsJson) ?>" data-ms-layout="<?= h($slaveLayoutJson) ?>"><thead><tr><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php foreach ($slaveVisibleColumns as $slaveColumnName) {
           $slaveLabel = trim((string)($slaveLabelRules[$slaveColumnName] ?? ''));
-          $slaveAlignment = (string)($slaveAlignmentRules[$slaveColumnName] ?? 'left');
-          $slaveHeaderClasses = [$slaveAlignment === 'center' ? 'text-center' : ($slaveAlignment === 'right' ? 'text-end' : 'text-start')];
+          $slaveHeaderAlignment = (string)($slaveHeaderAlignmentRules[$slaveColumnName] ?? 'left');
+          if (!in_array($slaveHeaderAlignment, ['left','center','right'], true)) $slaveHeaderAlignment = 'left';
+          $slaveHeaderClasses = [$slaveHeaderAlignment === 'center' ? 'text-center' : ($slaveHeaderAlignment === 'right' ? 'text-end' : 'text-start')];
           if (!empty($slaveFixedFontRules[$slaveColumnName])) $slaveHeaderClasses[] = 'font-monospace';
-          ?><th scope="col" data-ms-column="<?= h($slaveColumnName) ?>" class="<?= h(implode(' ', $slaveHeaderClasses)) ?>" title="<?= h($slaveColumnName) ?>"><span class="ms-col-header-main"><span class="ms-col-header-name"><?= h($slaveLabel !== '' ? $slaveLabel : $slaveColumnName) ?></span></span></th><?php } ?></tr></thead><tbody><?php
+          ?><th scope="col" data-ms-column="<?= h($slaveColumnName) ?>" data-ms-header-alignment="<?= h($slaveHeaderAlignment) ?>" class="<?= h(implode(' ', $slaveHeaderClasses)) ?>" title="<?= h($slaveColumnName) ?>"><span class="ms-col-header-main"><span class="ms-col-header-name"><?= h($slaveLabel !== '' ? $slaveLabel : $slaveColumnName) ?></span></span></th><?php } ?></tr></thead><tbody><?php
         $slaveCount = 0;
         if ($slaveRows instanceof mysqli_result) {
           $batch = [];
@@ -9324,12 +9422,18 @@ function render_column_display_settings(): void {
       foreach ((array)($tableConfig['labels'] ?? []) as $column => $label) if ((string)$label !== '') $labels[] = [(string)$table, (string)$column, (string)$label];
       foreach ((array)($tableConfig['images'] ?? []) as $column => $rule) if (is_array($rule)) $images[] = [(string)$table, (string)$column, $rule];
       foreach ((array)($tableConfig['soft_fk'] ?? []) as $column => $rule) if (is_array($rule)) $softFks[] = [(string)$table, (string)$column, $rule];
-      $alignmentMap=(array)($tableConfig['alignments']??[]);$fixedMap=(array)($tableConfig['fixed_fonts']??[]);$presentationColumns=array_values(array_unique(array_merge(array_keys($alignmentMap),array_keys($fixedMap))));foreach($presentationColumns as $column){$alignment=(string)($alignmentMap[$column]??'left');if(!in_array($alignment,['left','center','right'],true))$alignment='left';$presentations[]=[(string)$table,(string)$column,$alignment,!empty($fixedMap[$column])];}
+      $alignmentMap=(array)($tableConfig['alignments']??[]);$headerAlignmentMap=(array)($tableConfig['header_alignments']??[]);$fixedMap=(array)($tableConfig['fixed_fonts']??[]);
+      $presentationColumns=array_values(array_unique(array_merge(array_keys($alignmentMap),array_keys($headerAlignmentMap),array_keys($fixedMap))));
+      foreach($presentationColumns as $column){
+        $alignment=(string)($alignmentMap[$column]??'left');if(!in_array($alignment,['left','center','right'],true))$alignment='left';
+        $headerAlignment=(string)($headerAlignmentMap[$column]??'left');if(!in_array($headerAlignment,['left','center','right'],true))$headerAlignment='left';
+        $presentations[]=[(string)$table,(string)$column,$alignment,$headerAlignment,!empty($fixedMap[$column])];
+      }
     }
     ?><p class="text-body-secondary">These rules are stored inside the active profile in <code><?= h(ms_profile_config_file()) ?></code> for this connection/database. They affect table browsing, including filtered, single-row and linked-table result views; they do not alter the database schema or exported data.</p>
     <div class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-eye-slash me-2"></i>Hidden columns</strong><?php if($hidden){?><form method="post" class="m-0"><input type="hidden" name="action" value="column_view_show_all"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show all</button></form><?php }?></div><div class="card-body p-0"><?php if(!$hidden){?><div class="p-3 text-body-secondary">No hidden columns.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th></th></tr></thead><tbody><?php foreach($hidden as [$table,$column]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_show"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-secondary btn-sm"><i class="fa-solid fa-eye me-1"></i>Show</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All columns use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
+    <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All column names and cells use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Cell alignment</th><th>Column name alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$headerAlignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= h(ucfirst($headerAlignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card"><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
   }
