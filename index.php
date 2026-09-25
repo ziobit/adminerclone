@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.1';
+const MS_VERSION = '1.15.2';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -783,6 +783,8 @@ function ms_saved_search_name(string $name): string {
 function ms_saved_search_normalize(array $source, array $columnNames): array {
   $allowed = array_values(array_map('strval', $columnNames));
   $result = [];
+  $globalSearch = $source['global_search'] ?? '';
+  if (is_scalar($globalSearch) && (string)$globalSearch !== '') $result['global_search'] = (string)$globalSearch;
   $filterCols = isset($source['filter_col']) && is_array($source['filter_col']) ? array_slice($source['filter_col'], 0, 3) : [];
   $filterOps = isset($source['filter_op']) && is_array($source['filter_op']) ? array_slice($source['filter_op'], 0, 3) : [];
   $filterVals = isset($source['filter_val']) && is_array($source['filter_val']) ? array_slice($source['filter_val'], 0, 3) : [];
@@ -5826,6 +5828,18 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
   if(!is_array($filterCols))$filterCols=[]; if(!is_array($filterOps))$filterOps=[]; if(!is_array($filterValues))$filterValues=[];
   $operators=['='=>'=','!='=>'<>','>'=>'>','>='=>'>=','<'=>'<','<='=>'<=','contains'=>'LIKE','starts'=>'LIKE','ends'=>'LIKE','null'=>'IS NULL','not_null'=>'IS NOT NULL','regexp'=>'REGEXP','fulltext'=>'MATCH'];
   foreach($filterCols as $i=>$column){$column=(string)$column;if(!in_array($column,$allowed,true))continue;$op=(string)($filterOps[$i]??'=');if(!isset($operators[$op]))continue;$sqlOp=$operators[$op];if(in_array($op,['null','not_null'],true)){$where[]=qi($column).' '.$sqlOp;continue;}$value=(string)($filterValues[$i]??'');if($op==='fulltext'){$where[]='MATCH('.qi($column).') AGAINST ('.qs($db,$value).' IN BOOLEAN MODE)';continue;}if($op==='contains')$value='%'.$value.'%';if($op==='starts')$value=$value.'%';if($op==='ends')$value='%'.$value;$where[]=qi($column).' '.$sqlOp.' '.qs($db,$value);}
+  $globalSearch=g('global_search');
+  if($globalSearch!==''&&$columns){
+    $pattern=qs($db,'%'.$globalSearch.'%');$globalTerms=[];
+    foreach($columns as $column){
+      $name=qi((string)$column['COLUMN_NAME']);$type=strtolower((string)($column['DATA_TYPE']??''));
+      if(in_array($type,['geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection'],true))$value='ST_AsText('.$name.')';
+      elseif($type==='bit')$value='CAST(CAST('.$name.' AS UNSIGNED) AS CHAR)';
+      else $value='CAST('.$name.' AS CHAR)';
+      $globalTerms[]=$value.' LIKE '.$pattern;
+    }
+    $where[]='('.implode(' OR ',$globalTerms).')';
+  }
   $aggregate=strtoupper(g('aggregate'));$aggregateColumn=g('aggregate_column');$groupColumn=g('group_column');$validAgg=['COUNT','SUM','AVG','MIN','MAX'];
   $select='*';$group='';
   if(in_array($aggregate,$validAgg,true)&&in_array($aggregateColumn,$allowed,true)){$select=($groupColumn!==''&&in_array($groupColumn,$allowed,true)?qi($groupColumn).', ':'').$aggregate.'('.qi($aggregateColumn).') AS '.qi(strtolower($aggregate).'_'.$aggregateColumn);if($groupColumn!==''&&in_array($groupColumn,$allowed,true))$group=' GROUP BY '.qi($groupColumn);}
@@ -6146,7 +6160,14 @@ function page_select(mysqli $db): void {
     });
   })();
   </script>
-  <div class="card mb-3 no-print"><div class="card-header"><button class="btn btn-sm btn-secondary" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button></div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body">
+  <div class="card mb-3 no-print"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+    <button class="btn btn-sm btn-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button>
+    <div class="input-group input-group-sm" style="width:min(100%,24rem)">
+      <label class="visually-hidden" for="ms-global-search">Search all columns</label>
+      <input class="form-control" type="search" id="ms-global-search" name="global_search" form="ms-query-builder-form" value="<?= h(g('global_search')) ?>" placeholder="Search all columns" aria-label="Search all columns in this table">
+      <button class="btn btn-outline-primary" type="submit" form="ms-query-builder-form" title="Search all columns" aria-label="Search all columns"><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i></button>
+    </div>
+  </div><div class="collapse <?= $where||g('aggregate')!==''||$showAll?'show':'' ?>" id="queryBuilder"><div class="card-body">
     <div class="row g-2 align-items-end mb-3 pb-3 border-bottom">
       <div class="col-md-4"><label class="form-label" for="ms-saved-search-select">Saved search</label><select class="form-select" id="ms-saved-search-select" data-ms-saved-search-select><option value="">Choose saved search…</option><?php foreach($savedSearches as $searchName=>$searchQuery){$savedUrl='?'.http_build_query(array_merge(['page'=>'select','table'=>$table],is_array($searchQuery)?$searchQuery:[]));?><option value="<?= h($savedUrl) ?>" data-search-name="<?= h((string)$searchName) ?>"><?= h((string)$searchName) ?></option><?php }?></select></div>
       <div class="col-md-4"><label class="form-label" for="ms-search-name">Save current search as</label><input class="form-control" id="ms-search-name" data-ms-search-name maxlength="100" placeholder="Search name"></div>
@@ -6157,7 +6178,7 @@ function page_select(mysqli $db): void {
     <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3><?php for($i=0;$i<3;$i++){?><div class="row g-2 mb-2"><div class="col-md-3"><select class="form-select" name="filter_col[]"><option value="">Column…</option><?php foreach($columns as $c){$name=$c['COLUMN_NAME'];?><option value="<?= h($name) ?>"<?= (($_GET['filter_col'][$i]??'')===$name)?' selected':'' ?>><?= h($name) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="filter_op[]"><?php foreach(['=','!=','>','>=','<','<=','contains','starts','ends','regexp','fulltext','null','not_null'] as $op){?><option<?= (($_GET['filter_op'][$i]??'')===$op)?' selected':'' ?>><?= h($op) ?></option><?php }?></select></div><div class="col-md-7"><input class="form-control" name="filter_val[]" value="<?= h($_GET['filter_val'][$i]??'') ?>"></div></div><?php }?><hr><div class="row g-2"><div class="col-md-2"><label class="form-label">Aggregate</label><select class="form-select" name="aggregate"><option value="">None</option><?php foreach(['COUNT','SUM','AVG','MIN','MAX'] as $a){?><option<?= g('aggregate')===$a?' selected':'' ?>><?= $a ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Aggregate column</label><select class="form-select" name="aggregate_column"><?php foreach($columns as $c){?><option<?= g('aggregate_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Group by</label><select class="form-select" name="group_column"><option value="">None</option><?php foreach($columns as $c){?><option<?= g('group_column')===$c['COLUMN_NAME']?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><label class="form-label">Rows per page</label><input class="form-control" type="number" name="limit" min="1" max="500" value="<?= h((string)$limit) ?>"></div><div class="col-md-2"><label class="form-label d-block">Display</label><label class="form-check"><input class="form-check-input" type="checkbox" name="show_all" value="1"<?= $showAll?' checked':'' ?>><span class="form-check-label">Show all rows</span></label><div class="form-text">May use substantial memory.</div></div></div><hr><h3 class="h6">Ordering</h3><?php for($i=0;$i<2;$i++){?><div class="row g-2 mb-2"><div class="col-md-4"><select class="form-select" name="order_col[]"><option value="">Column…</option><?php foreach($columns as $c){?><option<?= (($_GET['order_col'][$i]??'')===$c['COLUMN_NAME'])?' selected':'' ?>><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-2"><select class="form-select" name="order_dir[]"><option>ASC</option><option<?= (($_GET['order_dir'][$i]??'')==='DESC')?' selected':'' ?>>DESC</option></select></div></div><?php }?><button class="btn btn-primary">Run query</button> <a class="btn btn-secondary" href="?page=select&amp;table=<?= urlencode($table) ?>">Reset</a></form></div></div></div>
   <div class="card mb-3 no-print"><div class="card-body py-2">
     <?php
-      $exportQuery = array_intersect_key($returnQuery, array_flip(['filter_col', 'filter_op', 'filter_val', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
+      $exportQuery = array_intersect_key($returnQuery, array_flip(['global_search', 'filter_col', 'filter_op', 'filter_val', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
       $exportQuery['limit'] = $limit;
       $exportQuery['p'] = $page;
       $exportQuery['show_all'] = $showAll ? '1' : '0';
