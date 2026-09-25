@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.6';
+const MS_VERSION = '1.15.7';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1523,6 +1523,8 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
       continue;
     }
+    $primary = primary_columns($db, $targetTable);
+    $identityColumns = $primary ?: $targetColumns;
     $values = [];
     foreach ($rows as $row) {
       if (array_key_exists($sourceColumn, $row) && $row[$sourceColumn] !== null) {
@@ -1537,18 +1539,40 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     foreach ($values as $value) {
       $quoted[] = qs($db, $value);
     }
-    $lookup = db_all(
-      $db,
-      'SELECT ' . qi($idColumn) . ' AS __ms_id, ' . qi($valueColumn) . ' AS __ms_value FROM ' . qi($targetTable) .
-      ' WHERE ' . qi($idColumn) . ' IN (' . implode(', ', $quoted) . ')'
-    );
+    $selectedColumns = array_values(array_unique(array_merge([$idColumn, $valueColumn], $identityColumns)));
+    $lookup = db_all($db, 'SELECT ' . implode(', ', array_map('qi', $selectedColumns)) . ' FROM ' . qi($targetTable) .
+      ' WHERE ' . qi($idColumn) . ' IN (' . implode(', ', $quoted) . ')');
     $map = [];
     foreach ($lookup as $targetRow) {
-      $map[(string)($targetRow['__ms_id'] ?? '')] = $targetRow['__ms_value'] ?? null;
+      $key = (string)($targetRow[$idColumn] ?? '');
+      if (array_key_exists($key, $map)) {
+        // A non-unique lookup value does not identify a specific target row.
+        $map[$key]['identity'] = null;
+        $map[$key]['ambiguous'] = true;
+        continue;
+      }
+      $identity = [];
+      foreach ($identityColumns as $identityColumn) $identity[$identityColumn] = $targetRow[$identityColumn] ?? null;
+      $map[$key] = ['display' => $targetRow[$valueColumn] ?? null, 'identity' => $identity, 'ambiguous' => false];
     }
     $maps[$sourceColumn] = $map;
   }
   return $maps;
+}
+
+function ms_soft_fk_link(array $rule, $value, ?array $match): array {
+  $targetTable = (string)($rule['table'] ?? '');
+  $idColumn = (string)($rule['id_column'] ?? '');
+  if ($match !== null && empty($match['ambiguous']) && is_array($match['identity'] ?? null)) {
+    $returnToken = ms_encode_navigation(['page' => 'select', 'table' => $targetTable]);
+    $url = '?' . http_build_query(['page' => 'row', 'mode' => 'view', 'table' => $targetTable,
+      'id' => encode_identity($match['identity']), 'return_to' => $returnToken]);
+    return [$url, 'fa-link', 'View referenced row'];
+  }
+  $url = '?' . http_build_query(['page' => 'select', 'table' => $targetTable,
+    'filter_col' => [$idColumn], 'filter_op' => ['='], 'filter_val' => [(string)$value]]);
+  return [$url, $match === null ? 'fa-link-slash' : 'fa-list',
+    $match === null ? 'Search for referenced row' : 'View matching referenced rows'];
 }
 
 function ms_render_image_value($value, array $rule): string {
@@ -6402,10 +6426,10 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
         $soft = $softFkRules[$name];
         $map = $softFkMaps[$name] ?? [];
         $key = (string)$value;
-        $found = array_key_exists($key, $map);
-        $display = $found ? $map[$key] : $value;
-        $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a class="ms-soft-fk-link" href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display) ?></span><i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small" aria-hidden="true"></i></a><?php
+        $match = is_array($map[$key] ?? null) ? $map[$key] : null;
+        $display = $match !== null && empty($match['ambiguous']) ? $match['display'] : $value;
+        [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
+        ?><a class="ms-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
       } elseif ($colMeta && preg_match('/blob|binary/i', (string)$colMeta['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -6426,8 +6450,9 @@ function ms_render_json_viewer_modal(): void {
   ?>
   <div class="modal fade" id="ms-json-view-modal" tabindex="-1" aria-labelledby="ms-json-view-title" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
-      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-json-view-title"><i class="fa-solid fa-code me-2" aria-hidden="true"></i>JSON viewer</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-json-view-title"><i class="fa-solid fa-code me-2" aria-hidden="true"></i>JSON viewer</h2><button type="button" class="btn btn-sm btn-outline-secondary ms-auto me-3" title="Copy the complete stored value to clipboard" data-ms-json-copy><i class="fa-regular fa-copy me-1" aria-hidden="true"></i><span data-ms-json-copy-label>Copy</span></button><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body">
+        <div class="small mb-2 d-none" role="status" aria-live="polite" data-ms-json-copy-status></div>
         <div class="small text-body-secondary mb-2" data-ms-json-column></div>
         <div class="alert alert-danger d-none" role="alert" data-ms-json-error></div>
         <div class="ms-json-tree border rounded p-3" data-ms-json-tree></div>
@@ -6447,9 +6472,49 @@ function ms_render_json_viewer_modal(): void {
     const limitNote=modal.querySelector('[data-ms-json-limit]');
     const rawDetails=modal.querySelector('[data-ms-json-raw-details]');
     const rawValue=modal.querySelector('[data-ms-json-raw]');
+    const copyButton=modal.querySelector('[data-ms-json-copy]');
+    const copyLabel=modal.querySelector('[data-ms-json-copy-label]');
+    const copyStatus=modal.querySelector('[data-ms-json-copy-status]');
     const maxNodes=5000;
     const maxDepth=80;
     let renderToken=0;
+    let currentRaw='';
+    const copyWithFallback=value=>{
+      const input=document.createElement('textarea');
+      input.value=value;
+      input.setAttribute('readonly','');
+      input.style.position='fixed';
+      input.style.left='-9999px';
+      const previousFocus=document.activeElement;
+      modal.appendChild(input);
+      try{
+        input.focus();
+        input.select();
+        if(!document.execCommand('copy'))throw new Error('Copy command was blocked.');
+      }finally{
+        input.remove();
+        if(previousFocus instanceof HTMLElement)previousFocus.focus();
+      }
+    };
+    copyButton.addEventListener('click',async()=>{
+      if(copyButton.disabled)return;
+      const text=currentRaw;
+      const token=renderToken;
+      try{
+        if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+          try{await navigator.clipboard.writeText(text);}catch(error){copyWithFallback(text);}
+        }else copyWithFallback(text);
+        if(token!==renderToken)return;
+        copyLabel.textContent='Copied!';
+        copyStatus.className='small text-success mb-2';
+        copyStatus.textContent='Complete value copied to clipboard.';
+      }catch(error){
+        if(token!==renderToken)return;
+        copyLabel.textContent='Copy';
+        copyStatus.className='small text-danger mb-2';
+        copyStatus.textContent='Could not copy automatically. Open Raw value to copy it manually.';
+      }
+    });
     const addLabel=(parent,label)=>{
       if(label===null)return;
       const key=document.createElement('span');
@@ -6504,6 +6569,12 @@ function ms_render_json_viewer_modal(): void {
       const text=button.dataset.msJsonValue||'';
       const sqlNull=button.dataset.msJsonNull==='1';
       const column=button.dataset.msJsonColumn||button.closest('td[data-ms-column]')?.dataset.msColumn||'';
+      currentRaw=text;
+      copyButton.disabled=sqlNull;
+      copyButton.title=sqlNull?'SQL NULL has no stored value to copy':'Copy the complete stored value to clipboard';
+      copyLabel.textContent='Copy';
+      copyStatus.textContent='';
+      copyStatus.className='small mb-2 d-none';
       fieldLabel.textContent=column?`Database field: ${column}`:'';
       rawValue.textContent=sqlNull?'SQL NULL':text;
       rawDetails.open=false;
@@ -7534,10 +7605,10 @@ function page_row(mysqli $db): void {
         $soft = $softFkRules[$name];
         $map = $softFkMaps[$name] ?? [];
         $key = (string)$value;
-        $found = array_key_exists($key, $map);
-        $display = $found ? $map[$key] : $value;
-        $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a class="ms-soft-fk-link ms-row-soft-fk-link" href="<?= h($relUrl) ?>" title="Virtual foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display, MS_MAX_CELL_BYTES) ?></span><i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small" aria-hidden="true"></i></a><?php
+        $match = is_array($map[$key] ?? null) ? $map[$key] : null;
+        $display = $match !== null && empty($match['ambiguous']) ? $match['display'] : $value;
+        [$relUrl, $relIcon, $relTitle] = ms_soft_fk_link($soft, $value, $match);
+        ?><a class="ms-soft-fk-link ms-row-soft-fk-link" href="<?= h($relUrl) ?>" title="<?= h($relTitle . ': ' . $name . ' = ' . (string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display, MS_MAX_CELL_BYTES) ?></span><i class="fa-solid <?= h($relIcon) ?> small" aria-hidden="true"></i></a><?php
       } elseif (preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -7562,27 +7633,55 @@ function page_row(mysqli $db): void {
       if (!in_array($masterField, $masterColumnNames, true) || !in_array($slaveField, $slaveColumnNames, true)) {
         ?><div class="alert alert-warning mt-3 mb-0">The saved master/slave link refers to a missing table or field. Update it in the table settings.</div><?php
       } else {
-        $slaveIdentityNames = primary_columns($db, $slaveTable) ?: $slaveColumnNames;
+        $slaveViewConfig = ms_raw_db_view()
+          ? ['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]]
+          : ms_column_view_table_config(selected_db(), $slaveTable);
+        $slaveHiddenColumns = is_array($slaveViewConfig['hidden'] ?? null) ? $slaveViewConfig['hidden'] : [];
+        $slaveImageColumns = is_array($slaveViewConfig['images'] ?? null) ? $slaveViewConfig['images'] : [];
+        $slaveSoftFkRules = is_array($slaveViewConfig['soft_fk'] ?? null) ? $slaveViewConfig['soft_fk'] : [];
+        $slaveFormatRules = is_array($slaveViewConfig['formats'] ?? null) ? $slaveViewConfig['formats'] : [];
+        $slaveLabelRules = is_array($slaveViewConfig['labels'] ?? null) ? $slaveViewConfig['labels'] : [];
+        $slaveAlignmentRules = is_array($slaveViewConfig['alignments'] ?? null) ? $slaveViewConfig['alignments'] : [];
+        $slaveFixedFontRules = is_array($slaveViewConfig['fixed_fonts'] ?? null) ? $slaveViewConfig['fixed_fonts'] : [];
+        $slaveVisibleColumns = array_values(array_filter($slaveColumnNames, static function (string $name) use ($slaveHiddenColumns): bool { return empty($slaveHiddenColumns[$name]); }));
+        $slaveLayoutColumnsJson = json_encode($slaveColumnNames, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '[]';
+        $slaveLayoutJson = json_encode(ms_profile_table_layout(selected_db(), $slaveTable), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}';
         $slaveReturnToken = ms_encode_navigation(['page' => 'select', 'table' => $slaveTable]);
         $slaveSoftDeleteRule = ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $slaveTable), $slaveColumns);
+        $slaveRelations = [];
+        foreach (db_all($db, 'SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $slaveTable) . ' AND REFERENCED_TABLE_NAME IS NOT NULL') as $slaveRelation) {
+          $slaveRelations[(string)$slaveRelation['COLUMN_NAME']] = $slaveRelation;
+        }
+        $slaveReturnQuery = ['page' => 'select', 'table' => $slaveTable];
+        $renderSlaveBatch = static function (array $batch) use ($db, $slaveTable, $slaveColumns, $slaveHiddenColumns, $slaveImageColumns, $slaveSoftFkRules, $slaveFormatRules, $slaveAlignmentRules, $slaveFixedFontRules, $slaveSoftDeleteRule, $slaveRelations, $slaveReturnQuery, $slaveReturnToken): void {
+          if (!$batch) return;
+          $maps = ms_soft_fk_maps($db, $batch, $slaveSoftFkRules);
+          echo ms_render_select_rows_html($db, $slaveTable, $slaveColumns, $batch, false, false, $slaveHiddenColumns, $slaveImageColumns, $slaveSoftFkRules, $maps, $slaveFormatRules, $slaveAlignmentRules, $slaveFixedFontRules, $slaveSoftDeleteRule, $slaveRelations, $slaveReturnQuery, $slaveReturnToken);
+        };
         $slaveRows = null;
         if ($values[$masterField] !== null) {
-          $slaveRows = $db->query('SELECT * FROM ' . qi($slaveTable) . ' WHERE ' . qi($slaveField) . ' = ' . qs($db, $values[$masterField]), MYSQLI_USE_RESULT);
+          // Buffer the result on this connection so display lookups can run between batches.
+          $slaveRows = $db->query('SELECT * FROM ' . qi($slaveTable) . ' WHERE ' . qi($slaveField) . ' = ' . qs($db, $values[$masterField]), MYSQLI_STORE_RESULT);
           if (!$slaveRows instanceof mysqli_result) throw new RuntimeException('Unable to load the related slave rows: ' . $db->error);
         }
-        ?><div class="card mt-3"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Slave rows: <?= h($slaveTable) ?></strong><span class="small text-body-secondary"><?= h($slaveField) ?> = <?= h($masterField) ?></span></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0 ms-data-table"><thead><tr><th scope="col">View</th><?php foreach ($slaveColumnNames as $slaveColumnName) { ?><th scope="col"><?= h($slaveColumnName) ?></th><?php } ?></tr></thead><tbody><?php
+        ?><div class="card mt-3"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Slave rows: <?= h($slaveTable) ?></strong><span class="small text-body-secondary"><?= h($slaveField) ?> = <?= h($masterField) ?></span></div><div class="table-responsive"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table ms-layout-table" data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($slaveTable) ?>" data-ms-pretty-mode="view" data-ms-columns="<?= h($slaveLayoutColumnsJson) ?>" data-ms-layout="<?= h($slaveLayoutJson) ?>"><thead><tr><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php foreach ($slaveVisibleColumns as $slaveColumnName) {
+          $slaveLabel = trim((string)($slaveLabelRules[$slaveColumnName] ?? ''));
+          $slaveAlignment = (string)($slaveAlignmentRules[$slaveColumnName] ?? 'left');
+          $slaveHeaderClasses = [$slaveAlignment === 'center' ? 'text-center' : ($slaveAlignment === 'right' ? 'text-end' : 'text-start')];
+          if (!empty($slaveFixedFontRules[$slaveColumnName])) $slaveHeaderClasses[] = 'font-monospace';
+          ?><th scope="col" data-ms-column="<?= h($slaveColumnName) ?>" class="<?= h(implode(' ', $slaveHeaderClasses)) ?>" title="<?= h($slaveColumnName) ?>"><span class="ms-col-header-main"><span class="ms-col-header-name"><?= h($slaveLabel !== '' ? $slaveLabel : $slaveColumnName) ?></span></span></th><?php } ?></tr></thead><tbody><?php
         $slaveCount = 0;
         if ($slaveRows instanceof mysqli_result) {
+          $batch = [];
           while ($slaveRow = $slaveRows->fetch_assoc()) {
             $slaveCount++;
-            $slaveIdentity = [];
-            foreach ($slaveIdentityNames as $identityName) $slaveIdentity[$identityName] = $slaveRow[$identityName] ?? null;
-            $slaveUrl = '?' . http_build_query(['page' => 'row', 'mode' => 'view', 'table' => $slaveTable, 'id' => encode_identity($slaveIdentity), 'return_to' => $slaveReturnToken]);
-            ?><tr<?= ms_row_is_soft_deleted($slaveRow, $slaveSoftDeleteRule) ? ' class="ms-soft-deleted"' : '' ?>><td><a class="btn btn-sm btn-outline-secondary" href="<?= h($slaveUrl) ?>" aria-label="View row in <?= h($slaveTable) ?>"><i class="fa-solid fa-eye" aria-hidden="true"></i></a></td><?php foreach ($slaveColumnNames as $slaveColumnName) { ?><td data-ms-column="<?= h($slaveColumnName) ?>"><?= render_value($slaveRow[$slaveColumnName] ?? null, MS_MAX_CELL_BYTES) ?></td><?php } ?></tr><?php
+            $batch[] = $slaveRow;
+            if (count($batch) >= 200) { $renderSlaveBatch($batch); $batch = []; }
           }
+          $renderSlaveBatch($batch);
           $slaveRows->free();
         }
-        if ($slaveCount === 0) { ?><tr><td class="text-center text-body-secondary p-4" colspan="<?= count($slaveColumnNames) + 1 ?>">No related slave rows.</td></tr><?php }
+        if ($slaveCount === 0) { ?><tr><td class="text-center text-body-secondary p-4" colspan="<?= count($slaveVisibleColumns) + 1 ?>">No related slave rows.</td></tr><?php }
         ?></tbody></table></div><div class="card-footer small text-body-secondary"><?= number_format($slaveCount) ?> related row(s)</div></div><?php
       }
     }
