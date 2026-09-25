@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.4';
+const MS_VERSION = '1.15.5';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -880,6 +880,89 @@ function ms_column_view_update_table(string $database, string $table, callable $
     foreach (['hidden', 'images', 'soft_fk', 'formats', 'labels', 'alignments', 'fixed_fonts'] as $key) if (empty($current[$key])) unset($current[$key]);
     return $current;
   });
+}
+
+function ms_profile_soft_delete_rule(string $database, string $table): ?array {
+  $rule = ms_profile_table_config($database, $table)['soft_delete'] ?? null;
+  return is_array($rule) && isset($rule['column'], $rule['value']) && is_string($rule['column']) && is_string($rule['value']) ? $rule : null;
+}
+
+function ms_profile_set_soft_delete_rule(string $database, string $table, ?array $rule): void {
+  ms_profile_update_table($database, $table, static function (array $config) use ($rule): array {
+    if ($rule === null) unset($config['soft_delete']);
+    else $config['soft_delete'] = $rule;
+    return $config;
+  });
+}
+
+function ms_active_soft_delete_rule(?array $rule, array $columns): ?array {
+  if ($rule === null) return null;
+  foreach ($columns as $column) {
+    if ((string)($column['COLUMN_NAME'] ?? '') === $rule['column'] && stripos((string)($column['EXTRA'] ?? ''), 'GENERATED') === false) {
+      $rule['data_type'] = (string)($column['DATA_TYPE'] ?? '');
+      if ($rule['data_type'] === 'bit' && preg_match('/\A(?:0|[1-9][0-9]*)\z/', $rule['value']) !== 1) return null;
+      $rule['bit_width'] = $rule['data_type'] === 'bit' && preg_match('/\Abit\((\d+)\)\z/i', (string)($column['COLUMN_TYPE'] ?? ''), $match) ? (int)$match[1] : 0;
+      return $rule;
+    }
+  }
+  return null;
+}
+
+function ms_row_is_soft_deleted(array $row, ?array $rule): bool {
+  if ($rule === null || !array_key_exists($rule['column'], $row) || $row[$rule['column']] === null) return false;
+  $actual = $row[$rule['column']];
+  if (($rule['data_type'] ?? '') !== 'bit') return (string)$actual === $rule['value'];
+  if (is_int($actual)) return (string)$actual === $rule['value'];
+  $bytes = (string)$actual;
+  if (($rule['bit_width'] ?? 0) === 1 && ($bytes === '0' || $bytes === '1')) return $bytes === $rule['value'];
+  $digits = [0];
+  for ($i = 0, $length = strlen($bytes); $i < $length; $i++) {
+    $carry = ord($bytes[$i]);
+    for ($j = count($digits) - 1; $j >= 0; $j--) {
+      $number = $digits[$j] * 256 + $carry;
+      $digits[$j] = $number % 10;
+      $carry = intdiv($number, 10);
+    }
+    while ($carry > 0) { array_unshift($digits, $carry % 10); $carry = intdiv($carry, 10); }
+  }
+  return implode('', $digits) === $rule['value'];
+}
+
+function ms_soft_delete_sql_match(mysqli $db, array $rule): string {
+  $column = qi($rule['column']);
+  $value = qs($db, $rule['value']);
+  return ($rule['data_type'] ?? '') === 'bit'
+    ? 'CAST(' . $column . ' AS UNSIGNED) <=> CAST(' . $value . ' AS UNSIGNED)'
+    : 'BINARY ' . $column . ' <=> BINARY ' . $value;
+}
+
+function ms_enum_values(string $columnType): array {
+  if (strncasecmp($columnType, 'enum(', 5) !== 0 || substr($columnType, -1) !== ')') return [];
+  $values = [];
+  $end = strlen($columnType) - 1;
+  $offset = 5;
+  while ($offset < $end) {
+    while ($offset < $end && ctype_space($columnType[$offset])) $offset++;
+    if ($offset >= $end || $columnType[$offset] !== "'") return [];
+    $offset++;
+    $value = '';
+    $closed = false;
+    while ($offset < $end) {
+      $char = $columnType[$offset++];
+      if ($char === '\\' && $offset < $end) {
+        $value .= stripcslashes('\\' . $columnType[$offset++]);
+      } elseif ($char === "'") {
+        if ($offset < $end && $columnType[$offset] === "'") { $value .= "'"; $offset++; }
+        else { $closed = true; break; }
+      } else $value .= $char;
+    }
+    if (!$closed) return [];
+    $values[] = $value;
+    while ($offset < $end && ctype_space($columnType[$offset])) $offset++;
+    if ($offset === $end) break;
+    if ($columnType[$offset++] !== ',' || $offset === $end) return [];
+  }
+  return $values;
 }
 
 function ms_column_view_hide(string $database, string $table, string $column, bool $hidden): void {
@@ -3476,7 +3559,8 @@ try {
           $returnQuery = ['page'=>'select','table'=>$table];
         }
         $returnToken = ms_encode_navigation($returnQuery);
-        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$relations,$returnQuery,$returnToken);
+        $softDeleteRule = $aggregated ? null : ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $table), $columns);
+        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
         $nextOffset = $offset + count($rows);
         echo json_encode([
           'ok' => true,
@@ -3726,7 +3810,8 @@ try {
           if ($configTable === '' || !table_exists($db, $configTable)) {
             throw new RuntimeException('The source table no longer exists.');
           }
-          $sourceColumns = array_column(table_columns($db, $configTable), 'COLUMN_NAME');
+          $sourceColumnsMeta = table_columns($db, $configTable);
+          $sourceColumns = array_column($sourceColumnsMeta, 'COLUMN_NAME');
           if ($configColumn === '' || !in_array($configColumn, $sourceColumns, true)) {
             throw new RuntimeException('The source column no longer exists.');
           }
@@ -3777,13 +3862,48 @@ try {
           ms_column_view_clear_presentation($database, $configTable, $configColumn);
           ms_column_view_set_label($database, $configTable, $configColumn, null);
           ms_column_view_hide($database, $configTable, $configColumn, false);
+          $currentSoftDelete = ms_profile_soft_delete_rule($database, $configTable);
+          if ($currentSoftDelete !== null && $currentSoftDelete['column'] === $configColumn) ms_profile_set_soft_delete_rule($database, $configTable, null);
           go([], 'Display customization removed and ' . $configTable . '.' . $configColumn . ' is visible again.');
         } elseif ($action === 'column_view_display_save') {
+          $softDeleteEnabled = p('soft_delete_enabled') === '1';
+          $currentSoftDelete = ms_profile_soft_delete_rule($database, $configTable);
+          $softDeleteRule = null;
+          if ($softDeleteEnabled) {
+            $sourceColumnMeta = null;
+            foreach ($sourceColumnsMeta as $columnMeta) {
+              if ((string)$columnMeta['COLUMN_NAME'] === $configColumn) { $sourceColumnMeta = $columnMeta; break; }
+            }
+            if ($sourceColumnMeta === null || stripos((string)$sourceColumnMeta['EXTRA'], 'GENERATED') !== false) {
+              throw new RuntimeException('A generated column cannot be used as a soft-delete value.');
+            }
+            if ((string)$sourceColumnMeta['DATA_TYPE'] === 'enum') {
+              $enumValues = ms_enum_values((string)$sourceColumnMeta['COLUMN_TYPE']);
+              $enumIndex = p('soft_delete_enum_index');
+              if (!$enumValues || preg_match('/\A[1-9][0-9]*\z/', $enumIndex) !== 1 || !array_key_exists((int)$enumIndex - 1, $enumValues)) {
+                throw new RuntimeException('Choose a valid ENUM value for soft deletion.');
+              }
+              $softDeleteValue = $enumValues[(int)$enumIndex - 1];
+            } else {
+              $softDeleteValue = p('soft_delete_empty') === '1' ? '' : p('soft_delete_value');
+              if (($softDeleteValue === '' && p('soft_delete_empty') !== '1') || strlen($softDeleteValue) > 4096 || preg_match('//u', $softDeleteValue) !== 1) {
+                throw new RuntimeException('Enter a soft-delete value or choose the empty string (valid UTF-8, at most 4096 bytes).');
+              }
+              if ((string)$sourceColumnMeta['DATA_TYPE'] === 'bit' && preg_match('/\A(?:0|[1-9][0-9]*)\z/', $softDeleteValue) !== 1) {
+                throw new RuntimeException('Enter a non-negative decimal number for a BIT soft-delete column.');
+              }
+            }
+            $softDeleteRule = ['column' => $configColumn, 'value' => $softDeleteValue];
+          }
           $displayLabel = trim(p('display_label'));
           $displayLabelLength = preg_match_all('/./us', $displayLabel, $displayLabelChars);
           if ($displayLabelLength === false || $displayLabelLength > 200) {
             throw new RuntimeException('The custom field name must be valid UTF-8 and 200 characters or fewer.');
           }
+          $saveSoftDeleteRule = static function () use ($softDeleteEnabled, $database, $configTable, $softDeleteRule, $currentSoftDelete, $configColumn): void {
+            if ($softDeleteEnabled) ms_profile_set_soft_delete_rule($database, $configTable, $softDeleteRule);
+            elseif ($currentSoftDelete !== null && $currentSoftDelete['column'] === $configColumn) ms_profile_set_soft_delete_rule($database, $configTable, null);
+          };
           ms_column_view_set_label($database, $configTable, $configColumn, $displayLabel !== '' ? $displayLabel : null);
           $alignment = p('alignment', 'left');
           if (!in_array($alignment, ['left', 'center', 'right'], true)) {
@@ -3795,6 +3915,7 @@ try {
           if ($style === '' || $style === 'default') {
             ms_column_view_clear_display($database, $configTable, $configColumn);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' now uses the default display' . ($hideColumn ? ' and is hidden.' : '.'));
           } elseif ($style === 'date') {
             $format = p('date_format');
@@ -3803,6 +3924,7 @@ try {
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'date', 'format' => $format]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' date display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'datetime') {
             $format = p('datetime_format');
@@ -3811,6 +3933,7 @@ try {
             }
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'datetime', 'format' => $format]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' date/time display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'money') {
             $currency = p('money_currency');
@@ -3820,6 +3943,7 @@ try {
             $decimals = max(0, min(4, (int)p('money_decimals', '2')));
             ms_column_view_set_format($database, $configTable, $configColumn, ['kind' => 'money', 'currency' => $currency, 'decimals' => $decimals]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' money display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif (in_array($style, [
             'relative_date', 'date_relative', 'elapsed_date', 'boolean', 'value_map', 'percentage', 'duration', 'file_size',
@@ -3828,6 +3952,7 @@ try {
           ], true)) {
             ms_column_view_set_format($database, $configTable, $configColumn, ms_display_rule_from_post($style));
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' ' . str_replace('_', ' ', $style) . ' display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'image') {
             $baseUrl = trim(p('image_base_url'));
@@ -3837,6 +3962,7 @@ try {
             }
             ms_column_view_set_image($database, $configTable, $configColumn, ['base_url' => $baseUrl, 'width' => $width]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' image display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'soft_fk') {
             $targetTable = p('soft_fk_table');
@@ -3851,6 +3977,7 @@ try {
             }
             ms_column_view_set_soft_fk($database, $configTable, $configColumn, ['table' => $targetTable, 'id_column' => $idColumn, 'value_column' => $valueColumn]);
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
+            $saveSoftDeleteRule();
             go([], 'Virtual foreign key saved for ' . $configTable . '.' . $configColumn . ($hideColumn ? ' and column hidden.' : '.'));
           } else {
             throw new RuntimeException('Choose a valid display style.');
@@ -4344,7 +4471,7 @@ try {
         }
         unset($_SESSION['ms_clone_rows']);
         go(['page' => 'select', 'table' => $table], $cloned . ' row(s) cloned.');
-      } elseif ($action === 'delete_row') {
+      } elseif ($action === 'delete_row' || $action === 'soft_delete_row') {
         $table = g('table');
         if (!table_exists($db, $table)) {
           throw new RuntimeException('Table not found.');
@@ -4357,6 +4484,94 @@ try {
         $returnQuery = ms_decode_navigation(p('return_to'));
         if (($returnQuery['page'] ?? '') !== 'select' || ($returnQuery['table'] ?? '') !== $table) {
           $returnQuery = ['page' => 'select', 'table' => $table];
+        }
+        $rule = ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $table), $columns);
+        $expectedSoftDeleted = g('expected_soft_deleted');
+        $expectedRuleHash = g('soft_rule_hash');
+        if ($rule !== null) {
+          $currentRuleHash = hash('sha256', $rule['column'] . "\0" . $rule['value']);
+          if (!in_array($expectedSoftDeleted, ['0', '1'], true) || !hash_equals($currentRuleHash, $expectedRuleHash)) {
+            throw new RuntimeException('The soft-delete settings changed. Refresh the table and try again.');
+          }
+        } elseif ($expectedSoftDeleted !== '' || $expectedRuleHash !== '') {
+          throw new RuntimeException('The soft-delete settings changed. Refresh the table and try again.');
+        }
+        if ($action === 'soft_delete_row') {
+          $meta = db_one($db, 'SELECT TABLE_TYPE, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+          if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('Only tables can have rows soft-deleted.');
+          if ($rule === null) throw new RuntimeException('This table has no valid soft-delete column.');
+          $transactional = false;
+          foreach (db_all($db, 'SHOW ENGINES') as $engineInfo) {
+            if (strcasecmp((string)($engineInfo['Engine'] ?? ''), (string)($meta['ENGINE'] ?? '')) === 0) {
+              $transactional = strtoupper((string)($engineInfo['Transactions'] ?? 'NO')) === 'YES';
+              break;
+            }
+          }
+          if (!$transactional) throw new RuntimeException('Soft deletion needs a transactional table engine so the new value can be verified safely.');
+          $column = qi($rule['column']);
+          $value = qs($db, $rule['value']);
+          $matchesDeletedValue = ms_soft_delete_sql_match($db, $rule);
+          $where = row_identity_where($db, $columns, $identity);
+          $db->begin_transaction();
+          try {
+            $current = db_one($db, 'SELECT ' . $column . ' AS ms_soft_delete_value FROM ' . qi($table) . ' WHERE ' . $where . ' LIMIT 1 FOR UPDATE');
+            if ($current === null) {
+              $message = 'The row was not found.';
+              $messageType = 'warning';
+            } elseif (ms_row_is_soft_deleted([$rule['column'] => $current['ms_soft_delete_value']], $rule)) {
+              $message = 'This row is already soft-deleted. Use Delete again to remove it permanently.';
+              $messageType = 'warning';
+            } else {
+              $updatedIdentity = $identity;
+              if (array_key_exists($rule['column'], $updatedIdentity)) $updatedIdentity[$rule['column']] = $rule['value'];
+              $verifyWhere = row_identity_where($db, $columns, $updatedIdentity) . ' AND (' . $matchesDeletedValue . ')';
+              $before = db_one($db, 'SELECT COUNT(*) AS n FROM ' . qi($table) . ' WHERE ' . $verifyWhere);
+              $beforeCount = (int)($before['n'] ?? 0);
+              $sql = 'UPDATE ' . qi($table) . ' SET ' . $column . ' = ' . $value . ' WHERE ' . $where . ' AND NOT (' . $matchesDeletedValue . ') LIMIT 1';
+              if (!$db->query($sql)) throw new RuntimeException($db->error);
+              if ($db->affected_rows !== 1) {
+                $message = 'The row could not be soft-deleted. Check that the configured value differs from its current value.';
+                $messageType = 'warning';
+              } else {
+                $after = db_one($db, 'SELECT COUNT(*) AS n FROM ' . qi($table) . ' WHERE ' . $verifyWhere);
+                $stored = db_one($db, 'SELECT ' . $column . ' AS ms_soft_delete_value FROM ' . qi($table) . ' WHERE ' . $verifyWhere . ' LIMIT 1');
+                if ((int)($after['n'] ?? 0) !== $beforeCount + 1 || $stored === null || !ms_row_is_soft_deleted([$rule['column'] => $stored['ms_soft_delete_value']], $rule)) {
+                  throw new RuntimeException('MySQL stored the deleted value differently or changed the row identity. Enter the exact stored value or add a primary key.');
+                }
+                $message = 'Row soft-deleted.';
+                $messageType = 'success';
+              }
+            }
+            $db->commit();
+          } catch (Throwable $softDeleteError) {
+            $db->rollback();
+            throw $softDeleteError;
+          }
+          ms_go_to_query($returnQuery, $message, $messageType);
+        }
+        if ($rule !== null) {
+          $column = qi($rule['column']);
+          $where = row_identity_where($db, $columns, $identity);
+          $matchesDeletedValue = ms_soft_delete_sql_match($db, $rule);
+          $db->begin_transaction();
+          try {
+            $current = db_one($db, 'SELECT ' . $column . ' AS ms_soft_delete_value FROM ' . qi($table) . ' WHERE ' . $where . ' LIMIT 1 FOR UPDATE');
+            if ($current === null || ms_row_is_soft_deleted([$rule['column'] => $current['ms_soft_delete_value']], $rule) !== ($expectedSoftDeleted === '1')) {
+              $message = 'The row or its soft-delete status changed. Refresh the table and try again.';
+              $messageType = 'warning';
+            } else {
+              $condition = $expectedSoftDeleted === '1' ? '(' . $matchesDeletedValue . ')' : 'NOT (' . $matchesDeletedValue . ')';
+              $sql = 'DELETE FROM ' . qi($table) . ' WHERE ' . $where . ' AND ' . $condition . ' LIMIT 1';
+              if (!$db->query($sql)) throw new RuntimeException($db->error);
+              $message = $db->affected_rows === 1 ? 'Row deleted.' : 'The row changed. Refresh the table and try again.';
+              $messageType = $db->affected_rows === 1 ? 'success' : 'warning';
+            }
+            $db->commit();
+          } catch (Throwable $deleteError) {
+            $db->rollback();
+            throw $deleteError;
+          }
+          ms_go_to_query($returnQuery, $message, $messageType);
         }
         $sql = 'DELETE FROM ' . qi($table) . ' WHERE ' . row_identity_where($db, $columns, $identity) . ' LIMIT 1';
         if (!$db->query($sql)) {
@@ -4710,6 +4925,10 @@ function page_head(string $title, bool $authenticated): void {
     .ms-pretty-toggle{display:inline-flex;align-items:center;justify-content:center;width:1.75rem;height:1.75rem;padding:0;border-radius:50%;color:var(--bs-secondary-color);font-size:.8rem;line-height:1}
     .ms-pretty-toggle:hover,.ms-pretty-toggle:focus,.ms-pretty-toggle[aria-pressed="true"]{color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.1)}
     [data-ms-save-widths][hidden]{display:none!important}
+    .ms-data-table tr.ms-soft-deleted td[data-ms-column],.ms-data-table tr.ms-soft-deleted td[data-ms-column] :is(a,.cell-value,.badge,code,pre){color:var(--bs-secondary-color)!important;text-decoration:line-through}
+    .ms-data-table tr.ms-soft-deleted td[data-ms-column] .badge{background:var(--bs-tertiary-bg)!important;border:1px solid var(--bs-border-color)}
+    .ms-data-table tr.ms-soft-deleted td[data-ms-column] .progress{filter:grayscale(1);opacity:.65}
+    .ms-data-table tr.ms-soft-deleted td[data-ms-column] img{filter:grayscale(1);opacity:.55}
     html[data-density="standard"]{--ms-table-font-size:14px;--ms-table-line-height:1.3;--ms-table-pad-y:.42rem;--ms-table-pad-x:.55rem;--ms-cell-max-width:420px;--ms-cell-max-height:9rem}
     html[data-density="large"]{--sidebar:295px;--ms-table-font-size:16px;--ms-table-line-height:1.42;--ms-table-pad-y:.7rem;--ms-table-pad-x:.82rem;--ms-cell-max-width:560px;--ms-cell-max-height:12rem;--ms-sql-editor-font-size:1rem;--ms-sql-editor-min-height:280px;font-size:17px}html[data-density="large"] .main{padding:1.6rem}html[data-density="large"] .sidebar{padding:1.3rem!important}html[data-density="large"] .form-control,html[data-density="large"] .form-select,html[data-density="large"] .btn{font-size:1rem;padding:.58rem .8rem}html[data-density="large"] .card-body,html[data-density="large"] .card-header,html[data-density="large"] .card-footer{padding:1.25rem}html[data-density="large"] .nav-link,html[data-density="large"] .list-group-item{padding:.7rem .85rem}
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
@@ -4766,19 +4985,41 @@ function page_foot(): void {
     event.preventDefault();
     event.stopPropagation();
     if (!window.Swal || typeof window.Swal.fire !== 'function') return;
-    const result = await window.Swal.fire({
-      title: 'Delete this row?',
-      text: 'This operation cannot be undone.',
-      icon: 'warning',
-      showCancelButton: true,
-      confirmButtonText: 'Delete',
-      cancelButtonText: 'Cancel',
-      confirmButtonColor: '#dc3545',
-      focusCancel: true,
-      reverseButtons: true
-    });
-    if (result.isConfirmed && target.form) {
-      if (typeof window.msShowPageLoader === 'function') window.msShowPageLoader('Deleting row...');
+    const row=target.closest('tr');
+    let action='delete_row';
+    if(row&&row.dataset.msSoftDeleteAvailable==='1'&&row.dataset.msSoftDeleted!=='1'){
+      const choice=await window.Swal.fire({
+        title:'Delete this row?',
+        text:'Mark this row as deleted using the configured soft-delete column?',
+        icon:'question',
+        showDenyButton:true,
+        showCancelButton:true,
+        confirmButtonText:'Soft-delete',
+        denyButtonText:'Delete permanently',
+        cancelButtonText:'Cancel',
+        denyButtonColor:'#dc3545',
+        focusConfirm:true
+      });
+      if(choice.isConfirmed)action='soft_delete_row';
+      else if(!choice.isDenied)return;
+    }
+    if(action==='delete_row'){
+      const result=await window.Swal.fire({
+        title:'Delete this row?',
+        text:'This operation cannot be undone.',
+        icon:'warning',
+        showCancelButton:true,
+        confirmButtonText:'Delete',
+        cancelButtonText:'Cancel',
+        confirmButtonColor:'#dc3545',
+        focusCancel:true,
+        reverseButtons:true
+      });
+      if(!result.isConfirmed)return;
+    }
+    if(target.form){
+      target.value=action;
+      if(typeof window.msShowPageLoader==='function')window.msShowPageLoader(action==='soft_delete_row'?'Soft-deleting row...':'Deleting row...');
       target.form.requestSubmit(target);
     }
   });
@@ -5938,7 +6179,7 @@ function render_select_pagination(int $page, int $pages, string $position): void
   ?></ul></nav><?php
 }
 
-function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,array $relations,array $returnQuery,string $returnToken): string {
+function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken): string {
   $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
   $columnMap = [];
   foreach ($columns as $column) {
@@ -5946,6 +6187,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
   }
   ob_start();
   foreach ($rows as $row) {
+    $isSoftDeleted = !$aggregated && ms_row_is_soft_deleted($row, $softDeleteRule);
     $identity = [];
     foreach ($primary as $key) {
       $identity[(string)$key] = $row[$key] ?? null;
@@ -5956,15 +6198,19 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
     $cloneUrl = '?' . http_build_query(['page'=>'row','mode'=>'clone','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
     $deleteQuery = $returnQuery;
     $deleteQuery['single_id'] = $encoded;
+    if ($editable && $softDeleteRule !== null) {
+      $deleteQuery['expected_soft_deleted'] = $isSoftDeleted ? '1' : '0';
+      $deleteQuery['soft_rule_hash'] = hash('sha256', $softDeleteRule['column'] . "\0" . $softDeleteRule['value']);
+    }
     $deleteUrl = '?' . http_build_query($deleteQuery);
-    ?><tr><?php if (!$aggregated) { ?>
+    ?><tr<?= $isSoftDeleted ? ' class="ms-soft-deleted" title="Soft-deleted row"' : '' ?><?php if ($editable && $softDeleteRule !== null && !$aggregated) { ?> data-ms-soft-delete-available="1" data-ms-soft-deleted="<?= $isSoftDeleted ? '1' : '0' ?>"<?php } ?>><?php if (!$aggregated) { ?>
       <?php if ($editable) { ?><td data-ms-static-column="selection"><input class="form-check-input row-check" type="checkbox" name="row_id[]" value="<?= h($encoded) ?>"></td><?php } ?>
-      <td class="ms-row-actions-cell" data-ms-static-column="actions"><span class="ms-row-actions">
+      <td class="ms-row-actions-cell" data-ms-static-column="actions"><span class="ms-row-actions"><?php if ($isSoftDeleted) { ?><span class="visually-hidden">Soft-deleted row. </span><?php } ?>
         <a class="ms-row-action" href="<?= h($viewUrl) ?>" title="View row" aria-label="View row"><i class="fa-solid fa-eye"></i></a>
         <?php if ($editable) { ?>
           <a class="ms-row-action" href="<?= h($editUrl) ?>" title="Edit row" aria-label="Edit row"><i class="fa-solid fa-pen"></i></a>
           <a class="ms-row-action" href="<?= h($cloneUrl) ?>" title="Clone row" aria-label="Clone row"><i class="fa-solid fa-clone"></i></a>
-          <button class="ms-row-action ms-row-delete" type="submit" name="action" value="delete_row" formaction="<?= h($deleteUrl) ?>" data-ms-delete-single title="Delete row" aria-label="Delete row"><i class="fa-solid fa-trash"></i></button>
+          <button class="ms-row-action ms-row-delete" type="submit" name="action" value="delete_row" formaction="<?= h($deleteUrl) ?>" data-ms-delete-single title="<?= $isSoftDeleted ? 'Delete permanently' : 'Delete row' ?>" aria-label="<?= $isSoftDeleted ? 'Delete permanently' : 'Delete row' ?>"><i class="fa-solid fa-trash"></i></button>
         <?php } ?>
       </span></td>
     <?php }
@@ -6022,9 +6268,11 @@ function page_select(mysqli $db): void {
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
+  $softDeleteRule=$aggregated?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
   $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];$alignmentRules=is_array($viewConfig['alignments']??null)?$viewConfig['alignments']:[];$fixedFontRules=is_array($viewConfig['fixed_fonts']??null)?$viewConfig['fixed_fonts']:[];
   $storedHiddenColumns=is_array($storedViewConfig['hidden']??null)?$storedViewConfig['hidden']:[];$storedImageColumns=is_array($storedViewConfig['images']??null)?$storedViewConfig['images']:[];$storedSoftFkRules=is_array($storedViewConfig['soft_fk']??null)?$storedViewConfig['soft_fk']:[];$storedFormatRules=is_array($storedViewConfig['formats']??null)?$storedViewConfig['formats']:[];$storedLabelRules=is_array($storedViewConfig['labels']??null)?$storedViewConfig['labels']:[];$storedAlignmentRules=is_array($storedViewConfig['alignments']??null)?$storedViewConfig['alignments']:[];$storedFixedFontRules=is_array($storedViewConfig['fixed_fonts']??null)?$storedViewConfig['fixed_fonts']:[];
+  $columnMetaMap=[];foreach($columns as $columnMeta)$columnMetaMap[(string)$columnMeta['COLUMN_NAME']]=$columnMeta;
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
@@ -6324,12 +6572,16 @@ function page_select(mysqli $db): void {
       $storedDisplayLabel=trim((string)($storedLabelRules[$header]??''));
       $alignment=(string)($alignmentRules[$header]??'left');$headerClasses=[];if($alignment==='center')$headerClasses[]='text-center';elseif($alignment==='right')$headerClasses[]='text-end';else $headerClasses[]='text-start';if(!empty($fixedFontRules[$header]))$headerClasses[]='font-monospace';
       $storedAlignment=(string)($storedAlignmentRules[$header]??'left');if(!in_array($storedAlignment,['left','center','right'],true))$storedAlignment='left';
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      $headerMeta=$columnMetaMap[$header]??[];
+      $enumValues=(string)($headerMeta['DATA_TYPE']??'')==='enum'?ms_enum_values((string)($headerMeta['COLUMN_TYPE']??'')):[];
+      $enumJson=json_encode($enumValues,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($enumJson))$enumJson='[]';
+      $isSoftDeleteColumn=$softDeleteRule!==null&&$softDeleteRule['column']===$header;
+      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
-  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$relations,$returnQuery,$returnToken);
+  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
-  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="Delete the selected rows?">Delete selected</button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
   <?php if($hasMoreRows){ ?><div class="d-flex justify-content-center mt-2 no-print" data-ms-show-more data-next-offset="<?= h((string)$nextOffset) ?>" data-total="<?= h((string)$total) ?>">
     <div class="input-group input-group-sm" style="max-width:22rem">
       <button class="btn btn-outline-primary" type="button" data-ms-show-more-button><i class="fa-solid fa-angles-down me-1"></i>Show</button>
@@ -6564,8 +6816,17 @@ function page_select(mysqli $db): void {
           <div class="row g-3 mt-1"><div class="col-md-6"><label class="form-label" for="ms-soft-fk-id">Target ID column</label><select class="form-select" id="ms-soft-fk-id" name="soft_fk_id_column" disabled><option value="">Choose table first…</option></select></div><div class="col-md-6"><label class="form-label" for="ms-soft-fk-value">Field to display</label><select class="form-select" id="ms-soft-fk-value" name="soft_fk_value_column" disabled><option value="">Choose table first…</option></select></div></div>
           <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>This is display-only. MySQL referential integrity is not changed.</div>
         </div>
+
+        <div class="border rounded p-3 mt-3">
+          <div class="form-check form-switch ms-ios-switch"><input class="form-check-input" type="checkbox" role="switch" id="ms-soft-delete-enabled" name="soft_delete_enabled" value="1"><label class="form-check-label fw-semibold" for="ms-soft-delete-enabled">This column is a soft-delete value</label></div>
+          <div class="mt-3" data-ms-soft-delete-options hidden>
+            <div data-ms-soft-delete-enum-wrap hidden><label class="form-label" for="ms-soft-delete-enum">Value meaning deleted</label><select class="form-select" id="ms-soft-delete-enum" name="soft_delete_enum_index" disabled><option value="">Choose the deleted value…</option></select></div>
+            <div data-ms-soft-delete-text-wrap hidden><label class="form-label" for="ms-soft-delete-value">Value meaning deleted</label><input class="form-control code" id="ms-soft-delete-value" name="soft_delete_value" placeholder="For example: 1, deleted, yes" disabled><div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="ms-soft-delete-empty" name="soft_delete_empty" value="1" disabled><label class="form-check-label" for="ms-soft-delete-empty">Use the empty string as the deleted value</label></div></div>
+            <div class="form-text">Rows with this value appear grey and struck through. Deleting them again removes them permanently. One soft-delete column can be active per table. Soft-delete updates need a transactional table engine.</div>
+          </div>
+        </div>
       </div>
-      <div class="modal-footer justify-content-between"><button class="btn btn-outline-danger" type="submit" name="action" value="column_view_display_clear" data-confirm="Reset this column to its default display name, raw value, and visible state?"><i class="fa-solid fa-eraser me-1"></i>Reset to default</button><div><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-primary" type="submit" name="action" value="column_view_display_save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
+      <div class="modal-footer justify-content-between"><button class="btn btn-outline-danger" type="submit" name="action" value="column_view_display_clear" formnovalidate data-confirm="Reset this column's display, visibility, and soft-delete setting to defaults?"><i class="fa-solid fa-eraser me-1"></i>Reset to default</button><div><button class="btn btn-secondary" type="button" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-primary" type="submit" name="action" value="column_view_display_save"><i class="fa-solid fa-floppy-disk me-1"></i>Save</button></div></div>
     </form></div></div>
   </div>
   <script>
@@ -6588,6 +6849,14 @@ function page_select(mysqli $db): void {
     const softTable=document.getElementById('ms-soft-fk-table');
     const softId=document.getElementById('ms-soft-fk-id');
     const softValue=document.getElementById('ms-soft-fk-value');
+    const softDeleteEnabled=document.getElementById('ms-soft-delete-enabled');
+    const softDeleteOptions=viewModal.querySelector('[data-ms-soft-delete-options]');
+    const softDeleteEnumWrap=viewModal.querySelector('[data-ms-soft-delete-enum-wrap]');
+    const softDeleteTextWrap=viewModal.querySelector('[data-ms-soft-delete-text-wrap]');
+    const softDeleteEnum=document.getElementById('ms-soft-delete-enum');
+    const softDeleteText=document.getElementById('ms-soft-delete-value');
+    const softDeleteEmpty=document.getElementById('ms-soft-delete-empty');
+    let softDeleteIsEnum=false;
     const sections=Array.from(viewModal.querySelectorAll('[data-ms-display-section]'));
     let currentHeader=null;
     const setColumnLabels=column=>viewModal.querySelectorAll('[data-ms-modal-column]').forEach(el=>el.textContent=column);
@@ -6611,12 +6880,34 @@ function page_select(mysqli $db): void {
       sections.forEach(section=>section.hidden=section.dataset.msDisplaySection!==style);
     };
     const updateHideLabel=()=>{if(hideLabel)hideLabel.textContent=hideColumn&&hideColumn.checked?'Hidden':'Visible';};
+    const updateSoftDeleteFields=()=>{
+      const enabled=softDeleteEnabled.checked;
+      softDeleteOptions.hidden=!enabled;
+      softDeleteEnumWrap.hidden=!enabled||!softDeleteIsEnum;
+      softDeleteTextWrap.hidden=!enabled||softDeleteIsEnum;
+      softDeleteEnum.disabled=!enabled||!softDeleteIsEnum;
+      softDeleteEmpty.disabled=!enabled||softDeleteIsEnum;
+      softDeleteText.disabled=!enabled||softDeleteIsEnum||softDeleteEmpty.checked;
+      softDeleteEnum.required=enabled&&softDeleteIsEnum;
+      softDeleteText.required=enabled&&!softDeleteIsEnum&&!softDeleteEmpty.checked;
+    };
     const openViewSettings=async header=>{
       if(!header)return;
       currentHeader=header;
       viewForm.reset();
       const column=header.dataset.msColumn||'';
       viewForm.elements.config_column.value=column;setColumnLabels(column);
+      let enumValues=[];
+      try{const decoded=JSON.parse(header.dataset.msEnumValues||'[]');if(Array.isArray(decoded)&&decoded.every(value=>typeof value==='string'))enumValues=decoded;}catch(error){}
+      softDeleteIsEnum=enumValues.length>0;
+      softDeleteEnum.innerHTML='<option value="">Choose the deleted value…</option>';
+      enumValues.forEach((value,index)=>{const option=document.createElement('option');option.value=String(index+1);option.textContent=value===''?'(empty string)':value;softDeleteEnum.appendChild(option);});
+      softDeleteEnabled.checked=header.dataset.msSoftDeleteEnabled==='1';
+      const deletedValue=softDeleteEnabled.checked?header.dataset.msSoftDeleteValue||'':'';
+      softDeleteText.value=deletedValue;
+      softDeleteEmpty.checked=softDeleteEnabled.checked&&!softDeleteIsEnum&&deletedValue==='';
+      if(softDeleteIsEnum){const index=enumValues.indexOf(deletedValue);softDeleteEnum.value=index<0?'':String(index+1);}
+      updateSoftDeleteFields();
       displayLabel.value=header.dataset.msDisplayLabel||'';
       const alignment=header.dataset.msAlignment||'left';alignmentInputs.forEach(input=>input.checked=input.value===alignment);
       fixedFont.checked=header.dataset.msFixedFont==='1';
@@ -6658,6 +6949,8 @@ function page_select(mysqli $db): void {
       trigger.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){open(event);}});
     });
     hideColumn.addEventListener('change',updateHideLabel);
+    softDeleteEnabled.addEventListener('change',updateSoftDeleteFields);
+    softDeleteEmpty.addEventListener('change',updateSoftDeleteFields);
     displayStyle.addEventListener('change',()=>{updateSections();if(displayStyle.value==='soft_fk')loadSoftColumns(softTable.value,softId.dataset.selected||'',softValue.dataset.selected||'');});
     softTable.addEventListener('change',()=>{softId.dataset.selected='';softValue.dataset.selected='';loadSoftColumns(softTable.value);});
   });
