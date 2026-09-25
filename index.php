@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.16';
+const MS_VERSION = '1.15.17';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -10204,10 +10204,9 @@ function page_settings(): void {
       <?php } ?>
     </div></section>
 
-    <div class="d-flex flex-wrap gap-2"><button class="btn btn-primary" type="submit"><i class="fa-solid fa-floppy-disk me-1"></i>Save settings</button><button class="btn btn-secondary" type="button" id="ms-settings-reset"><i class="fa-solid fa-rotate-left me-1"></i>Restore defaults</button></div>
   </form><?php
   render_column_display_settings();
-  ?></div><?php
+  ?><div class="d-flex justify-content-end mt-3 mb-4"><button class="btn btn-secondary" type="button" id="ms-settings-reset"><i class="fa-solid fa-rotate-left me-1"></i>Restore defaults</button></div></div><?php
 }
 
 if (empty($_SESSION['ms_login'])) {
