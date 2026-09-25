@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.9';
+const MS_VERSION = '1.15.10';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5111,9 +5111,10 @@ function page_head(string $title, bool $authenticated): void {
     .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
     .ms-select-table-name:hover{color:var(--ms-accent);text-decoration:underline}
     .ms-select-table-name:focus-visible{outline:2px solid var(--ms-accent);outline-offset:3px;border-radius:.15rem}
-    .ms-select-row-count{padding-inline:.7rem;font-size:.7rem;line-height:1.1}
+    h1.ms-select-heading .ms-select-row-count.badge{display:inline-flex;align-items:center;justify-content:center;padding:.2rem .8rem;font-size:.7rem;line-height:1.1;white-space:nowrap}
     .ms-pretty-toggle{display:inline-flex;align-items:center;justify-content:center;width:1.75rem;height:1.75rem;padding:0;border-radius:50%;color:var(--bs-secondary-color);font-size:.8rem;line-height:1}
-    .ms-select-heading .ms-pretty-toggle{width:1.25rem;height:1.25rem;margin-left:.35rem;font-size:.35rem}
+    h1.ms-select-heading button.ms-pretty-toggle.btn{width:1.5rem;height:1.5rem;min-width:1.5rem;min-height:1.5rem;margin-left:.45rem;padding:0;font-size:.625rem;line-height:1}
+    h1.ms-select-heading button.ms-pretty-toggle.btn > i{font-size:.625rem;line-height:1}
     .ms-pretty-toggle:hover,.ms-pretty-toggle:focus,.ms-pretty-toggle[aria-pressed="true"]{color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.1)}
     [data-ms-save-widths][hidden]{display:none!important}
     .ms-data-table tr.ms-soft-deleted td[data-ms-column],.ms-data-table tr.ms-soft-deleted td[data-ms-column] :is(a,.cell-value,.badge,code,pre){color:var(--bs-secondary-color)!important;text-decoration:line-through}
