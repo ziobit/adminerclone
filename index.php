@@ -722,12 +722,30 @@ function ms_profile_table_icon(string $database, string $table, bool $isBaseTabl
   return ms_normalize_table_icon($tableConfig['icon'] ?? [], $isBaseTable);
 }
 
-function ms_profile_set_table_icon(string $database, string $table, string $style, string $name, string $color, bool $isBaseTable): void {
+function ms_profile_table_display_name(string $database, string $table): string {
+  $name = ms_profile_table_config($database, $table)['display_name'] ?? '';
+  return is_string($name) && trim($name) !== '' ? $name : $table;
+}
+
+function ms_profile_master_relation(string $database, string $table): ?array {
+  $relation = ms_profile_table_config($database, $table)['master_relation'] ?? null;
+  if (!is_array($relation)) return null;
+  foreach (['slave_table', 'slave_field', 'master_field'] as $key) {
+    if (!isset($relation[$key]) || !is_string($relation[$key]) || $relation[$key] === '') return null;
+  }
+  return $relation;
+}
+
+function ms_profile_set_table_options(string $database, string $table, string $style, string $name, string $color, bool $isBaseTable, string $displayName, ?array $relation): void {
   $color = strtolower(trim($color));
   $icon = ms_normalize_table_icon(['style' => $style, 'name' => $name, 'color' => $color], $isBaseTable);
   if ($icon['style'] !== $style || $icon['name'] !== $name || $icon['color'] !== $color) throw new RuntimeException('Invalid Font Awesome icon or color.');
-  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($icon): array {
+  ms_profile_update_table($database, $table, static function (array $tableConfig) use ($icon, $displayName, $relation): array {
     $tableConfig['icon'] = $icon;
+    if ($displayName !== '') $tableConfig['display_name'] = $displayName;
+    else unset($tableConfig['display_name']);
+    if ($relation !== null) $tableConfig['master_relation'] = $relation;
+    else unset($tableConfig['master_relation']);
     return $tableConfig;
   });
 }
@@ -1611,7 +1629,7 @@ function ms_render_number($value, int $decimals, string $prefix = '', string $su
   return '<span class="text-nowrap">' . h($prefix) . h($formatted) . h($suffix) . '</span>';
 }
 
-function ms_render_formatted_value($value, array $rule): string {
+function ms_render_formatted_value($value, array $rule, bool $selectCell = false, string $column = ''): string {
   $kind = (string)($rule['kind'] ?? '');
   if ($kind === 'null_display') {
     if ($value === null) {
@@ -1624,7 +1642,7 @@ function ms_render_formatted_value($value, array $rule): string {
     }
     return render_value($value);
   }
-  if ($value === null) return render_value(null);
+  if ($value === null && !($kind === 'json' && $selectCell)) return render_value(null);
 
   if ($kind === 'date' || $kind === 'datetime') {
     $format = (string)($rule['format'] ?? ($kind === 'date' ? 'd-m-Y' : 'd-m-Y H:i:s'));
@@ -1768,6 +1786,9 @@ function ms_render_formatted_value($value, array $rule): string {
   }
 
   if ($kind === 'json') {
+    if ($selectCell) {
+      return '<button class="btn btn-sm btn-outline-secondary ms-json-view-button" type="button" data-ms-view-json data-ms-json-column="' . h($column) . '" data-ms-json-null="' . ($value === null ? '1' : '0') . '" data-ms-json-value="' . h((string)$value) . '"><i class="fa-solid fa-code me-1" aria-hidden="true"></i>View JSON</button>';
+    }
     $text = (string)$value;
     $decoded = json_decode($text, true);
     if (json_last_error() !== JSON_ERROR_NONE) return render_value($value);
@@ -1927,7 +1948,7 @@ function ms_display_rule_from_post(string $style): array {
     if (!in_array($display, ['full', 'domain'], true)) throw new RuntimeException('Choose a valid URL display.');
     return ['kind' => 'url', 'display' => $display];
   }
-  if ($style === 'json') return ['kind' => 'json', 'collapsed' => p('json_collapsed') === '1'];
+  if ($style === 'json') return ['kind' => 'json'];
   if ($style === 'truncate') return ['kind' => 'truncate', 'length' => max(10, min(2000, (int)p('truncate_length', '120')))];
   if ($style === 'image_url') return ['kind' => 'image_url', 'width' => max(16, min(1024, (int)p('image_url_width', '96')))];
   if ($style === 'accounting') {
@@ -3467,7 +3488,21 @@ try {
           $table = p('table');
           if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
           $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
-          ms_profile_set_table_icon($database, $table, p('icon_style'), p('icon_name'), p('icon_color'), (string)($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE');
+          $displayName = trim(p('display_name'));
+          $displayLength = preg_match_all('/./us', $displayName);
+          if ($displayLength === false || $displayLength > 120 || preg_match('/[\x00-\x1f\x7f]/', $displayName)) throw new RuntimeException('Displayed table name must be at most 120 characters on one line.');
+          $relation = null;
+          if (p('master_enabled') === '1') {
+            $slaveTable = p('slave_table');
+            $slaveField = p('slave_field');
+            $masterField = p('master_field');
+            if ($slaveTable === '' || !table_exists($db, $slaveTable)) throw new RuntimeException('Choose an existing slave table or view.');
+            $masterColumns = array_column(table_columns($db, $table), 'COLUMN_NAME');
+            $slaveColumns = array_column(table_columns($db, $slaveTable), 'COLUMN_NAME');
+            if (!in_array($masterField, $masterColumns, true) || !in_array($slaveField, $slaveColumns, true)) throw new RuntimeException('Choose valid master and slave link fields.');
+            $relation = ['slave_table' => $slaveTable, 'slave_field' => $slaveField, 'master_field' => $masterField];
+          }
+          ms_profile_set_table_options($database, $table, p('icon_style'), p('icon_name'), p('icon_color'), (string)($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE', $displayName, $relation);
         } elseif ($configAction === 'save_table_order') {
           $database = selected_db();
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
@@ -4929,6 +4964,23 @@ function page_head(string $title, bool $authenticated): void {
     .ms-data-table tr.ms-soft-deleted td[data-ms-column] .badge{background:var(--bs-tertiary-bg)!important;border:1px solid var(--bs-border-color)}
     .ms-data-table tr.ms-soft-deleted td[data-ms-column] .progress{filter:grayscale(1);opacity:.65}
     .ms-data-table tr.ms-soft-deleted td[data-ms-column] img{filter:grayscale(1);opacity:.55}
+    .ms-data-table tr.ms-soft-deleted td[data-ms-column] .ms-json-view-button{color:var(--bs-secondary-color)!important;text-decoration:line-through}
+    .ms-soft-fk-link{display:inline-flex;align-items:center;gap:.3rem;max-width:100%;vertical-align:middle}
+    .ms-soft-fk-value{min-width:0;flex:0 1 auto}
+    .ms-soft-fk-link .cell-value{max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ms-row-soft-fk-link .cell-value{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}
+    .ms-soft-fk-link i{flex:none}
+    .ms-json-tree{max-height:60vh;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.875rem;line-height:1.5}
+    .ms-json-tree details>summary{cursor:pointer;padding:.08rem .25rem;border-radius:.25rem}
+    .ms-json-tree details>summary:hover{background:var(--bs-tertiary-bg)}
+    .ms-json-children{margin-left:.45rem;padding-left:1rem;border-left:1px solid var(--bs-border-color)}
+    .ms-json-leaf{padding:.08rem .25rem;white-space:pre-wrap;overflow-wrap:anywhere}
+    .ms-json-key{font-weight:600;color:var(--ms-accent)}
+    .ms-json-string{color:var(--bs-success-text-emphasis)}
+    .ms-json-number{color:var(--bs-primary-text-emphasis)}
+    .ms-json-boolean{color:var(--bs-warning-text-emphasis)}
+    .ms-json-null{color:var(--bs-secondary-color)}
+    .ms-json-raw{max-height:55vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
     html[data-density="standard"]{--ms-table-font-size:14px;--ms-table-line-height:1.3;--ms-table-pad-y:.42rem;--ms-table-pad-x:.55rem;--ms-cell-max-width:420px;--ms-cell-max-height:9rem}
     html[data-density="large"]{--sidebar:295px;--ms-table-font-size:16px;--ms-table-line-height:1.42;--ms-table-pad-y:.7rem;--ms-table-pad-x:.82rem;--ms-cell-max-width:560px;--ms-cell-max-height:12rem;--ms-sql-editor-font-size:1rem;--ms-sql-editor-min-height:280px;font-size:17px}html[data-density="large"] .main{padding:1.6rem}html[data-density="large"] .sidebar{padding:1.3rem!important}html[data-density="large"] .form-control,html[data-density="large"] .form-select,html[data-density="large"] .btn{font-size:1rem;padding:.58rem .8rem}html[data-density="large"] .card-body,html[data-density="large"] .card-header,html[data-density="large"] .card-footer{padding:1.25rem}html[data-density="large"] .nav-link,html[data-density="large"] .list-group-item{padding:.7rem .85rem}
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
@@ -4937,6 +4989,22 @@ function page_head(string $title, bool $authenticated): void {
     html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
     html[data-density="ultracompact"] .ms-db-tools .nav-link{line-height:1.1}html[data-density="ultracompact"] .ms-sidebar-object-name,html[data-density="ultracompact"] .ms-sidebar-object-action{padding-top:.08rem;padding-bottom:.08rem;line-height:1.1}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools .nav-link{line-height:1.15}html[data-density="compact"] .ms-sidebar-object-name,html[data-density="compact"] .ms-sidebar-object-action{padding-top:.18rem;padding-bottom:.18rem;line-height:1.15}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools .nav-link{line-height:1.25}html[data-density="large"] .ms-sidebar-object-name,html[data-density="large"] .ms-sidebar-object-action{padding-top:.7rem;padding-bottom:.7rem;line-height:1.25}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}.ms-ios-switch{padding-left:3.4rem;min-height:1.75rem}.ms-ios-switch .form-check-input{width:2.9rem;height:1.65rem;margin-left:-3.4rem;margin-top:.05rem;border-radius:999px;cursor:pointer;box-shadow:none}.ms-ios-switch .form-check-input:focus{box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.18)}.ms-ios-switch .form-check-label{cursor:pointer;line-height:1.75rem}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
+    .ms-mobile-sidebar-toggle,.ms-mobile-sidebar-close{display:none}
+    @media screen and (max-width:991.98px){
+      .sidebar{position:fixed;inset:0;z-index:1040;display:none;width:100%;height:100vh;height:100dvh;max-height:100dvh;overflow:auto;overscroll-behavior:contain;border-right:0;background:var(--bs-tertiary-bg)}
+      .sidebar .nav{flex-direction:column;flex-wrap:nowrap;overflow:visible}
+      .sidebar .nav-link{white-space:normal}
+      .main{margin-left:0;padding-top:3.75rem}
+      body.ms-mobile-sidebar-open .sidebar{display:block}
+      body.ms-mobile-sidebar-open .main{visibility:hidden}
+      .ms-mobile-sidebar-toggle{position:fixed;z-index:1039;top:calc(.5rem + env(safe-area-inset-top,0px));left:calc(.5rem + env(safe-area-inset-left,0px));display:inline-flex;align-items:center;justify-content:center;width:2.85rem;height:2.85rem;padding:0;border:0;border-radius:.5rem;background:transparent;color:var(--bs-body-color);font-size:1.45rem;line-height:1;touch-action:none;user-select:none;cursor:grab}
+      .ms-mobile-sidebar-toggle i{filter:drop-shadow(0 1px 1px var(--bs-body-bg))}
+      .ms-mobile-sidebar-toggle:hover,.ms-mobile-sidebar-toggle:focus-visible{background:var(--bs-tertiary-bg)}
+      .ms-mobile-sidebar-toggle:focus-visible,.ms-mobile-sidebar-close:focus-visible{outline:3px solid var(--ms-accent);outline-offset:2px}
+      .ms-mobile-sidebar-toggle.ms-dragging{cursor:grabbing}
+      body.ms-mobile-sidebar-open .ms-mobile-sidebar-toggle{display:none}
+      .ms-mobile-sidebar-close{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:2.5rem;height:2.5rem;padding:0}
+    }
   </style>
 </head>
 <body>
@@ -4966,13 +5034,106 @@ function page_head(string $title, bool $authenticated): void {
   });
 })();
 </script>
-<?php if ($authenticated) { render_sidebar(); ?><main class="main"><?php } else { ?><main class="container py-5"><?php }
+<?php if ($authenticated) { render_sidebar(); ?><button class="ms-mobile-sidebar-toggle" id="ms-mobile-sidebar-toggle" type="button" aria-controls="ms-sidebar" aria-expanded="false" aria-label="Open navigation" title="Open navigation"><i class="fa-solid fa-bars" aria-hidden="true"></i></button><main class="main"><?php } else { ?><main class="container py-5"><?php }
 }
 
 function page_foot(): void {
   ?></main>
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+(() => {
+  'use strict';
+  const sidebar=document.getElementById('ms-sidebar');
+  const toggle=document.getElementById('ms-mobile-sidebar-toggle');
+  const closeButton=sidebar?sidebar.querySelector('[data-ms-mobile-sidebar-close]'):null;
+  const main=document.querySelector('main.main');
+  if(!sidebar||!toggle||!closeButton||!main)return;
+  const mobile=window.matchMedia('(max-width: 991.98px)');
+  const positionKey='ms-mobile-sidebar-toggle-position';
+  let savedOverflow='';
+  let drag=null;
+  let suppressPointerClickUntil=0;
+  const place=(x,y)=>{
+    const margin=4;
+    const maxX=Math.max(margin,window.innerWidth-toggle.offsetWidth-margin);
+    const maxY=Math.max(margin,window.innerHeight-toggle.offsetHeight-margin);
+    toggle.style.left=Math.min(maxX,Math.max(margin,x))+'px';
+    toggle.style.top=Math.min(maxY,Math.max(margin,y))+'px';
+  };
+  const keepVisible=()=>{
+    if(!mobile.matches||!toggle.style.left||!toggle.style.top||document.body.classList.contains('ms-mobile-sidebar-open'))return;
+    place(Number.parseFloat(toggle.style.left),Number.parseFloat(toggle.style.top));
+  };
+  const setOpen=(open,returnFocus=false)=>{
+    const wasOpen=document.body.classList.contains('ms-mobile-sidebar-open');
+    open=Boolean(open&&mobile.matches);
+    document.body.classList.toggle('ms-mobile-sidebar-open',open);
+    toggle.setAttribute('aria-expanded',open?'true':'false');
+    main.inert=open;
+    sidebar.inert=mobile.matches&&!open;
+    if(mobile.matches)sidebar.setAttribute('aria-hidden',open?'false':'true');
+    else sidebar.removeAttribute('aria-hidden');
+    if(open){sidebar.setAttribute('role','dialog');sidebar.setAttribute('aria-modal','true');}
+    else{sidebar.removeAttribute('role');sidebar.removeAttribute('aria-modal');}
+    if(open&&!wasOpen){savedOverflow=document.body.style.overflow;document.body.style.overflow='hidden';closeButton.focus({preventScroll:true});}
+    if(!open&&wasOpen){document.body.style.overflow=savedOverflow;if(returnFocus&&mobile.matches)toggle.focus({preventScroll:true});}
+  };
+  const restorePosition=()=>{
+    if(!mobile.matches)return;
+    try{
+      const stored=JSON.parse(window.localStorage.getItem(positionKey)||'null');
+      if(stored&&Number.isFinite(stored.x)&&Number.isFinite(stored.y))place(stored.x,stored.y);
+    }catch(error){}
+  };
+  restorePosition();
+  setOpen(false);
+  toggle.addEventListener('pointerdown',event=>{
+    if(!mobile.matches||(event.pointerType==='mouse'&&event.button!==0))return;
+    const rect=toggle.getBoundingClientRect();
+    drag={id:event.pointerId,startX:event.clientX,startY:event.clientY,left:rect.left,top:rect.top,moved:false};
+    toggle.setPointerCapture(event.pointerId);
+  });
+  toggle.addEventListener('pointermove',event=>{
+    if(!drag||event.pointerId!==drag.id)return;
+    const dx=event.clientX-drag.startX,dy=event.clientY-drag.startY;
+    if(!drag.moved&&Math.hypot(dx,dy)<7)return;
+    drag.moved=true;
+    toggle.classList.add('ms-dragging');
+    place(drag.left+dx,drag.top+dy);
+    event.preventDefault();
+  });
+  const finishDrag=event=>{
+    if(!drag||event.pointerId!==drag.id)return;
+    if(drag.moved){
+      suppressPointerClickUntil=Date.now()+400;
+      try{window.localStorage.setItem(positionKey,JSON.stringify({x:Number.parseFloat(toggle.style.left),y:Number.parseFloat(toggle.style.top)}));}catch(error){}
+    }
+    toggle.classList.remove('ms-dragging');
+    drag=null;
+  };
+  toggle.addEventListener('pointerup',finishDrag);
+  toggle.addEventListener('pointercancel',finishDrag);
+  toggle.addEventListener('click',event=>{
+    if(event.detail>0&&Date.now()<suppressPointerClickUntil){event.preventDefault();event.stopPropagation();suppressPointerClickUntil=0;return;}
+    setOpen(true);
+  });
+  closeButton.addEventListener('click',()=>setOpen(false,true));
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&mobile.matches&&document.body.classList.contains('ms-mobile-sidebar-open')){event.preventDefault();setOpen(false,true);}});
+  sidebar.addEventListener('click',event=>{
+    if(!mobile.matches||!(event.target instanceof Element))return;
+    if(event.target.closest('a[href],button[type="submit"],input[type="submit"]'))window.setTimeout(()=>setOpen(false,true),0);
+  });
+  sidebar.addEventListener('change',event=>{
+    if(mobile.matches&&event.target instanceof Element&&event.target.matches('input,select'))setOpen(false,true);
+  });
+  mobile.addEventListener('change',()=>{setOpen(false);restorePosition();window.requestAnimationFrame(keepVisible);});
+  const onViewportResize=()=>window.requestAnimationFrame(keepVisible);
+  window.addEventListener('resize',onViewportResize);
+  if(window.visualViewport)window.visualViewport.addEventListener('resize',onViewportResize);
+  window.addEventListener('pageshow',()=>setOpen(false));
+})();
+</script>
 <script>
 (() => {
   'use strict';
@@ -5414,9 +5575,9 @@ function render_sidebar(): void {
   $hiddenSidebar = $dbName !== '' ? ms_profile_hidden_sidebar($dbName) : [];
   $databaseConfig = $dbName !== '' ? ms_profile_database_config($dbName) : [];
   $sidebarTableConfigs = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
-  ?><aside class="sidebar p-3">
+  ?><aside class="sidebar p-3" id="ms-sidebar" aria-label="Navigation">
     <div class="mb-3">
-      <div class="brand d-flex align-items-center gap-2"><a class="text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a><a class="badge text-bg-secondary fw-normal text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a></div>
+      <div class="d-flex align-items-center justify-content-between gap-2"><div class="brand d-flex align-items-center gap-2"><a class="text-decoration-none" href="?page=databases"><i class="fa-solid fa-cube me-2"></i><?= h(MS_APP_NAME) ?></a><a class="badge text-bg-secondary fw-normal text-decoration-none" href="<?= h(url(['ms_check_update' => '1'])) ?>" title="Check for new version">v<?= h(MS_VERSION) ?></a></div><button class="btn btn-outline-secondary ms-mobile-sidebar-close" type="button" data-ms-mobile-sidebar-close aria-label="Close navigation" title="Close navigation"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button></div>
       <div class="ms-raw-db-switch" title="Show raw database fields and values, temporarily ignoring all saved custom column views">
         <div class="form-check form-switch m-0 d-inline-flex align-items-center gap-2">
           <input class="form-check-input m-0" type="checkbox" role="switch" id="ms-raw-db-view"<?= $rawDbView ? ' checked' : '' ?>>
@@ -5437,9 +5598,11 @@ function render_sidebar(): void {
           $isBaseTable=(string)$t['TABLE_TYPE']==='BASE TABLE';
           $tableConfig=isset($sidebarTableConfigs[$name])&&is_array($sidebarTableConfigs[$name])?$sidebarTableConfigs[$name]:[];
           $sidebarIcon=ms_normalize_table_icon($tableConfig['icon']??[],$isBaseTable);
+          $sidebarLabel=isset($tableConfig['display_name'])&&is_string($tableConfig['display_name'])&&trim($tableConfig['display_name'])!==''?$tableConfig['display_name']:$name;
+          $sidebarTitle=$sidebarLabel===$name?$name:$sidebarLabel.' ('.$name.')';
           $sidebarObjectHidden=!empty($hiddenSidebar[$name]);
           ?><div class="ms-sidebar-object-row" data-ms-sidebar-object-key="<?= h($name) ?>"<?= (!$rawDbView && $sidebarObjectHidden) ? ' hidden' : '' ?>>
-            <a class="ms-sidebar-object-name text-truncate" title="<?= h($name) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="<?= h(ms_table_icon_class($sidebarIcon)) ?> fa-fw me-1" style="color:<?= h($sidebarIcon['color'] !== '' ? $sidebarIcon['color'] : 'inherit') ?>" data-ms-sidebar-object-icon data-icon-style="<?= h($sidebarIcon['style']) ?>" data-icon-name="<?= h($sidebarIcon['name']) ?>" data-icon-color="<?= h($sidebarIcon['color']) ?>"></i><span class="text-truncate"><?= h($name) ?></span></a>
+            <a class="ms-sidebar-object-name text-truncate" title="<?= h($sidebarTitle) ?> · Show content" href="?page=select&amp;table=<?= urlencode($name) ?>"><i class="<?= h(ms_table_icon_class($sidebarIcon)) ?> fa-fw me-1" style="color:<?= h($sidebarIcon['color'] !== '' ? $sidebarIcon['color'] : 'inherit') ?>" data-ms-sidebar-object-icon data-icon-style="<?= h($sidebarIcon['style']) ?>" data-icon-name="<?= h($sidebarIcon['name']) ?>" data-icon-color="<?= h($sidebarIcon['color']) ?>"></i><span class="text-truncate" data-ms-sidebar-object-label><?= h($sidebarLabel) ?></span></a>
             <span class="ms-sidebar-object-actions">
               <a class="ms-sidebar-object-action" href="?page=select&amp;table=<?= urlencode($name) ?>" title="Show content: <?= h($name) ?>" aria-label="Show content of <?= h($name) ?>"><i class="fa-solid fa-table-cells" aria-hidden="true"></i></a>
               <?php if ($isBaseTable) { ?><a class="ms-sidebar-object-action" href="?page=structure&amp;table=<?= urlencode($name) ?>" title="Alter structure: <?= h($name) ?>" aria-label="Alter structure of <?= h($name) ?>"><i class="fa-solid fa-screwdriver-wrench" aria-hidden="true"></i></a><?php } ?>
@@ -6228,7 +6391,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
       }
       ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>"<?php } ?><?= $cellClasses ? ' class="'.h(implode(' ', $cellClasses)).'"' : '' ?>><?php
       if (!$aggregated && isset($formatRules[$name]) && is_array($formatRules[$name])) {
-        echo ms_render_formatted_value($value, $formatRules[$name]);
+        echo ms_render_formatted_value($value, $formatRules[$name], true, $name);
       } elseif (!$aggregated && isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
         echo ms_render_image_value($value, $imageColumns[$name]);
       } elseif (!$aggregated && isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
@@ -6238,7 +6401,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
         $found = array_key_exists($key, $map);
         $display = $found ? $map[$key] : $value;
         $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
+        ?><a class="ms-soft-fk-link" href="<?= h($relUrl) ?>" title="Soft foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display) ?></span><i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small" aria-hidden="true"></i></a><?php
       } elseif ($colMeta && preg_match('/blob|binary/i', (string)$colMeta['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -6255,9 +6418,124 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
   return (string)ob_get_clean();
 }
 
+function ms_render_json_viewer_modal(): void {
+  ?>
+  <div class="modal fade" id="ms-json-view-modal" tabindex="-1" aria-labelledby="ms-json-view-title" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
+      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-json-view-title"><i class="fa-solid fa-code me-2" aria-hidden="true"></i>JSON viewer</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <div class="small text-body-secondary mb-2" data-ms-json-column></div>
+        <div class="alert alert-danger d-none" role="alert" data-ms-json-error></div>
+        <div class="ms-json-tree border rounded p-3" data-ms-json-tree></div>
+        <div class="small text-body-secondary mt-2 d-none" data-ms-json-limit>Only part of this JSON fits in the tree. The complete value is available below.</div>
+        <details class="mt-3" data-ms-json-raw-details><summary class="btn btn-sm btn-outline-secondary">Raw value</summary><pre class="ms-json-raw code bg-body-tertiary border rounded p-3 mt-2 mb-0" data-ms-json-raw></pre></details>
+      </div>
+    </div></div>
+  </div>
+  <script>
+  (()=>{
+    'use strict';
+    const modal=document.getElementById('ms-json-view-modal');
+    if(!modal)return;
+    const fieldLabel=modal.querySelector('[data-ms-json-column]');
+    const errorBox=modal.querySelector('[data-ms-json-error]');
+    const tree=modal.querySelector('[data-ms-json-tree]');
+    const limitNote=modal.querySelector('[data-ms-json-limit]');
+    const rawDetails=modal.querySelector('[data-ms-json-raw-details]');
+    const rawValue=modal.querySelector('[data-ms-json-raw]');
+    const maxNodes=5000;
+    const maxDepth=80;
+    let renderToken=0;
+    const addLabel=(parent,label)=>{
+      if(label===null)return;
+      const key=document.createElement('span');
+      key.className='ms-json-key';
+      key.textContent=typeof label==='number'?`[${label}]`:JSON.stringify(label);
+      parent.append(key,document.createTextNode(': '));
+    };
+    const addNode=(parent,label,value,depth,state)=>{
+      if(state.nodes>=maxNodes){state.limited=true;return;}
+      state.nodes++;
+      if(value!==null&&typeof value==='object'){
+        const entries=Object.entries(value);
+        const branch=document.createElement('details');
+        branch.className='ms-json-branch';
+        branch.open=depth===0;
+        const summary=document.createElement('summary');
+        addLabel(summary,label);
+        summary.appendChild(document.createTextNode(Array.isArray(value)?`Array (${entries.length} items)`:`Object (${entries.length} properties)`));
+        branch.appendChild(summary);
+        const children=document.createElement('div');
+        children.className='ms-json-children';
+        if(depth>=maxDepth){
+          children.textContent='Tree depth limit reached. See the raw value below.';
+          state.limited=true;
+        }else if(entries.length===0){
+          children.textContent=Array.isArray(value)?'[]':'{}';
+        }else{
+          for(const [key,child] of entries){
+            if(state.nodes>=maxNodes){state.limited=true;break;}
+            addNode(children,Array.isArray(value)?Number(key):key,child,depth+1,state);
+          }
+        }
+        branch.appendChild(children);
+        parent.appendChild(branch);
+        return;
+      }
+      const line=document.createElement('div');
+      line.className='ms-json-leaf';
+      addLabel(line,label);
+      const literal=document.createElement('span');
+      literal.className=value===null?'ms-json-null':typeof value==='string'?'ms-json-string':typeof value==='number'?'ms-json-number':'ms-json-boolean';
+      literal.textContent=JSON.stringify(value);
+      line.appendChild(literal);
+      parent.appendChild(line);
+    };
+    document.addEventListener('click',event=>{
+      const button=event.target instanceof Element?event.target.closest('[data-ms-view-json]'):null;
+      if(!button)return;
+      event.preventDefault();
+      event.stopPropagation();
+      const token=++renderToken;
+      const text=button.dataset.msJsonValue||'';
+      const sqlNull=button.dataset.msJsonNull==='1';
+      const column=button.dataset.msJsonColumn||button.closest('td[data-ms-column]')?.dataset.msColumn||'';
+      fieldLabel.textContent=column?`Database field: ${column}`:'';
+      rawValue.textContent=sqlNull?'SQL NULL':text;
+      rawDetails.open=false;
+      errorBox.classList.add('d-none');
+      limitNote.classList.add('d-none');
+      tree.classList.remove('d-none');
+      tree.textContent=sqlNull?'SQL NULL: no JSON document is stored in this field.':'Loading JSON…';
+      bootstrap.Modal.getOrCreateInstance(modal).show();
+      if(sqlNull){rawDetails.open=true;return;}
+      setTimeout(()=>{
+        if(token!==renderToken)return;
+        try{
+          const parsed=JSON.parse(text);
+          const state={nodes:0,limited:false};
+          const fragment=document.createDocumentFragment();
+          addNode(fragment,null,parsed,0,state);
+          tree.replaceChildren(fragment);
+          limitNote.classList.toggle('d-none',!state.limited);
+        }catch(error){
+          tree.classList.add('d-none');
+          errorBox.textContent=`Invalid JSON: ${error instanceof Error?error.message:'The stored value could not be parsed.'} The original value is shown below.`;
+          errorBox.classList.remove('d-none');
+          rawDetails.open=true;
+        }
+      },0);
+    });
+  })();
+  </script>
+  <?php
+}
+
 function page_select(mysqli $db): void {
   $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
   $tableIcon=ms_profile_table_icon(selected_db(),$table,$editable);
+  $tableDisplayName=ms_profile_table_display_name(selected_db(),$table);
+  $masterRelation=ms_profile_master_relation(selected_db(),$table);
   $iconPalette=[
     '#ef4444'=>'Red','#f97316'=>'Orange','#f59e0b'=>'Amber','#eab308'=>'Yellow',
     '#84cc16'=>'Lime','#22c55e'=>'Green','#10b981'=>'Emerald','#14b8a6'=>'Teal',
@@ -6280,7 +6558,7 @@ function page_select(mysqli $db): void {
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
   $prettyEdit=!$aggregated&&ms_profile_edit_pretty_view(selected_db(),$table);
-  $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" data-icon-color="'.h($tableIcon['color']).'" title="Change table icon" aria-label="Change icon for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" style="color:'.h($tableIcon['color'] !== '' ? $tableIcon['color'] : 'inherit').'" data-ms-current-table-icon aria-hidden="true"></i></button>';
+  $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" data-icon-color="'.h($tableIcon['color']).'" data-display-name="'.h($tableDisplayName===$table?'':$tableDisplayName).'" data-master-enabled="'.($masterRelation===null?'0':'1').'" data-slave-table="'.h((string)($masterRelation['slave_table']??'')).'" data-slave-field="'.h((string)($masterRelation['slave_field']??'')).'" data-master-field="'.h((string)($masterRelation['master_field']??'')).'" title="Table display and relations" aria-label="Edit display and relations for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" style="color:'.h($tableIcon['color'] !== '' ? $tableIcon['color'] : 'inherit').'" data-ms-current-table-icon aria-hidden="true"></i></button>';
   $prettyToggle=$aggregated?'':'<button class="btn btn-sm ms-pretty-toggle no-print" type="button" data-ms-pretty-toggle data-ms-table="'.h($table).'" aria-pressed="'.($prettyEdit?'true':'false').'" title="'.($prettyEdit?'Edit Pretty View: switch to Pretty View':'Pretty View: edit header layout and appearance').'" aria-label="'.($prettyEdit?'Edit Pretty View. Switch to Pretty View':'Pretty View. Enable Edit Pretty View').'"><i class="fa-solid '.($prettyEdit?'fa-pen-to-square':'fa-eye').'" aria-hidden="true"></i></button>';
   $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
@@ -6289,8 +6567,17 @@ function page_select(mysqli $db): void {
   ?>
   <div class="modal fade" id="ms-table-icon-modal" tabindex="-1" aria-labelledby="ms-table-icon-modal-title" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
-      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-table-icon-modal-title"><i class="fa-solid fa-icons me-2"></i>Choose table icon</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-header"><h2 class="modal-title fs-5" id="ms-table-icon-modal-title"><i class="fa-solid fa-table me-2"></i>Table display and relations</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body">
+        <div class="mb-3"><label class="form-label" for="ms-table-display-name">Displayed table name</label><input class="form-control" id="ms-table-display-name" type="text" maxlength="120" placeholder="<?= h($table) ?>" autocomplete="off"><div class="form-text">Shown in the left sidebar. Leave blank to use the table name.</div></div>
+        <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" role="switch" id="ms-table-master-enabled"><label class="form-check-label" for="ms-table-master-enabled">Master table</label></div>
+        <div id="ms-table-master-fields" class="border rounded p-3 mb-3" hidden>
+          <div class="row g-3">
+            <div class="col-md-4"><label class="form-label" for="ms-table-slave-table">Slave table</label><select class="form-select" id="ms-table-slave-table"><option value="">Choose table or view…</option><?php foreach($softTargetTables as $targetTable){ ?><option value="<?= h($targetTable) ?>"><?= h($targetTable) ?></option><?php } ?></select></div>
+            <div class="col-md-4"><label class="form-label" for="ms-table-slave-field">Slave field link</label><select class="form-select" id="ms-table-slave-field"><option value="">Choose a slave table first…</option></select></div>
+            <div class="col-md-4"><label class="form-label" for="ms-table-master-field">Master field link</label><select class="form-select" id="ms-table-master-field"><option value="">Choose field…</option><?php foreach($columns as $linkColumn){ ?><option value="<?= h((string)$linkColumn['COLUMN_NAME']) ?>"><?= h((string)$linkColumn['COLUMN_NAME']) ?></option><?php } ?></select></div>
+          </div><div class="form-text mt-2">Rows with a matching slave field value appear below each master row.</div>
+        </div>
         <section class="border rounded p-3 mb-3" aria-labelledby="ms-table-icon-color-title">
           <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2"><div class="fw-semibold" id="ms-table-icon-color-title"><i class="fa-solid fa-palette me-2"></i>Icon color</div><span class="small text-body-secondary" id="ms-table-icon-color-value">Theme/default</span></div>
           <div class="ms-icon-color-palette" role="group" aria-label="Icon color choices">
@@ -6321,6 +6608,40 @@ function page_select(mysqli $db): void {
     const empty=document.getElementById('ms-table-icon-empty');
     const selectedLabel=document.getElementById('ms-table-icon-selected');
     const save=document.getElementById('ms-table-icon-save');
+    const displayName=document.getElementById('ms-table-display-name');
+    const masterEnabled=document.getElementById('ms-table-master-enabled');
+    const masterFields=document.getElementById('ms-table-master-fields');
+    const slaveTable=document.getElementById('ms-table-slave-table');
+    const slaveField=document.getElementById('ms-table-slave-field');
+    const masterField=document.getElementById('ms-table-master-field');
+    let slaveRequest=0;
+    const updateMasterFields=()=>{
+      masterFields.hidden=!masterEnabled.checked;
+      [slaveTable,slaveField,masterField].forEach(select=>{select.disabled=!masterEnabled.checked;});
+    };
+    const loadSlaveFields=async preferred=>{
+      const table=slaveTable.value;
+      const request=++slaveRequest;
+      slaveField.replaceChildren(new Option(table?'Loading fields…':'Choose a slave table first…',''));
+      slaveField.disabled=true;
+      if(!table)return;
+      try{
+        const response=await fetch('?ajax=soft_fk_columns&table='+encodeURIComponent(table),{credentials:'same-origin',headers:{'Accept':'application/json'}});
+        const data=await response.json();
+        if(!response.ok||!data.ok||!Array.isArray(data.columns))throw new Error(data.error||'Unable to load slave fields.');
+        if(request!==slaveRequest)return;
+        slaveField.replaceChildren(new Option('Choose field…',''));
+        data.columns.forEach(column=>slaveField.add(new Option(column,column)));
+        if(data.columns.includes(preferred))slaveField.value=preferred;
+        slaveField.disabled=!masterEnabled.checked;
+      }catch(error){
+        if(request!==slaveRequest)return;
+        slaveField.replaceChildren(new Option('Unable to load fields',''));
+        alert(error&&error.message?error.message:'Unable to load slave fields.');
+      }
+    };
+    masterEnabled.addEventListener('change',()=>{updateMasterFields();if(masterEnabled.checked&&slaveTable.value&&slaveField.options.length<2)loadSlaveFields(trigger.dataset.slaveField||'');});
+    slaveTable.addEventListener('change',()=>loadSlaveFields(''));
     const colorChoices=Array.from(modal.querySelectorAll('[data-ms-icon-color]'));
     const colorPicker=document.getElementById('ms-table-icon-color-picker');
     const customColor=document.getElementById('ms-table-icon-custom-color');
@@ -6422,28 +6743,43 @@ function page_select(mysqli $db): void {
       selectedStyle=trigger.dataset.iconStyle||'solid';
       selectedName=trigger.dataset.iconName||'table';
       selectedColor=normalizeColor(trigger.dataset.iconColor||'');
+      displayName.value=trigger.dataset.displayName||'';
+      masterEnabled.checked=trigger.dataset.masterEnabled==='1';
+      slaveTable.value=trigger.dataset.slaveTable||'';
+      masterField.value=trigger.dataset.masterField||'';
+      updateMasterFields();
+      loadSlaveFields(trigger.dataset.slaveField||'');
       colorPicker.value=selectedColor||'#3b82f6';
       search.value='';
       buildGrid();
       applyFilter();
       updateSelection();
       setTimeout(()=>{
-        search.focus();
-        const active=entries.find(entry=>entry.style===selectedStyle&&entry.name===selectedName);
-        if(active)active.button.scrollIntoView({block:'center'});
+        displayName.focus();
       },150);
     });
     search.addEventListener('input',applyFilter);
     clearSearch.addEventListener('click',()=>{search.value='';applyFilter();search.focus();});
     save.addEventListener('click',async()=>{
+      const alias=displayName.value.trim();
+      if(masterEnabled.checked&&(!slaveTable.value||!slaveField.value||!masterField.value)){
+        alert('Choose a slave table, slave field link and master field link.');
+        (!slaveTable.value?slaveTable:!slaveField.value?slaveField:masterField).focus();
+        return;
+      }
       save.disabled=true;
       const original=save.innerHTML;
       save.innerHTML='<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span>Saving…';
       try{
-        await window.msConfigPost('table_icon',{table:trigger.dataset.msTable||'',icon_style:selectedStyle,icon_name:selectedName,icon_color:selectedColor});
+        await window.msConfigPost('table_icon',{table:trigger.dataset.msTable||'',icon_style:selectedStyle,icon_name:selectedName,icon_color:selectedColor,display_name:alias,master_enabled:masterEnabled.checked?'1':'0',slave_table:slaveTable.value,slave_field:slaveField.value,master_field:masterField.value});
         trigger.dataset.iconStyle=selectedStyle;
         trigger.dataset.iconName=selectedName;
         trigger.dataset.iconColor=selectedColor;
+        trigger.dataset.displayName=alias;
+        trigger.dataset.masterEnabled=masterEnabled.checked?'1':'0';
+        trigger.dataset.slaveTable=masterEnabled.checked?slaveTable.value:'';
+        trigger.dataset.slaveField=masterEnabled.checked?slaveField.value:'';
+        trigger.dataset.masterField=masterEnabled.checked?masterField.value:'';
         const titleIcon=trigger.querySelector('[data-ms-current-table-icon]');
         if(titleIcon){
           titleIcon.className=iconClass(selectedStyle,selectedName)+' fs-5';
@@ -6458,10 +6794,14 @@ function page_select(mysqli $db): void {
           sidebarIcon.dataset.iconStyle=selectedStyle;
           sidebarIcon.dataset.iconName=selectedName;
           sidebarIcon.dataset.iconColor=selectedColor;
+          const sidebarLabel=row.querySelector('[data-ms-sidebar-object-label]');
+          if(sidebarLabel)sidebarLabel.textContent=alias||trigger.dataset.msTable||'';
+          const sidebarLink=row.querySelector('.ms-sidebar-object-name');
+          if(sidebarLink)sidebarLink.title=(alias?alias+' ('+(trigger.dataset.msTable||'')+')':trigger.dataset.msTable||'')+' · Show content';
         });
         bootstrap.Modal.getOrCreateInstance(modal).hide();
       }catch(error){
-        alert(error&&error.message?error.message:'Unable to save the table icon.');
+        alert(error&&error.message?error.message:'Unable to save the table settings.');
       }finally{
         save.disabled=false;
         save.innerHTML=original;
@@ -6630,7 +6970,7 @@ function page_select(mysqli $db): void {
           <option value="coordinates">Coordinates → map</option>
           <option value="ip">IP address</option>
           <option value="color">Color swatch</option>
-          <option value="json">Pretty JSON</option>
+          <option value="json">JSON tree viewer</option>
           <option value="truncate">Long-text preview</option>
           <option value="multiline">Multiline text</option>
           <option value="html">Trusted HTML</option>
@@ -6761,7 +7101,7 @@ function page_select(mysqli $db): void {
         </div>
 
         <div class="border rounded p-3 mt-3" data-ms-display-section="json" hidden>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" id="ms-json-collapsed" name="json_collapsed" value="1" checked><label class="form-check-label" for="ms-json-collapsed">Collapsed behind a “View JSON” button</label></div>
+          <div class="small text-body-secondary">Table cells show a View JSON button. Click it to inspect a tree of the stored value. Invalid JSON opens the same viewer with an error and the original value.</div>
         </div>
 
         <div class="border rounded p-3 mt-3" data-ms-display-section="truncate" hidden>
@@ -6928,7 +7268,7 @@ function page_select(mysqli $db): void {
       setField('percentage_input',rule.input||'value');setField('percentage_decimals',rule.decimals!==undefined?rule.decimals:1);setField('percentage_progress',rule.progress);
       setField('duration_input',rule.input||'seconds');
       setField('file_size_input',rule.input||'bytes');setField('file_size_decimals',rule.decimals!==undefined?rule.decimals:2);
-      setField('url_display',rule.display||'full');setField('json_collapsed',rule.collapsed!==undefined?rule.collapsed:true);setField('truncate_length',rule.length||120);
+      setField('url_display',rule.display||'full');setField('truncate_length',rule.length||120);
       setField('image_url_width',rule.width||96);
       setField('accounting_currency',rule.currency||'');setField('accounting_decimals',rule.decimals!==undefined?rule.decimals:2);
       setField('compact_decimals',rule.decimals!==undefined?rule.decimals:2);setField('number_decimals',rule.decimals!==undefined?rule.decimals:0);
@@ -6955,6 +7295,7 @@ function page_select(mysqli $db): void {
     softTable.addEventListener('change',()=>{softId.dataset.selected='';softValue.dataset.selected='';loadSoftColumns(softTable.value);});
   });
   </script>
+  <?php ms_render_json_viewer_modal(); ?>
   <?php } ?>
   <script>
   (()=>{
@@ -7182,7 +7523,7 @@ function page_row(mysqli $db): void {
       $visibleLabel = $customLabel !== '' ? $customLabel : $name;
       ?><tr><th><div><?= h($visibleLabel) ?></div><?php if ($customLabel !== '') { ?><div class="small text-body-secondary code"><?= h($name) ?></div><?php } ?></th><td><?php
       if (isset($formatRules[$name]) && is_array($formatRules[$name])) {
-        echo ms_render_formatted_value($value, $formatRules[$name]);
+        echo ms_render_formatted_value($value, $formatRules[$name], true, $name);
       } elseif (isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
         echo ms_render_image_value($value, $imageColumns[$name]);
       } elseif (isset($softFkRules[$name]) && is_array($softFkRules[$name]) && $value !== null) {
@@ -7192,7 +7533,7 @@ function page_row(mysqli $db): void {
         $found = array_key_exists($key, $map);
         $display = $found ? $map[$key] : $value;
         $relUrl = '?' . http_build_query(['page'=>'select','table'=>(string)($soft['table']??''),'filter_col'=>[(string)($soft['id_column']??'')],'filter_op'=>['='],'filter_val'=>[(string)$value]]);
-        ?><a href="<?= h($relUrl) ?>" title="Virtual foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><?= render_value($display, MS_MAX_CELL_BYTES) ?> <i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small"></i></a><?php
+        ?><a class="ms-soft-fk-link ms-row-soft-fk-link" href="<?= h($relUrl) ?>" title="Virtual foreign key: <?= h($name) ?> = <?= h((string)$value) ?>"><span class="ms-soft-fk-value"><?= render_value($display, MS_MAX_CELL_BYTES) ?></span><i class="fa-solid <?= $found?'fa-link':'fa-link-slash' ?> small" aria-hidden="true"></i></a><?php
       } elseif (preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) && $value !== null) {
         ?><a href="?download=blob&amp;table=<?= urlencode($table) ?>&amp;column=<?= urlencode($name) ?>&amp;id=<?= urlencode($encoded) ?>"><i class="fa-solid fa-download me-1"></i><?= h(strlen((string)$value)) ?> bytes</a><?php
       } elseif (isset($relations[$name]) && $value !== null) {
@@ -7206,6 +7547,42 @@ function page_row(mysqli $db): void {
     }
     if ($shown === 0) { ?><tr><td colspan="3" class="text-center text-body-secondary p-4">Every column is hidden by the current viewing rules. Enable Raw DB view to see the complete row.</td></tr><?php }
     ?></tbody></table></div></div><?php
+    $masterRelation = ms_profile_master_relation(selected_db(), $table);
+    if ($masterRelation !== null) {
+      $slaveTable = $masterRelation['slave_table'];
+      $slaveField = $masterRelation['slave_field'];
+      $masterField = $masterRelation['master_field'];
+      $slaveColumns = table_exists($db, $slaveTable) ? table_columns($db, $slaveTable) : [];
+      $slaveColumnNames = array_values(array_map('strval', array_column($slaveColumns, 'COLUMN_NAME')));
+      $masterColumnNames = array_values(array_map('strval', array_column($columns, 'COLUMN_NAME')));
+      if (!in_array($masterField, $masterColumnNames, true) || !in_array($slaveField, $slaveColumnNames, true)) {
+        ?><div class="alert alert-warning mt-3 mb-0">The saved master/slave link refers to a missing table or field. Update it in the table settings.</div><?php
+      } else {
+        $slaveIdentityNames = primary_columns($db, $slaveTable) ?: $slaveColumnNames;
+        $slaveReturnToken = ms_encode_navigation(['page' => 'select', 'table' => $slaveTable]);
+        $slaveSoftDeleteRule = ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $slaveTable), $slaveColumns);
+        $slaveRows = null;
+        if ($values[$masterField] !== null) {
+          $slaveRows = $db->query('SELECT * FROM ' . qi($slaveTable) . ' WHERE ' . qi($slaveField) . ' = ' . qs($db, $values[$masterField]), MYSQLI_USE_RESULT);
+          if (!$slaveRows instanceof mysqli_result) throw new RuntimeException('Unable to load the related slave rows: ' . $db->error);
+        }
+        ?><div class="card mt-3"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Slave rows: <?= h($slaveTable) ?></strong><span class="small text-body-secondary"><?= h($slaveField) ?> = <?= h($masterField) ?></span></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0 ms-data-table"><thead><tr><th scope="col">View</th><?php foreach ($slaveColumnNames as $slaveColumnName) { ?><th scope="col"><?= h($slaveColumnName) ?></th><?php } ?></tr></thead><tbody><?php
+        $slaveCount = 0;
+        if ($slaveRows instanceof mysqli_result) {
+          while ($slaveRow = $slaveRows->fetch_assoc()) {
+            $slaveCount++;
+            $slaveIdentity = [];
+            foreach ($slaveIdentityNames as $identityName) $slaveIdentity[$identityName] = $slaveRow[$identityName] ?? null;
+            $slaveUrl = '?' . http_build_query(['page' => 'row', 'mode' => 'view', 'table' => $slaveTable, 'id' => encode_identity($slaveIdentity), 'return_to' => $slaveReturnToken]);
+            ?><tr<?= ms_row_is_soft_deleted($slaveRow, $slaveSoftDeleteRule) ? ' class="ms-soft-deleted"' : '' ?>><td><a class="btn btn-sm btn-outline-secondary" href="<?= h($slaveUrl) ?>" aria-label="View row in <?= h($slaveTable) ?>"><i class="fa-solid fa-eye" aria-hidden="true"></i></a></td><?php foreach ($slaveColumnNames as $slaveColumnName) { ?><td data-ms-column="<?= h($slaveColumnName) ?>"><?= render_value($slaveRow[$slaveColumnName] ?? null, MS_MAX_CELL_BYTES) ?></td><?php } ?></tr><?php
+          }
+          $slaveRows->free();
+        }
+        if ($slaveCount === 0) { ?><tr><td class="text-center text-body-secondary p-4" colspan="<?= count($slaveColumnNames) + 1 ?>">No related slave rows.</td></tr><?php }
+        ?></tbody></table></div><div class="card-footer small text-body-secondary"><?= number_format($slaveCount) ?> related row(s)</div></div><?php
+      }
+    }
+    ms_render_json_viewer_modal();
     return;
   }
 
