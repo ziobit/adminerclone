@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.14';
+const MS_VERSION = '1.15.15';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5335,8 +5335,10 @@ function page_head(string $title, bool $authenticated): void {
     .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
     .ms-sql-editor-wrap{position:relative;border-radius:var(--bs-border-radius);background:var(--bs-body-bg)}.ms-sql-highlight{position:absolute;inset:0;z-index:1;margin:0;box-sizing:border-box;border-style:solid;border-color:transparent;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--bs-body-color);background:var(--bs-body-bg);border-radius:inherit}.ms-smart-sql-input{position:relative;z-index:2;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--bs-body-color);resize:vertical}.ms-smart-sql-input::selection{background:rgba(var(--ms-accent-rgb),.28)}.ms-sql-highlight .sql-k{color:#7c3aed;font-weight:700}.ms-sql-highlight .sql-t{color:#0f766e;font-weight:600}.ms-sql-highlight .sql-f{color:#2563eb}.ms-sql-highlight .sql-s{color:#b45309}.ms-sql-highlight .sql-i{color:#be185d}.ms-sql-highlight .sql-c{color:#6b7280;font-style:italic}.ms-sql-highlight .sql-n{color:#0891b2}.ms-sql-highlight .sql-v{color:#9333ea}.ms-sql-highlight .sql-o{color:#dc2626}.ms-sql-autocomplete{position:absolute;z-index:1200;min-width:280px;max-width:min(460px,calc(100% - 8px));max-height:280px;overflow:auto;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);box-shadow:0 .8rem 2.2rem rgba(0,0,0,.22);padding:.3rem}.ms-sql-autocomplete[hidden]{display:none!important}.ms-sql-suggestion{display:flex;align-items:center;gap:.6rem;width:100%;border:0;border-radius:.35rem;background:transparent;color:var(--bs-body-color);text-align:left;padding:.48rem .6rem}.ms-sql-suggestion:hover,.ms-sql-suggestion.active{background:rgba(var(--ms-accent-rgb),.12)}.ms-sql-suggestion-icon{width:1.35rem;text-align:center;color:var(--ms-accent)}.ms-sql-suggestion-main{min-width:0;flex:1}.ms-sql-suggestion-name{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-suggestion-meta{display:block;font-size:.75em;color:var(--bs-secondary-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-autocomplete-title{padding:.25rem .55rem .35rem;color:var(--bs-secondary-color);font-size:.75em;text-transform:uppercase;letter-spacing:.06em;font-weight:700}html[data-bs-theme="dark"] .ms-sql-highlight .sql-k{color:#c4b5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-t{color:#5eead4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-f{color:#93c5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-s{color:#fbbf24}html[data-bs-theme="dark"] .ms-sql-highlight .sql-i{color:#f9a8d4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-c{color:#94a3b8}html[data-bs-theme="dark"] .ms-sql-highlight .sql-n{color:#67e8f9}html[data-bs-theme="dark"] .ms-sql-highlight .sql-v{color:#d8b4fe}html[data-bs-theme="dark"] .ms-sql-highlight .sql-o{color:#fca5a5}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
-    .ms-settings-save-sticky{position:sticky;top:0;z-index:1030;display:flex;justify-content:flex-end;align-items:center;min-height:3.25rem;margin-bottom:.75rem;padding:.4rem .5rem;border:1px solid var(--bs-border-color);border-radius:.5rem;background:var(--bs-body-bg);box-shadow:0 .25rem .75rem rgba(0,0,0,.08)}
-    @media(max-width:767.98px){.ms-settings-save-sticky{top:3.75rem}}
+    .ms-settings-save-sticky{position:sticky;top:0;z-index:1030;display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"title save" "subtitle save";align-items:center;column-gap:1rem;row-gap:.1rem;margin-bottom:1rem;padding:.75rem 1rem;border:1px solid var(--bs-border-color);border-radius:.5rem;background:var(--bs-body-bg);box-shadow:0 .25rem .75rem rgba(0,0,0,.08)}
+    .ms-settings-save-sticky h1{grid-area:title}.ms-settings-subtitle{grid-area:subtitle;min-width:0}.ms-settings-save-sticky button{grid-area:save}
+    @media(max-width:991.98px){.ms-settings-save-sticky{top:3.75rem}}
+    @media(max-width:575.98px){.ms-settings-save-sticky{grid-template-areas:"title save" "subtitle subtitle";padding:.65rem .75rem}}
     html[data-pagination-position="top"] [data-ms-pagination="bottom"]{display:none!important}html[data-pagination-position="bottom"] [data-ms-pagination="top"]{display:none!important}.ms-date-editor .ms-picker-input[hidden],.ms-date-editor .ms-manual-input[hidden]{display:none!important}.ms-date-editor .ms-picker-toggle{min-width:2.45rem;padding-left:.55rem;padding-right:.55rem}.ms-date-editor .ms-picker-toggle i{margin:0!important}.ms-db-tools{align-items:flex-start;gap:0!important;font-size:.875em}.ms-db-tools .nav-link{display:inline-flex;align-items:center;width:auto!important;max-width:100%;white-space:nowrap;line-height:1.2}.ms-db-tools .nav-link i{font-size:1em}.ms-page-jump-item{display:flex;align-items:stretch}.ms-page-jump{width:5.25rem;min-width:5.25rem;text-align:center;border-radius:0!important;border-color:var(--bs-border-color);padding-left:.35rem!important;padding-right:.35rem!important}.ms-page-jump:focus{position:relative;z-index:4}.ms-page-jump-current{font-weight:700;color:var(--ms-link)}
     html[data-density="ultracompact"] .ms-db-tools .nav-link{line-height:1.1}html[data-density="ultracompact"] .ms-sidebar-object-name,html[data-density="ultracompact"] .ms-sidebar-object-action{padding-top:.08rem;padding-bottom:.08rem;line-height:1.1}html[data-density="ultracompact"] .ms-page-jump{width:4.25rem;min-width:4.25rem}html[data-density="compact"] .ms-db-tools .nav-link{line-height:1.15}html[data-density="compact"] .ms-sidebar-object-name,html[data-density="compact"] .ms-sidebar-object-action{padding-top:.18rem;padding-bottom:.18rem;line-height:1.15}html[data-density="compact"] .ms-page-jump{width:4.75rem;min-width:4.75rem}html[data-density="large"] .ms-db-tools .nav-link{line-height:1.25}html[data-density="large"] .ms-sidebar-object-name,html[data-density="large"] .ms-sidebar-object-action{padding-top:.7rem;padding-bottom:.7rem;line-height:1.25}html[data-density="large"] .ms-page-jump{width:6rem;min-width:6rem}
     @media(max-width:991.98px){.sidebar{position:static;width:auto;height:auto}.main{margin-left:0}.sidebar .nav{flex-direction:row;overflow:auto;flex-wrap:nowrap}.sidebar .nav-link{white-space:nowrap}}.ms-ios-switch{padding-left:3.4rem;min-height:1.75rem}.ms-ios-switch .form-check-input{width:2.9rem;height:1.65rem;margin-left:-3.4rem;margin-top:.05rem;border-radius:999px;cursor:pointer;box-shadow:none}.ms-ios-switch .form-check-input:focus{box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.18)}.ms-ios-switch .form-check-label{cursor:pointer;line-height:1.75rem}@media print{.sidebar,.no-print{display:none!important}.main{margin:0;padding:0}.table-scroll{max-height:none;overflow:visible}}
@@ -7958,6 +7960,8 @@ function page_select(mysqli $db): void {
     .ms-global-search-clear:hover,.ms-global-search-clear:focus-visible{color:var(--bs-body-color)}
     .ms-global-search-clear:focus-visible{outline:2px solid var(--bs-primary);outline-offset:1px;border-radius:.125rem}
     .ms-global-search-clear[hidden]{display:none}
+    [data-ms-filter-from][hidden]{display:none!important}
+    [data-ms-filter-main]:not(.ms-filter-between) .form-control{border-top-left-radius:var(--bs-border-radius);border-bottom-left-radius:var(--bs-border-radius)}
   </style>
   <div class="card mb-3 no-print"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
     <button class="btn btn-sm btn-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button>
@@ -7996,18 +8000,17 @@ function page_select(mysqli $db): void {
         </select>
       </div>
       <div class="col-md-7">
-        <div class="d-flex flex-wrap align-items-end gap-2">
+        <div class="d-flex flex-wrap align-items-center gap-2">
           <label class="flex-grow-1" style="min-width:10rem" data-ms-filter-main>
             <span class="visually-hidden">Filter <?= $i+1 ?> value</span>
-            <span class="small text-body-secondary" data-ms-filter-from hidden>From</span>
-            <input class="form-control" name="filter_val[]" value="<?= h((string)($_GET['filter_val'][$i]??'')) ?>" autocomplete="off">
+            <span class="input-group"><span class="input-group-text" data-ms-filter-from hidden>From</span><input class="form-control" name="filter_val[]" value="<?= h((string)($_GET['filter_val'][$i]??'')) ?>" autocomplete="off"></span>
           </label>
           <label class="flex-grow-1" style="min-width:10rem" data-ms-filter-end hidden>
-            <span class="small text-body-secondary">Through</span>
-            <input class="form-control" name="filter_val_to[]" value="<?= h((string)($_GET['filter_val_to'][$i]??'')) ?>" autocomplete="off">
+            <span class="visually-hidden">Filter <?= $i+1 ?> ending value</span>
+            <span class="input-group"><span class="input-group-text">Through</span><input class="form-control" name="filter_val_to[]" value="<?= h((string)($_GET['filter_val_to'][$i]??'')) ?>" autocomplete="off"></span>
           </label>
           <label style="min-width:8rem" data-ms-filter-unit hidden>
-            <span class="small text-body-secondary">Units</span>
+            <span class="visually-hidden">Filter <?= $i+1 ?> relative time unit</span>
             <select class="form-select" name="filter_unit[]">
               <?php foreach(['day'=>'days','month'=>'months','year'=>'years'] as $unit=>$label){?><option value="<?= $unit ?>"<?= (($_GET['filter_unit'][$i]??'day')===$unit)?' selected':'' ?>><?= $label ?></option><?php }?>
             </select>
@@ -8083,6 +8086,7 @@ function page_select(mysqli $db): void {
         endWrapper.hidden=!between;
         unitWrapper.hidden=!relative;
         fromLabel.hidden=!between;
+        mainWrapper.classList.toggle('ms-filter-between',between);
         agoLabel.hidden=!relative;
         noValueLabel.hidden=!withoutValue;
         initial=false;
@@ -10085,7 +10089,6 @@ function page_settings(): void {
   }
   $activeProfile = ms_active_profile_name();
   $profileNames = ms_profile_names();
-  title_bar('Settings', 'Profile: ' . $activeProfile . ' · all preferences and database display customizations are profile-specific.');
   $updateCache = ms_update_cache_read();
   $updateCheckedAt = (int)($updateCache['checked_at'] ?? 0);
   $updateRemoteVersion = trim((string)($updateCache['remote_version'] ?? ''));
@@ -10099,7 +10102,11 @@ function page_settings(): void {
     'check_failed' => 'Check failed'
   ];
   $updateStatusLabel = $updateStatusLabels[$updateStatus] ?? ucfirst(str_replace('_', ' ', $updateStatus));
-  ?><div class="ms-settings-save-sticky"><button class="btn btn-primary" type="submit" form="ms-settings-form"><i class="fa-solid fa-floppy-disk me-1" aria-hidden="true"></i>Save all</button></div>
+  ?><header class="ms-settings-save-sticky">
+    <h1 class="h3 mb-0">Settings</h1>
+    <div class="ms-settings-subtitle text-body-secondary">Profile: <?= h($activeProfile) ?> · all preferences and database display customizations are profile-specific.</div>
+    <button class="btn btn-primary" type="submit" form="ms-settings-form"><i class="fa-solid fa-floppy-disk me-1" aria-hidden="true"></i>Save all</button>
+  </header>
   <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-cloud-arrow-down me-2"></i>Software update</h2><a class="btn btn-primary btn-sm" href="<?= h(url(['ms_check_update' => '1'])) ?>"><i class="fa-solid fa-rotate me-1"></i>Check for new version</a></div><div class="card-body">
     <div class="row g-3">
       <div class="col-md-3"><div class="small text-body-secondary">Installed version</div><div class="fw-semibold">v<?= h(MS_VERSION) ?></div></div>
