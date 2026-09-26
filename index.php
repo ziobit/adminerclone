@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.18';
+const MS_VERSION = '1.15.19';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -976,6 +976,144 @@ function ms_profile_delete_search(string $database, string $table, string $name)
     }
     return $tableConfig;
   });
+}
+
+function ms_view_preset_server_key(): string {
+  $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
+  return hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? ''));
+}
+
+function ms_view_preset_normalize(array $source, array $columns): array {
+  $allowed = array_values(array_map('strval', $columns));
+  if (!isset($source['query']) || !is_array($source['query'])) throw new RuntimeException('Invalid preset query.');
+  $query = ms_saved_search_normalize($source['query'], $allowed);
+  $duplicateGroup = $source['query']['duplicate_group'] ?? '';
+  if (is_string($duplicateGroup) && $duplicateGroup !== '' && ms_insight_group_decode($duplicateGroup, array_map(static function (string $column): array { return ['COLUMN_NAME' => $column]; }, $allowed))) {
+    $query['duplicate_group'] = $duplicateGroup;
+  }
+  $hidden = [];
+  $sourceHidden = isset($source['hidden']) && is_array($source['hidden']) ? $source['hidden'] : [];
+  foreach ($sourceHidden as $name) if (is_string($name) && in_array($name, $allowed, true)) $hidden[$name] = true;
+  $order = [];
+  $sourceOrder = isset($source['order']) && is_array($source['order']) ? $source['order'] : [];
+  foreach ($sourceOrder as $name) if (is_string($name) && in_array($name, $allowed, true) && !in_array($name, $order, true)) $order[] = $name;
+  foreach ($allowed as $name) if (!in_array($name, $order, true)) $order[] = $name;
+  $widths = [];
+  $sourceWidths = isset($source['widths']) && is_array($source['widths']) ? $source['widths'] : [];
+  foreach ($sourceWidths as $name => $width) {
+    if (!in_array((string)$name, $allowed, true) || !is_numeric($width)) continue;
+    $pixels = (int)$width;
+    if ($pixels >= 48 && $pixels <= 1200) $widths[(string)$name] = $pixels;
+  }
+  return [
+    'query' => $query,
+    'hidden' => array_keys($hidden),
+    'order' => $order,
+    'widths' => $widths,
+    'view_mode' => ($source['view_mode'] ?? '') === 'cards' ? 'cards' : 'table',
+    'raw_db_view' => !empty($source['raw_db_view'])
+  ];
+}
+
+function ms_view_preset_bucket(array $config, string $database, string $table, string $scope): array {
+  if ($scope === 'private') {
+    $profile = ms_active_profile_name();
+    $bucket = $config['profiles'][$profile]['servers'][ms_server_config_key()]['databases'][$database]['tables'][$table]['view_presets'] ?? [];
+  } elseif ($scope === 'shared') {
+    $bucket = $config['shared_view_presets'][ms_view_preset_server_key()][$database][$table] ?? [];
+  } else throw new RuntimeException('Invalid preset scope.');
+  return is_array($bucket) ? $bucket : [];
+}
+
+function ms_view_preset_list(string $database, string $table): array {
+  $config = ms_profile_config_read();
+  $owner = ms_server_config_key();
+  $result = ['private' => [], 'shared' => []];
+  foreach (['private','shared'] as $scope) {
+    foreach (ms_view_preset_bucket($config, $database, $table, $scope) as $id => $entry) {
+      if (!is_string($id) || !is_array($entry) || !is_array($entry['snapshot'] ?? null)) continue;
+      $result[$scope][] = ['id' => $id, 'name' => (string)($entry['name'] ?? ''),
+        'owner' => (string)($entry['owner_label'] ?? ''),
+        'can_manage' => $scope === 'private' || ($entry['owner'] ?? '') === $owner];
+    }
+    usort($result[$scope], static function (array $a, array $b): int { return strnatcasecmp($a['name'], $b['name']); });
+  }
+  return $result;
+}
+
+function ms_view_preset_save(string $database, string $table, string $scope, string $name, array $snapshot, array $columns): void {
+  $name = ms_saved_search_name($name);
+  if (!in_array($scope, ['private','shared'], true)) throw new RuntimeException('Invalid preset scope.');
+  $snapshot = ms_view_preset_normalize($snapshot, $columns);
+  $owner = ms_server_config_key();
+  $ownerLabel = (string)($_SESSION['ms_login']['user'] ?? '');
+  ms_profile_config_mutate(static function (array $config) use ($database, $table, $scope, $name, $snapshot, $owner, $ownerLabel): array {
+    if ($scope === 'private') {
+      $profile = ms_active_profile_name();
+      $bucket =& $config['profiles'][$profile]['servers'][$owner]['databases'][$database]['tables'][$table]['view_presets'];
+    } else {
+      $bucket =& $config['shared_view_presets'][ms_view_preset_server_key()][$database][$table];
+    }
+    if (!is_array($bucket)) $bucket = [];
+    $id = '';
+    foreach ($bucket as $key => $entry) {
+      if (is_array($entry) && strcasecmp((string)($entry['name'] ?? ''), $name) === 0 && ($scope === 'private' || ($entry['owner'] ?? '') === $owner)) {
+        $id = (string)$key;
+        break;
+      }
+    }
+    if ($id === '') {
+      if (count($bucket) >= 100) throw new RuntimeException('This table already has 100 ' . $scope . ' presets.');
+      do { $id = bin2hex(random_bytes(8)); } while (isset($bucket[$id]));
+    }
+    $bucket[$id] = ['name' => $name, 'owner' => $owner, 'owner_label' => $ownerLabel,
+      'snapshot' => $snapshot, 'updated_at' => time()];
+    return $config;
+  });
+}
+
+function ms_view_preset_get(string $database, string $table, string $scope, string $id): array {
+  if (preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1) throw new RuntimeException('Invalid preset.');
+  $entry = ms_view_preset_bucket(ms_profile_config_read(), $database, $table, $scope)[$id] ?? null;
+  if (!is_array($entry) || !is_array($entry['snapshot'] ?? null)) throw new RuntimeException('Preset not found.');
+  return $entry;
+}
+
+function ms_view_preset_delete(string $database, string $table, string $scope, string $id): void {
+  if (!in_array($scope, ['private','shared'], true) || preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1) throw new RuntimeException('Invalid preset.');
+  $owner = ms_server_config_key();
+  ms_profile_config_mutate(static function (array $config) use ($database, $table, $scope, $id, $owner): array {
+    if ($scope === 'private') {
+      $bucket =& $config['profiles'][ms_active_profile_name()]['servers'][$owner]['databases'][$database]['tables'][$table]['view_presets'];
+    } else {
+      $bucket =& $config['shared_view_presets'][ms_view_preset_server_key()][$database][$table];
+    }
+    if (!is_array($bucket) || !isset($bucket[$id])) throw new RuntimeException('Preset not found.');
+    if ($scope === 'shared' && ($bucket[$id]['owner'] ?? '') !== $owner) throw new RuntimeException('Only the creator can delete this shared preset.');
+    unset($bucket[$id]);
+    return $config;
+  });
+}
+
+function ms_view_preset_apply(string $database, string $table, string $scope, string $id, array $columns): string {
+  $entry = ms_view_preset_get($database, $table, $scope, $id);
+  $snapshot = ms_view_preset_normalize($entry['snapshot'], $columns);
+  $hidden = array_fill_keys($snapshot['hidden'], true);
+  ms_profile_update_table($database, $table, static function (array $config) use ($hidden, $snapshot): array {
+    if ($hidden) $config['hidden'] = $hidden;
+    else unset($config['hidden']);
+    $layout = isset($config['layout']) && is_array($config['layout']) ? $config['layout'] : [];
+    $layout['order'] = $snapshot['order'];
+    $layout['widths'] = $snapshot['widths'];
+    $config['layout'] = $layout;
+    return $config;
+  });
+  $settings = ms_profile_settings();
+  if ($settings['rawDbView'] !== $snapshot['raw_db_view']) {
+    $settings['rawDbView'] = $snapshot['raw_db_view'];
+    ms_profile_update_settings($settings);
+  }
+  return '?' . http_build_query(array_merge(['page' => 'select', 'table' => $table], $snapshot['query'], ['view_mode' => $snapshot['view_mode']]));
 }
 
 function ms_column_view_table_config(string $database, string $table): array {
@@ -3800,6 +3938,7 @@ try {
       try {
         require_csrf();
         $configAction = p('action');
+        $presetUrl = null;
         if ($configAction === 'raw_db_view') {
           $settings = ms_profile_settings();
           $settings['rawDbView'] = p('enabled') === '1';
@@ -3879,6 +4018,24 @@ try {
           $widths = json_decode(p('widths_json'), true);
           if (!is_array($widths)) throw new RuntimeException('Invalid column widths.');
           ms_profile_set_table_widths($database, $table, $widths, $columns);
+        } elseif (in_array($configAction, ['save_view_preset','apply_view_preset','delete_view_preset'], true)) {
+          $database = selected_db();
+          if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+          $table = p('table');
+          if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+          $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+          $scope = p('scope');
+          if ($configAction === 'save_view_preset') {
+            $raw = p('preset_json');
+            if (strlen($raw) > 65536) throw new RuntimeException('The preset is too large.');
+            $snapshot = json_decode($raw, true);
+            if (!is_array($snapshot) || json_last_error() !== JSON_ERROR_NONE) throw new RuntimeException('Invalid preset data.');
+            ms_view_preset_save($database, $table, $scope, p('name'), $snapshot, $columns);
+          } elseif ($configAction === 'apply_view_preset') {
+            $presetUrl = ms_view_preset_apply($database, $table, $scope, p('id'), $columns);
+          } else {
+            ms_view_preset_delete($database, $table, $scope, p('id'));
+          }
         } elseif ($configAction === 'save_search') {
           $database = selected_db();
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
@@ -3900,7 +4057,7 @@ try {
         } else {
           throw new RuntimeException('Unknown profile configuration operation.');
         }
-        echo json_encode(['ok' => true, 'profile' => ms_active_profile_name()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        echo json_encode(['ok' => true, 'profile' => ms_active_profile_name(), 'url' => $presetUrl], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
       } catch (Throwable $ajaxError) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -4037,6 +4194,7 @@ try {
         $imageColumns = is_array($viewConfig['images'] ?? null) ? $viewConfig['images'] : [];
         $softFkRules = is_array($viewConfig['soft_fk'] ?? null) ? $viewConfig['soft_fk'] : [];
         $formatRules = is_array($viewConfig['formats'] ?? null) ? $viewConfig['formats'] : [];
+        $labelRules = is_array($viewConfig['labels'] ?? null) ? $viewConfig['labels'] : [];
         $alignmentRules = is_array($viewConfig['alignments'] ?? null) ? $viewConfig['alignments'] : [];
         $fixedFontRules = is_array($viewConfig['fixed_fonts'] ?? null) ? $viewConfig['fixed_fonts'] : [];
         $softFkMaps = $aggregated ? [] : ms_soft_fk_maps($db, $rows, $softFkRules);
@@ -4053,7 +4211,7 @@ try {
         }
         $returnToken = ms_encode_navigation($returnQuery);
         $softDeleteRule = $aggregated ? null : ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $table), $columns);
-        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
+        $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
         $nextOffset = $offset + count($rows);
         echo json_encode([
           'ok' => true,
@@ -5434,6 +5592,18 @@ function page_head(string $title, bool $authenticated): void {
     .ms-insight-menu{position:fixed;z-index:1060;min-width:12rem;box-shadow:0 .5rem 1.5rem rgba(0,0,0,.2)}
     .ms-insight-bar{height:.7rem;min-width:2px;background:var(--ms-accent);border-radius:.25rem}
     .ms-insight-chart{max-height:21rem;overflow:auto}
+    .ms-layout-table[data-ms-view-mode="cards"]{display:block;width:100%}
+    .ms-layout-table[data-ms-view-mode="cards"] thead{display:none}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr));gap:.75rem;padding:.75rem}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody tr{display:block;border:1px solid var(--bs-border-color);border-radius:.6rem;background:var(--bs-body-bg);box-shadow:0 .15rem .5rem rgba(0,0,0,.08);overflow:hidden}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody tr:hover{background:var(--bs-tertiary-bg)}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td{border:0;background:transparent!important;box-shadow:none!important;max-width:none!important;min-width:0!important;width:auto!important;white-space:normal!important}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-column]{display:grid;grid-template-columns:minmax(5rem,36%) minmax(0,1fr);gap:.6rem;align-items:start;border-top:1px solid var(--bs-border-color);text-align:start!important}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-column]::before{content:attr(data-ms-card-label);font-weight:600;color:var(--bs-secondary-color);overflow-wrap:anywhere}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-column] .cell-value{max-width:100%;max-height:none}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-static-column="selection"],.ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-static-column="actions"]{display:inline-flex;align-items:center;vertical-align:middle}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-static-column="actions"]{width:calc(100% - 3rem)!important;justify-content:flex-end}
+    .ms-layout-table[data-ms-view-mode="cards"] tbody td[data-ms-static-column="actions"]:first-child{width:100%!important}
     .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-drag-handle,.ms-layout-table[data-ms-pretty-mode="edit"] th.text-end[data-ms-header-alignment="right"] .ms-col-drag-handle{position:absolute;left:var(--ms-table-pad-x);top:50%;transform:translateY(-50%);margin-right:0}
     .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-header-name{max-width:calc(100% - 2rem)}
     .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
@@ -6085,7 +6255,7 @@ function page_foot(): void {
     if(hideMenu)hideMenu.addEventListener('click',()=>{window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);if(input)input.checked=false;});settingsForm.dispatchEvent(new Event('change'));});
     const reset=document.getElementById('ms-settings-reset');
     if(reset)reset.addEventListener('click',async()=>{
-      if(!confirm('Restore every setting in the current profile to defaults? This also removes its saved column views, sidebar choices, saved widths, column order and saved searches.'))return;
+      if(!confirm('Restore every setting in the current profile to defaults? This also removes its private saved views, saved searches, sidebar choices, saved widths and column order. Shared views remain available.'))return;
       reset.disabled=true;
       try{await window.msConfigPost('reset_profile');location.reload();}
       catch(error){alert(error.message||String(error));reset.disabled=false;}
@@ -7292,7 +7462,7 @@ function ms_pdf_display_text($value, array $rule = []): string {
   return $plain;
 }
 
-function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken): string {
+function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken,array $labelRules=[]): string {
   $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
   $columnMap = [];
   foreach ($columns as $column) {
@@ -7340,7 +7510,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
         else $cellClasses[] = 'text-start';
         if (!empty($fixedFontRules[$name])) $cellClasses[] = 'font-monospace';
       }
-      ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>"<?php } ?><?= $cellClasses ? ' class="'.h(implode(' ', $cellClasses)).'"' : '' ?>><?php
+      ?><td<?php if (!$aggregated) { ?> data-ms-column="<?= h($name) ?>" data-ms-card-label="<?= h(trim((string)($labelRules[$name]??''))!==''?(string)$labelRules[$name]:$name) ?>"<?php } ?><?= $cellClasses ? ' class="'.h(implode(' ', $cellClasses)).'"' : '' ?>><?php
       if (!$aggregated && isset($formatRules[$name]) && is_array($formatRules[$name])) {
         echo ms_render_formatted_value($value, $formatRules[$name], true, $name);
       } elseif (!$aggregated && isset($imageColumns[$name]) && is_array($imageColumns[$name])) {
@@ -7544,6 +7714,7 @@ function page_select(mysqli $db): void {
   ];
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
+  $viewMode=!$aggregated&&g('view_mode')==='cards'?'cards':'table';
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
   $softDeleteRule=$aggregated?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
@@ -7557,6 +7728,11 @@ function page_select(mysqli $db): void {
   $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
   $layoutColumns=$allColumnNames;$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';$savedLayout=ms_profile_table_layout(selected_db(),$table);$savedLayoutJson=json_encode($savedLayout,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'{}';$sidebarHidden=!empty(ms_profile_hidden_sidebar(selected_db())[$table]);$savedSearches=ms_profile_table_saved_searches(selected_db(),$table);
+  $viewPresets=ms_view_preset_list(selected_db(),$table);
+  $presetSeed=['columns'=>$allColumnNames,'hidden'=>array_keys(array_filter($storedHiddenColumns)),
+    'order'=>$savedLayout['order']??[],'widths'=>$savedLayout['widths']??[],
+    'view_mode'=>$viewMode,'raw_db_view'=>ms_raw_db_view(),'limit'=>$limit];
+  $presetSeedJson=json_encode($presetSeed,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'{}';
   $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
   $prettyEdit=!$aggregated&&ms_profile_edit_pretty_view(selected_db(),$table);
@@ -7586,8 +7762,13 @@ function page_select(mysqli $db): void {
   $pdfEditorDataJson=json_encode(['table'=>$table,'all_columns'=>$allColumnNames,'columns'=>$pdfEditorColumns,'template'=>ms_profile_pdf_template(selected_db(),$table)],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT);
   if(!is_string($pdfEditorDataJson))$pdfEditorDataJson='{}';
   $tableIconButton='<button class="btn btn-outline-secondary ms-table-icon-trigger no-print" type="button" data-bs-toggle="modal" data-bs-target="#ms-table-icon-modal" data-ms-table-icon-trigger data-ms-table="'.h($table).'" data-icon-style="'.h($tableIcon['style']).'" data-icon-name="'.h($tableIcon['name']).'" data-icon-color="'.h($tableIcon['color']).'" data-display-name="'.h($tableDisplayName===$table?'':$tableDisplayName).'" data-master-enabled="'.($masterRelation===null?'0':'1').'" data-slave-table="'.h((string)($masterRelation['slave_table']??'')).'" data-slave-field="'.h((string)($masterRelation['slave_field']??'')).'" data-master-field="'.h((string)($masterRelation['master_field']??'')).'" title="Table display and relations" aria-label="Edit display and relations for '.h($table).'"><i class="'.h(ms_table_icon_class($tableIcon)).' fs-5" style="color:'.h($tableIcon['color'] !== '' ? $tableIcon['color'] : 'inherit').'" data-ms-current-table-icon aria-hidden="true"></i></button>';
-  $prettyToggle=$aggregated?'':'<button class="btn btn-sm ms-pretty-toggle no-print" type="button" data-ms-pretty-toggle data-ms-table="'.h($table).'" aria-pressed="'.($prettyEdit?'true':'false').'" title="'.($prettyEdit?'Edit Pretty View: switch to Pretty View':'Pretty View: edit header layout and appearance').'" aria-label="'.($prettyEdit?'Edit Pretty View. Switch to Pretty View':'Pretty View. Enable Edit Pretty View').'"><i class="fa-solid '.($prettyEdit?'fa-pen-to-square':'fa-eye').'" aria-hidden="true"></i></button>';
-  $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';if(!$aggregated)$actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';$actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
+  $prettyToggle=$aggregated||$viewMode==='cards'?'':'<button class="btn btn-sm ms-pretty-toggle no-print" type="button" data-ms-pretty-toggle data-ms-table="'.h($table).'" aria-pressed="'.($prettyEdit?'true':'false').'" title="'.($prettyEdit?'Edit Pretty View: switch to Pretty View':'Pretty View: edit header layout and appearance').'" aria-label="'.($prettyEdit?'Edit Pretty View. Switch to Pretty View':'Pretty View. Enable Edit Pretty View').'"><i class="fa-solid '.($prettyEdit?'fa-pen-to-square':'fa-eye').'" aria-hidden="true"></i></button>';
+  $actions='<div class="d-inline-flex align-items-center me-2"><div class="form-check form-switch ms-ios-switch m-0"><input class="form-check-input" type="checkbox" role="switch" id="ms-sidebar-object-visible" data-ms-sidebar-object-toggle="'.h($table).'"'.($sidebarHidden?'':' checked').'><label class="form-check-label text-nowrap" for="ms-sidebar-object-visible">Left sidebar</label></div></div> ';
+  if(!$aggregated){
+    $actions.='<div class="btn-group me-1" role="group" aria-label="View mode"><a class="btn btn-secondary'.($viewMode==='table'?' active':'').'" href="'.h(url(['view_mode'=>'table','p'=>null])).'" aria-label="Table view" title="Table view"'.($viewMode==='table'?' aria-current="page"':'').'><i class="fa-solid fa-table"></i></a><a class="btn btn-secondary'.($viewMode==='cards'?' active':'').'" href="'.h(url(['view_mode'=>'cards','p'=>null])).'" aria-label="Card view" title="Card view"'.($viewMode==='cards'?' aria-current="page"':'').'><i class="fa-solid fa-grip"></i></a></div> ';
+    $actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit&&$viewMode==='table'?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';
+  }
+  $actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   $allRowsTotal=$total;
@@ -7601,6 +7782,30 @@ function page_select(mysqli $db): void {
   $rowCountLabel=$partialRows?($aggregated?'displayed result rows':'displayed rows').' of '.number_format($allRowsTotal).' total table rows':'total table rows';
   $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" data-ms-row-count-pill data-ms-total-rows="'.h((string)$allRowsTotal).'" data-ms-count-partial="'.($where||$aggregated?'1':'0').'" data-ms-result-unit="'.($aggregated?'result rows':'rows').'" aria-label="'.h(number_format($shownRows).' '.$rowCountLabel).'">'.h($rowCount).'</span>';
   title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
+  ?>
+  <section class="card mb-3 no-print" aria-label="Saved views" data-ms-view-presets data-ms-table="<?= h($table) ?>" data-ms-preset-seed="<?= h($presetSeedJson) ?>">
+    <div class="card-body">
+      <div class="d-flex flex-wrap align-items-center gap-2 mb-2"><strong><i class="fa-solid fa-bookmark me-1"></i>Saved views</strong><span class="small text-body-secondary">Restore filters, sort, visible fields, column layout, page size and table/card view.</span></div>
+      <?php if($viewPresets['private']||$viewPresets['shared']){ ?>
+        <div class="d-flex flex-wrap gap-2 mb-3" style="max-height:10rem;overflow:auto" aria-label="Open a saved view">
+          <?php foreach(['private'=>'Private','shared'=>'Shared'] as $scope=>$scopeLabel)foreach($viewPresets[$scope] as $preset){ ?>
+            <button class="btn btn-sm <?= $scope==='shared'?'btn-outline-primary':'btn-outline-secondary' ?>" type="button" data-ms-apply-preset data-scope="<?= h($scope) ?>" data-id="<?= h($preset['id']) ?>" title="<?= h($scopeLabel.($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?>" aria-label="<?= h('Open '.$scopeLabel.' view '.$preset['name']) ?>"><i class="fa-solid <?= $scope==='shared'?'fa-users':'fa-lock' ?> me-1" aria-hidden="true"></i><?= h($preset['name']) ?></button>
+          <?php } ?>
+        </div>
+      <?php } ?>
+      <div class="d-flex flex-wrap gap-2 align-items-end">
+        <div style="min-width:min(100%,15rem)"><label class="form-label small mb-1" for="ms-view-preset-name">Name</label><input class="form-control form-control-sm" id="ms-view-preset-name" data-ms-preset-name maxlength="100" placeholder="Fatture insolute &gt; 30 giorni"></div>
+        <div><label class="form-label small mb-1" for="ms-view-preset-scope">Access</label><select class="form-select form-select-sm" id="ms-view-preset-scope" data-ms-preset-scope><option value="private">Private to this login and profile</option><option value="shared">Shared on this server</option></select></div>
+        <button class="btn btn-sm btn-primary" type="button" data-ms-save-preset><i class="fa-solid fa-floppy-disk me-1"></i>Save current view</button>
+        <?php if($viewPresets['private']||$viewPresets['shared']){ ?>
+          <div><label class="form-label small mb-1" for="ms-view-preset-manage">Manage views</label><select class="form-select form-select-sm" id="ms-view-preset-manage" data-ms-preset-manage><option value="">Choose view…</option><?php foreach(['private'=>'Private','shared'=>'Shared'] as $scope=>$scopeLabel){if(!$viewPresets[$scope])continue;?><optgroup label="<?= h($scopeLabel) ?>"><?php foreach($viewPresets[$scope] as $preset){ ?><option value="<?= h($scope.':'.$preset['id']) ?>" data-ms-can-manage="<?= $preset['can_manage']?'1':'0' ?>" data-ms-preset-name="<?= h($preset['name']) ?>"><?= h($preset['name'].($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?></option><?php } ?></optgroup><?php } ?></select></div>
+          <button class="btn btn-sm btn-outline-danger" type="button" data-ms-delete-preset disabled>Delete</button>
+        <?php } ?>
+      </div>
+      <div class="form-text">Saving under the same name updates your preset. Shared views can be opened by other logins; only their creator can delete them.</div>
+    </div>
+  </section>
+  <?php
   if (g('duplicate_group') !== '') {
     $duplicateValues=ms_insight_group_decode(g('duplicate_group'),$columns);
     if ($duplicateValues) {
@@ -8177,7 +8382,7 @@ function page_select(mysqli $db): void {
       <div class="col-md-auto"><button class="btn btn-secondary" type="button" data-ms-load-search disabled><i class="fa-solid fa-folder-open me-1"></i>Load</button></div>
       <div class="col-md-auto"><button class="btn btn-outline-danger" type="button" data-ms-delete-search="<?= h($table) ?>" disabled><i class="fa-solid fa-trash me-1"></i>Delete</button></div>
     </div>
-    <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><h3 class="h6">Filters</h3>
+    <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><input type="hidden" name="view_mode" value="<?= h($viewMode) ?>"><h3 class="h6">Filters</h3>
     <?php
       $filterOperatorLabels=['='=>'=','!='=>'!=','>'=>'>','>='=>'>=','<'=>'<','<='=>'<=','contains'=>'contains','starts'=>'starts','ends'=>'ends','regexp'=>'regexp','fulltext'=>'fulltext','null'=>'null','not_null'=>'not_null','between'=>'Between','older_than'=>'Older than','newer_than'=>'Newer than'];
       for($i=0;$i<3;$i++){
@@ -8386,7 +8591,7 @@ function page_select(mysqli $db): void {
     <div class="form-text">Runs the query again on MySQL, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
   </div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
-  <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-pretty-mode="<?= $prettyEdit?'edit':'view' ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>" data-ms-layout="<?= h($savedLayoutJson) ?>"<?php } ?>><thead><tr><?php
+  <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-view-mode="<?= h($viewMode) ?>" data-ms-pretty-mode="<?= $prettyEdit&&$viewMode==='table'?'edit':'view' ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>" data-ms-layout="<?= h($savedLayoutJson) ?>"<?php } ?>><thead><tr><?php
     if(!$aggregated){if($editable){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><?php }?><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php }
     foreach($headers as $header){
       $header=(string)$header;
@@ -8410,9 +8615,94 @@ function page_select(mysqli $db): void {
       ?><th<?php if(!$aggregated){ ?> tabindex="0" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
-  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
+  echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <script>
+  (() => {
+    'use strict';
+    const root=document.querySelector('[data-ms-view-presets]');
+    if(!root)return;
+    const seed=JSON.parse(root.dataset.msPresetSeed||'{}');
+    const table=document.querySelector('#ms-select-row-form [data-ms-table-layout]');
+    const nameInput=root.querySelector('[data-ms-preset-name]');
+    const scopeInput=root.querySelector('[data-ms-preset-scope]');
+    const saveButton=root.querySelector('[data-ms-save-preset]');
+    const manage=root.querySelector('[data-ms-preset-manage]');
+    const deleteButton=root.querySelector('[data-ms-delete-preset]');
+    const columns=Array.isArray(seed.columns)?seed.columns:[];
+    const capture=()=>{
+      const params=new URLSearchParams(location.search);
+      const query={limit:String(seed.limit||50)};
+      ['global_search','aggregate','aggregate_column','group_column','show_all','duplicate_group'].forEach(key=>{
+        if(params.has(key))query[key]=params.get(key);
+      });
+      ['filter_col','filter_op','filter_val','filter_val_to','filter_unit','order_col','order_dir'].forEach(key=>{
+        if(params.has(key+'[]'))query[key]=params.getAll(key+'[]');
+      });
+      const base=[],seen=new Set();
+      if(Array.isArray(seed.order))seed.order.forEach(name=>{if(columns.includes(name)&&!seen.has(name)){base.push(name);seen.add(name);}});
+      columns.forEach(name=>{if(!seen.has(name))base.push(name);});
+      let order=base;
+      let hidden=Array.isArray(seed.hidden)?seed.hidden:[];
+      const widths=seed.widths&&typeof seed.widths==='object'&&!Array.isArray(seed.widths)?{...seed.widths}:{};
+      if(table){
+        const headers=Array.from(table.querySelectorAll('thead th[data-ms-column]'));
+        const visible=headers.map(header=>header.dataset.msColumn);
+        const visibleSet=new Set(visible);
+        if(!seed.raw_db_view)hidden=columns.filter(name=>!visibleSet.has(name));
+        let index=0;
+        order=base.map(name=>visibleSet.has(name)?visible[index++]:name);
+        headers.forEach(header=>{
+          const width=parseFloat(header.style.width);
+          if(Number.isFinite(width)&&width>=48&&width<=1200)widths[header.dataset.msColumn]=Math.round(width);
+        });
+      }
+      return {query,hidden,order,widths,view_mode:table?.dataset.msViewMode||seed.view_mode||'table',raw_db_view:!!seed.raw_db_view};
+    };
+    const apply=async button=>{
+      const scope=button.dataset.scope,id=button.dataset.id;
+      button.disabled=true;
+      try{
+        const response=await window.msConfigPost('apply_view_preset',{table:root.dataset.msTable,scope,id});
+        if(!response.url||!response.url.startsWith('?'))throw new Error('Unable to open the saved view.');
+        if(typeof window.msShowPageLoader==='function')window.msShowPageLoader('Opening saved view...');
+        location.assign(response.url);
+      }catch(error){alert(error.message||String(error));button.disabled=false;}
+    };
+    root.querySelectorAll('[data-ms-apply-preset]').forEach(button=>button.addEventListener('click',()=>apply(button)));
+    saveButton.addEventListener('click',async()=>{
+      const name=nameInput.value.trim();
+      if(!name){nameInput.focus();return;}
+      saveButton.disabled=true;
+      try{
+        await window.msConfigPost('save_view_preset',{table:root.dataset.msTable,scope:scopeInput.value,name,preset_json:JSON.stringify(capture())});
+        location.reload();
+      }catch(error){alert(error.message||String(error));saveButton.disabled=false;}
+    });
+    if(manage&&deleteButton){
+      manage.addEventListener('change',()=>{
+        const option=manage.selectedOptions[0];
+        deleteButton.disabled=!option||option.dataset.msCanManage!=='1';
+        if(!deleteButton.disabled){
+          nameInput.value=option.dataset.msPresetName||'';
+          scopeInput.value=manage.value.split(':',1)[0];
+        }
+      });
+      deleteButton.addEventListener('click',async()=>{
+        const option=manage.selectedOptions[0];
+        if(!option||option.dataset.msCanManage!=='1')return;
+        const [scope,id]=option.value.split(':');
+        if(!confirm('Delete saved view “'+(option.dataset.msPresetName||'')+'”?'))return;
+        deleteButton.disabled=true;
+        try{
+          await window.msConfigPost('delete_view_preset',{table:root.dataset.msTable,scope,id});
+          location.reload();
+        }catch(error){alert(error.message||String(error));deleteButton.disabled=false;}
+      });
+    }
+  })();
+  </script>
   <?php if(!$aggregated){
     $insightColumns=[];
     foreach($columns as $insightColumn)if(ms_insight_groupable($insightColumn))$insightColumns[]=(string)$insightColumn['COLUMN_NAME'];
@@ -10545,7 +10835,7 @@ function page_settings(): void {
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
       <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" value="1" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
-      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules, saved searches and query history are also profile-specific. Restore defaults resets the complete active profile.</div></div>
+      <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules, saved searches, private saved views and query history are profile-specific. Shared saved views are available across logins on the same server. Restore defaults resets the active profile, including its private saved views.</div></div>
     </div></div></section>
 
     <section class="card mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-bars me-2"></i>Left menu</h2><div><button class="btn btn-secondary btn-sm" type="button" id="ms-menu-show-all">Show all</button> <button class="btn btn-secondary btn-sm" type="button" id="ms-menu-hide-all">Hide all</button></div></div><div class="card-body"><p class="text-body-secondary">Choose which database tools appear in the left navigation. Settings and Log out always remain visible.</p><div class="row g-2"><?php foreach ($menuItems as $key => [$icon, $label]) { ?>
