@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.17';
+const MS_VERSION = '1.15.18';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1656,6 +1656,117 @@ function table_exists(mysqli $db, string $table): bool {
 
 function table_columns(mysqli $db, string $table): array {
   return db_all($db, 'SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table) . ' ORDER BY ORDINAL_POSITION');
+}
+
+function ms_insight_groupable(array $column): bool {
+  $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
+  if (in_array($type, ['char', 'varchar', 'enum', 'set'], true)) {
+    $length = $column['CHARACTER_MAXIMUM_LENGTH'] ?? null;
+    return $length === null || (int)$length <= 255;
+  }
+  return in_array($type, ['tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double','real','date','datetime','timestamp','time','year'], true);
+}
+
+function ms_insight_rows(mysqli $db, string $sql): array {
+  $result = $db->query($sql);
+  if (!$result instanceof mysqli_result) throw new RuntimeException('Analysis query failed: ' . $db->error);
+  $rows = [];
+  while ($row = $result->fetch_assoc()) $rows[] = $row;
+  $result->free();
+  return $rows;
+}
+
+function ms_insight_group_token(array $values): string {
+  $json = json_encode((object)$values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  return is_string($json) ? rtrim(strtr(base64_encode($json), '+/', '-_'), '=') : '';
+}
+
+function ms_insight_group_decode(string $token, array $columns): array {
+  if ($token === '' || strlen($token) > 8192 || preg_match('/\A[A-Za-z0-9_-]+\z/', $token) !== 1) return [];
+  $json = base64_decode(strtr($token, '-_', '+/'), true);
+  if (!is_string($json)) return [];
+  $values = json_decode($json, true);
+  if (!is_array($values) || !$values || count($values) > 5) return [];
+  $allowed = array_column($columns, 'COLUMN_NAME');
+  foreach ($values as $name => $value) {
+    if (!in_array((string)$name, $allowed, true) || ($value !== null && !is_scalar($value))) return [];
+  }
+  return $values;
+}
+
+function ms_insight_analyze(mysqli $db, string $table, array $column): array {
+  $name = (string)$column['COLUMN_NAME'];
+  $field = qi($name);
+  $type = strtolower((string)$column['DATA_TYPE']);
+  $numeric = in_array($type, ['tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double','real'], true);
+  $temporal = in_array($type, ['date','datetime','timestamp'], true);
+  $textual = in_array($type, ['char','varchar','tinytext','text','mediumtext','longtext','enum','set'], true);
+  $groupable = ms_insight_groupable($column);
+  $parts = ['COUNT(*) AS total', 'COUNT(' . $field . ') AS non_null'];
+  if ($textual) $parts[] = 'SUM(CASE WHEN OCTET_LENGTH(' . $field . ') = 0 THEN 1 ELSE 0 END) AS empty_count';
+  if ($groupable) {
+    $parts[] = 'COUNT(DISTINCT ' . $field . ') AS distinct_count';
+    $parts[] = 'MIN(' . $field . ') AS min_value';
+    $parts[] = 'MAX(' . $field . ') AS max_value';
+  }
+  if ($numeric) $parts[] = 'AVG(' . $field . ') AS average_value';
+  $summary = ms_insight_rows($db, 'SELECT ' . implode(', ', $parts) . ' FROM ' . qi($table))[0] ?? [];
+  $top = [];
+  $chart = [];
+  if ($groupable) {
+    $top = ms_insight_rows($db, 'SELECT ' . $field . ' AS value, COUNT(*) AS occurrences FROM ' . qi($table) . ' GROUP BY ' . $field . ' ORDER BY occurrences DESC LIMIT 10');
+    foreach ($top as &$item) $item['token'] = ms_insight_group_token([$name => $item['value']]);
+    unset($item);
+  }
+  if ($numeric && (int)($summary['non_null'] ?? 0) > 0) {
+    $minimum = (float)($summary['min_value'] ?? 0);
+    $maximum = (float)($summary['max_value'] ?? 0);
+    if (is_finite($minimum) && is_finite($maximum)) {
+      if ((string)$summary['min_value'] === (string)$summary['max_value']) {
+        $chart = [['label' => (string)$summary['min_value'], 'occurrences' => (int)$summary['non_null']]];
+      } elseif (is_finite($maximum - $minimum) && $maximum > $minimum) {
+        $minSql = sprintf('%.17g', $minimum);
+        $maxSql = sprintf('%.17g', $maximum);
+        $expression = 'LEAST(9, GREATEST(0, FLOOR((CAST(' . $field . ' AS DOUBLE) - (' . $minSql . ')) / ((' . $maxSql . ') - (' . $minSql . ')) * 10)))';
+        foreach (ms_insight_rows($db, 'SELECT ' . $expression . ' AS bucket, COUNT(*) AS occurrences FROM ' . qi($table) . ' WHERE ' . $field . ' IS NOT NULL GROUP BY bucket ORDER BY bucket') as $bucket) {
+          $index = (int)$bucket['bucket'];
+          $lower = $minimum + ($maximum - $minimum) * $index / 10;
+          $upper = $minimum + ($maximum - $minimum) * ($index + 1) / 10;
+          $chart[] = ['bucket' => $index, 'label' => sprintf('%.6g – %.6g', $lower, $upper), 'occurrences' => (int)$bucket['occurrences']];
+        }
+      }
+    }
+  } elseif ($temporal && (int)($summary['non_null'] ?? 0) > 0) {
+    $months = ms_insight_rows($db, 'SELECT DATE_FORMAT(' . $field . ", '%Y-%m') AS month, COUNT(*) AS occurrences FROM " . qi($table) . ' WHERE ' . $field . ' IS NOT NULL GROUP BY month ORDER BY month DESC LIMIT 12');
+    foreach (array_reverse($months) as $month) $chart[] = ['label' => $month['month'] ?? 'Unknown', 'occurrences' => (int)$month['occurrences']];
+  }
+  return ['column' => $name, 'type' => (string)$column['COLUMN_TYPE'], 'summary' => $summary, 'top' => $top, 'chart' => $chart,
+    'chart_title' => $numeric ? 'Value ranges' : ($temporal ? 'Recent months with values' : ''),
+    'null_token' => ms_insight_group_token([$name => null]), 'empty_token' => $textual ? ms_insight_group_token([$name => '']) : '',
+    'groupable' => $groupable];
+}
+
+function ms_insight_duplicates(mysqli $db, string $table, array $names, array $columns, int $page): array {
+  $available = [];
+  foreach ($columns as $column) if (ms_insight_groupable($column)) $available[(string)$column['COLUMN_NAME']] = true;
+  $names = array_values(array_unique($names));
+  if (!$names || count($names) > 5) throw new RuntimeException('Choose between one and five columns.');
+  foreach ($names as $name) if (!is_string($name) || !isset($available[$name])) throw new RuntimeException('One of the selected columns cannot be grouped exactly.');
+  $fields = implode(', ', array_map('qi', $names));
+  $countAlias = '__ms_insight_count';
+  while (in_array($countAlias, $names, true)) $countAlias .= '_';
+  $offset = ($page - 1) * 50;
+  $rows = ms_insight_rows($db, 'SELECT ' . $fields . ', COUNT(*) AS ' . qi($countAlias) . ' FROM ' . qi($table) .
+    ' GROUP BY ' . $fields . ' HAVING COUNT(*) > 1 ORDER BY ' . qi($countAlias) . ' DESC, ' . $fields . ' LIMIT ' . $offset . ',51');
+  $more = count($rows) > 50;
+  if ($more) array_pop($rows);
+  $groups = [];
+  foreach ($rows as $row) {
+    $values = [];
+    foreach ($names as $name) $values[$name] = $row[$name];
+    $groups[] = ['values' => $values, 'occurrences' => (int)$row[$countAlias], 'token' => ms_insight_group_token($values)];
+  }
+  return ['columns' => $names, 'groups' => $groups, 'page' => $page, 'has_more' => $more];
 }
 
 
@@ -3797,6 +3908,37 @@ try {
       exit;
     }
 
+    if (g('ajax') === 'column_insights') {
+      header('Content-Type: application/json; charset=UTF-8');
+      header('Cache-Control: no-store');
+      try {
+        $database = selected_db();
+        if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
+        $table = g('table');
+        if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
+        $columns = table_columns($db, $table);
+        if (g('kind') === 'analyze') {
+          $column = null;
+          foreach ($columns as $candidate) if ((string)$candidate['COLUMN_NAME'] === g('column')) $column = $candidate;
+          if ($column === null) throw new RuntimeException('Column not found.');
+          $data = ms_insight_analyze($db, $table, $column);
+        } elseif (g('kind') === 'duplicates') {
+          $requested = $_GET['columns'] ?? [];
+          if (!is_array($requested)) throw new RuntimeException('Choose at least one column.');
+          $page = g('group_page', '1');
+          if (preg_match('/\A[1-9][0-9]{0,3}\z/', $page) !== 1 || (int)$page > 1000) throw new RuntimeException('Invalid duplicate page.');
+          $data = ms_insight_duplicates($db, $table, $requested, $columns, (int)$page);
+        } else {
+          throw new RuntimeException('Unknown column analysis operation.');
+        }
+        echo json_encode(['ok' => true, 'data' => $data], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+      } catch (Throwable $ajaxError) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+      }
+      exit;
+    }
+
     if (g('ajax') === 'pdf_row') {
       header('Content-Type: application/json; charset=UTF-8');
       header('Cache-Control: no-store');
@@ -5289,6 +5431,9 @@ function page_head(string $title, bool $authenticated): void {
     .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main,.ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{display:flex;width:100%;max-width:100%}
     .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main{justify-content:center}
     .ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{justify-content:flex-end}
+    .ms-insight-menu{position:fixed;z-index:1060;min-width:12rem;box-shadow:0 .5rem 1.5rem rgba(0,0,0,.2)}
+    .ms-insight-bar{height:.7rem;min-width:2px;background:var(--ms-accent);border-radius:.25rem}
+    .ms-insight-chart{max-height:21rem;overflow:auto}
     .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-drag-handle,.ms-layout-table[data-ms-pretty-mode="edit"] th.text-end[data-ms-header-alignment="right"] .ms-col-drag-handle{position:absolute;left:var(--ms-table-pad-x);top:50%;transform:translateY(-50%);margin-right:0}
     .ms-layout-table[data-ms-pretty-mode="edit"] th.text-center[data-ms-header-alignment="center"] .ms-col-header-name{max-width:calc(100% - 2rem)}
     .ms-select-table-name{border:0;padding:0;background:none;color:inherit;font:inherit;line-height:inherit;text-align:left;cursor:pointer}
@@ -7072,6 +7217,9 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
     if($op==='ends')$value='%'.$value;
     $where[]=qi($column).' '.$sqlOp.' '.qs($db,$value);
   }
+  foreach(ms_insight_group_decode(g('duplicate_group'),$columns) as $column=>$value){
+    $where[]=qi((string)$column).' <=> '.qs($db,$value);
+  }
   $globalSearch=g('global_search');
   if($globalSearch!==''&&$columns){
     $pattern=qs($db,'%'.$globalSearch.'%');$globalTerms=[];
@@ -7453,6 +7601,12 @@ function page_select(mysqli $db): void {
   $rowCountLabel=$partialRows?($aggregated?'displayed result rows':'displayed rows').' of '.number_format($allRowsTotal).' total table rows':'total table rows';
   $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" data-ms-row-count-pill data-ms-total-rows="'.h((string)$allRowsTotal).'" data-ms-count-partial="'.($where||$aggregated?'1':'0').'" data-ms-result-unit="'.($aggregated?'result rows':'rows').'" aria-label="'.h(number_format($shownRows).' '.$rowCountLabel).'">'.h($rowCount).'</span>';
   title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
+  if (g('duplicate_group') !== '') {
+    $duplicateValues=ms_insight_group_decode(g('duplicate_group'),$columns);
+    if ($duplicateValues) {
+      ?><div class="alert alert-info d-flex flex-wrap align-items-center justify-content-between gap-2 no-print"><span><i class="fa-solid fa-layer-group me-2" aria-hidden="true"></i>Rows in a duplicate group for <?= h(implode(' + ',array_keys($duplicateValues))) ?>.</span><a class="btn btn-outline-primary btn-sm" href="<?= h(url(['duplicate_group'=>null,'p'=>null])) ?>">Clear duplicate group</a></div><?php
+    }
+  }
   ?>
   <div class="modal fade" id="ms-table-icon-modal" tabindex="-1" aria-labelledby="ms-table-icon-modal-title" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
@@ -8253,12 +8407,216 @@ function page_select(mysqli $db): void {
       $enumValues=(string)($headerMeta['DATA_TYPE']??'')==='enum'?ms_enum_values((string)($headerMeta['COLUMN_TYPE']??'')):[];
       $enumJson=json_encode($enumValues,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($enumJson))$enumJson='[]';
       $isSoftDeleteColumn=$softDeleteRule!==null&&$softDeleteRule['column']===$header;
-      ?><th<?php if(!$aggregated){ ?> data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      ?><th<?php if(!$aggregated){ ?> tabindex="0" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if(!$aggregated){
+    $insightColumns=[];
+    foreach($columns as $insightColumn)if(ms_insight_groupable($insightColumn))$insightColumns[]=(string)$insightColumn['COLUMN_NAME'];
+    $insightColumnsJson=json_encode($insightColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
+  ?>
+    <div id="ms-insight-context-menu" class="dropdown-menu ms-insight-menu no-print" role="menu" hidden>
+      <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="analyze"><i class="fa-solid fa-chart-simple me-2" aria-hidden="true"></i>Analyze column</button>
+      <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="duplicates"><i class="fa-solid fa-clone me-2" aria-hidden="true"></i>Find duplicates</button>
+    </div>
+    <div class="modal fade" id="ms-column-insights-modal" tabindex="-1" aria-labelledby="ms-column-insights-title" aria-hidden="true" data-ms-eligible-columns="<?= h($insightColumnsJson) ?>">
+      <div class="modal-dialog modal-xl modal-fullscreen-md-down modal-dialog-scrollable"><div class="modal-content">
+        <div class="modal-header"><h2 class="modal-title fs-5" id="ms-column-insights-title">Column analysis</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body">
+          <div class="small text-body-secondary mb-3">Analysis covers the entire table or view, including rows outside the current page and filters.</div>
+          <div data-ms-insight-controls hidden>
+            <div class="fw-semibold mb-2">Match on these columns <span class="fw-normal text-body-secondary">(up to five)</span></div>
+            <div class="border rounded p-2 mb-3 d-flex flex-wrap gap-2 ms-insight-chart" data-ms-insight-column-choices></div>
+            <button type="button" class="btn btn-primary mb-3" data-ms-insight-search><i class="fa-solid fa-magnifying-glass me-1" aria-hidden="true"></i>Find duplicate groups</button>
+            <div class="form-text mb-3">NULL and empty strings are included. Text, binary, JSON and spatial fields cannot be grouped reliably and are omitted.</div>
+          </div>
+          <div role="status" aria-live="polite" data-ms-insight-status></div>
+          <div data-ms-insight-result></div>
+          <nav class="d-flex align-items-center justify-content-center gap-3 mt-3" data-ms-insight-pagination hidden aria-label="Duplicate group pages">
+            <button type="button" class="btn btn-outline-secondary btn-sm" data-ms-insight-prev>Previous</button><span data-ms-insight-page></span><button type="button" class="btn btn-outline-secondary btn-sm" data-ms-insight-next>Next</button>
+          </nav>
+        </div>
+      </div></div>
+    </div>
+  <?php } ?>
+  <?php if(!$aggregated){ ?>
+  <script>
+  (()=>{
+    'use strict';
+    const table=document.querySelector('#ms-select-row-form [data-ms-table-layout]');
+    const menu=document.getElementById('ms-insight-context-menu');
+    const modal=document.getElementById('ms-column-insights-modal');
+    if(!table||!menu||!modal)return;
+    const title=modal.querySelector('#ms-column-insights-title');
+    const controls=modal.querySelector('[data-ms-insight-controls]');
+    const choices=modal.querySelector('[data-ms-insight-column-choices]');
+    const search=modal.querySelector('[data-ms-insight-search]');
+    const status=modal.querySelector('[data-ms-insight-status]');
+    const result=modal.querySelector('[data-ms-insight-result]');
+    const pagination=modal.querySelector('[data-ms-insight-pagination]');
+    const previous=modal.querySelector('[data-ms-insight-prev]');
+    const next=modal.querySelector('[data-ms-insight-next]');
+    const pageLabel=modal.querySelector('[data-ms-insight-page]');
+    const eligible=JSON.parse(modal.dataset.msEligibleColumns||'[]');
+    let column='',kind='',page=1,controller=null;
+    const element=(tag,className='',label)=>{const node=document.createElement(tag);if(className)node.className=className;if(label!==undefined)node.textContent=String(label);return node;};
+    const number=value=>Number(value||0).toLocaleString('en-US');
+    const display=value=>value===null?'NULL':String(value)===''?'(empty string)':String(value);
+    const short=value=>{const label=display(value);return label.length>140?label.slice(0,140)+'…':label;};
+    const groupLink=token=>'?'+new URLSearchParams({page:'select',table:table.dataset.msTable||'',duplicate_group:token}).toString();
+    const closeMenu=()=>{menu.hidden=true;menu.classList.remove('show');};
+    const showMenu=(header,x,y)=>{
+      column=header.dataset.msColumn||'';
+      menu.hidden=false;menu.classList.add('show');
+      menu.style.left=Math.max(8,Math.min(x,window.innerWidth-menu.offsetWidth-8))+'px';
+      menu.style.top=Math.max(8,Math.min(y,window.innerHeight-menu.offsetHeight-8))+'px';
+      menu.querySelector('button')?.focus();
+    };
+    table.addEventListener('contextmenu',event=>{
+      const header=event.target instanceof Element?event.target.closest('thead th[data-ms-column]'):null;
+      if(!header)return;
+      event.preventDefault();showMenu(header,event.clientX,event.clientY);
+    });
+    table.addEventListener('keydown',event=>{
+      if(event.key!=='ContextMenu'&&!(event.shiftKey&&event.key==='F10'))return;
+      const header=event.target instanceof Element?event.target.closest('thead th[data-ms-column]'):null;
+      if(!header)return;
+      event.preventDefault();const rect=header.getBoundingClientRect();showMenu(header,rect.left+20,rect.bottom);
+    });
+    document.addEventListener('pointerdown',event=>{if(!menu.contains(event.target))closeMenu();});
+    document.addEventListener('keydown',event=>{if(event.key==='Escape')closeMenu();});
+    window.addEventListener('scroll',closeMenu,true);
+    window.addEventListener('resize',closeMenu);
+    const showStatus=(message,error=false)=>{status.className=error?'alert alert-danger':'small text-body-secondary mb-2';status.textContent=message;};
+    const statCard=(label,value,detail,token)=>{
+      const card=element('div','col-sm-6 col-lg-3');
+      const box=element('div','border rounded p-3 h-100');
+      box.append(element('div','small text-body-secondary',label),element('div','fs-4 fw-semibold text-break',value));
+      if(detail)box.append(element('div','small text-body-secondary',detail));
+      if(token){const link=element('a','small', 'View rows');link.href=groupLink(token);box.append(link);}
+      card.append(box);return card;
+    };
+    const distribution=(items,titleText)=>{
+      const section=element('section','mt-4');section.append(element('h3','h6 mb-3',titleText));
+      if(!items.length){section.append(element('p','text-body-secondary','No values to chart.'));return section;}
+      const max=Math.max(1,...items.map(item=>Number(item.occurrences)||0));
+      const list=element('div','ms-insight-chart');
+      items.forEach(item=>{
+        const row=element('div','row g-2 align-items-center mb-2');
+        const label=element('div','col-sm-4 text-truncate small',short(item.label!==undefined?item.label:item.value));
+        label.title=display(item.label!==undefined?item.label:item.value);
+        const barColumn=element('div','col-sm-6');
+        const track=element('div','bg-body-tertiary rounded');
+        const bar=element('div','ms-insight-bar');bar.style.width=Math.max(2,100*(Number(item.occurrences)||0)/max)+'%';
+        track.append(bar);barColumn.append(track);
+        row.append(label,barColumn,element('div','col-sm-2 text-sm-end small',number(item.occurrences)));
+        list.append(row);
+      });section.append(list);return section;
+    };
+    const renderAnalysis=data=>{
+      const s=data.summary||{};const total=Number(s.total)||0;const nulls=total-(Number(s.non_null)||0);
+      const percent=value=>total?(100*value/total).toFixed(1)+'% of rows':'0% of rows';
+      const grid=element('div','row g-2');
+      grid.append(statCard('Rows',number(s.total)),statCard('Non-NULL',number(s.non_null)),statCard('NULL',number(nulls),percent(nulls),data.null_token));
+      if(s.distinct_count!==undefined)grid.append(statCard('Distinct non-NULL',number(s.distinct_count)));
+      if(s.empty_count!==undefined)grid.append(statCard('Empty strings',number(s.empty_count),percent(Number(s.empty_count)||0),data.empty_token));
+      if(s.min_value!==undefined)grid.append(statCard('Minimum',display(s.min_value)));
+      if(s.max_value!==undefined)grid.append(statCard('Maximum',display(s.max_value)));
+      if(s.average_value!==undefined)grid.append(statCard('Average',display(s.average_value)));
+      result.append(element('p','small text-body-secondary','Database type: '+data.type),grid);
+      if(data.chart&&data.chart.length)result.append(distribution(data.chart,data.chart_title));
+      if(data.groupable){
+        const top=(data.top||[]).map(item=>({...item,label:item.value}));
+        result.append(distribution(top,'Most common values'));
+        if(top.length){
+          const links=element('div','d-flex flex-wrap gap-2 mt-2');
+          top.forEach(item=>{const link=element('a','btn btn-outline-secondary btn-sm text-truncate',short(item.value));link.href=groupLink(item.token);link.title='View rows with '+display(item.value);links.append(link);});
+          result.append(links);
+        }
+      }else result.append(element('p','small text-body-secondary mt-3','Distinct values and distribution are unavailable for long text, binary, JSON, spatial or other non-groupable fields.'));
+    };
+    const selectedColumns=()=>Array.from(choices.querySelectorAll('input:checked')).map(input=>input.value);
+    const renderGroups=data=>{
+      const groups=data.groups||[];
+      if(!groups.length){
+        result.append(element('div','alert alert-info','No duplicate groups on this page.'));
+        pagination.hidden=data.page<=1;
+        pageLabel.textContent='Page '+number(data.page);
+        previous.disabled=data.page<=1;next.disabled=true;
+        return;
+      }
+      const wrapper=element('div','table-responsive border rounded');
+      const grid=element('table','table table-sm table-striped align-middle mb-0');
+      const head=element('thead');const headRow=element('tr');
+      data.columns.forEach(name=>headRow.append(element('th','',name)));
+      headRow.append(element('th','text-end','Rows'),element('th','text-end',''));
+      head.append(headRow);grid.append(head);
+      const body=element('tbody');
+      groups.forEach(group=>{
+        const row=element('tr');
+        data.columns.forEach(name=>{const cell=element('td','code text-break',short(group.values[name]));cell.title=display(group.values[name]);row.append(cell);});
+        const count=element('td','text-end fw-semibold',number(group.occurrences));
+        const action=element('td','text-end');const link=element('a','btn btn-outline-primary btn-sm text-nowrap','View rows');link.href=groupLink(group.token);action.append(link);
+        row.append(count,action);body.append(row);
+      });grid.append(body);wrapper.append(grid);result.append(wrapper);
+      pagination.hidden=data.page===1&&!data.has_more;
+      pageLabel.textContent='Page '+number(data.page);
+      previous.disabled=data.page<=1;next.disabled=!data.has_more;
+    };
+    const load=async()=>{
+      if(controller)controller.abort();controller=new AbortController();const request=controller;
+      const params=new URLSearchParams({ajax:'column_insights',table:table.dataset.msTable||'',kind});
+      if(kind==='analyze')params.set('column',column);
+      else{
+        const names=selectedColumns();
+        if(!names.length){result.replaceChildren();pagination.hidden=true;showStatus('Choose at least one supported column.',true);return;}
+        names.forEach(name=>params.append('columns[]',name));params.set('group_page',String(page));
+      }
+      result.replaceChildren();pagination.hidden=true;search.disabled=kind==='duplicates';showStatus('Analyzing the entire table…');
+      try{
+        const response=await fetch('?'+params.toString(),{credentials:'same-origin',headers:{Accept:'application/json'},signal:request.signal});
+        if(!/^application\/json/i.test(response.headers.get('Content-Type')||''))throw new Error('Sign in again and retry.');
+        const payload=await response.json();
+        if(!response.ok||!payload.ok)throw new Error(payload.error||'Unable to analyze this column.');
+        if(request!==controller)return;
+        status.className='';status.textContent='';
+        if(kind==='analyze')renderAnalysis(payload.data);else renderGroups(payload.data);
+      }catch(error){if(error.name!=='AbortError'&&request===controller)showStatus(error.message||'Analysis failed.',true);}
+      finally{if(request===controller)search.disabled=false;}
+    };
+    const open=(requestedKind)=>{
+      kind=requestedKind;page=1;closeMenu();result.replaceChildren();status.className='';status.textContent='';pagination.hidden=true;
+      controls.hidden=kind!=='duplicates';
+      title.textContent=kind==='analyze'?'Analyze column · '+column:'Find duplicates · '+(table.dataset.msTable||'');
+      if(kind==='duplicates'){
+        choices.replaceChildren();
+        eligible.forEach(name=>{
+          const label=element('label','border rounded px-2 py-1 d-inline-flex align-items-center gap-2');
+          const input=element('input','form-check-input m-0');input.type='checkbox';input.value=name;input.checked=name===column;
+          label.append(input,element('span','code',name));choices.append(label);
+        });
+        if(!eligible.includes(column))showStatus('This field cannot be grouped exactly. Select a supported field below.');
+      }
+      bootstrap.Modal.getOrCreateInstance(modal).show();
+      if(kind==='analyze'||selectedColumns().length)load();
+    };
+    menu.querySelectorAll('[data-ms-insight-kind]').forEach(button=>button.addEventListener('click',()=>open(button.dataset.msInsightKind)));
+    choices.addEventListener('change',event=>{
+      if(selectedColumns().length>5){event.target.checked=false;showStatus('Select no more than five columns.',true);return;}
+      if(controller)controller.abort();
+      result.replaceChildren();pagination.hidden=true;page=1;
+      showStatus('Selection changed. Run Find duplicate groups to refresh the results.');
+    });
+    search.addEventListener('click',()=>{page=1;load();});
+    previous.addEventListener('click',()=>{if(page>1){page--;load();}});
+    next.addEventListener('click',()=>{page++;load();});
+    modal.addEventListener('hidden.bs.modal',()=>{if(controller)controller.abort();controller=null;});
+  })();
+  </script>
+  <?php } ?>
   <?php if($hasMoreRows){ ?><div class="d-flex justify-content-center mt-2 no-print" data-ms-show-more data-next-offset="<?= h((string)$nextOffset) ?>" data-total="<?= h((string)$total) ?>">
     <div class="input-group input-group-sm" style="max-width:22rem">
       <button class="btn btn-outline-primary" type="button" data-ms-show-more-button><i class="fa-solid fa-angles-down me-1"></i>Show</button>
