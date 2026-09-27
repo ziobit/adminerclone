@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.21';
+const MS_VERSION = '1.15.22';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -5506,7 +5506,7 @@ try {
 }
 
 function page_head(string $title, bool $authenticated): void {
-  $namedPageLoader = isset($_GET['pageid']) && is_scalar($_GET['pageid']) && trim((string)$_GET['pageid']) !== '';
+  $namedPageLoader = isset($_GET['page']) && is_scalar($_GET['page']) && trim((string)$_GET['page']) !== '';
   $clientSettings = ms_profile_settings();
   $clientSettings['hiddenSidebarObjects'] = selected_db() !== '' ? ms_profile_hidden_sidebar(selected_db()) : [];
   $clientSettingsJson = json_encode($clientSettings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
@@ -11024,7 +11024,7 @@ function page_users(mysqli $db): void {
 
 function render_column_display_settings(): void {
   $database = selected_db();
-  ?><section class="card mt-4 mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
+  ?><section class="card mb-3" data-ms-settings-collapsible><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h2 class="h5 mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column display rules</h2><?php if($database!==''){?><span class="badge text-bg-secondary"><?= h($database) ?></span><?php }?></div><div class="card-body"><?php
   if ($database === '') {
     ?><div class="alert alert-info mb-0">Choose a database first to manage hidden columns, custom field names, formatting, image displays and soft foreign keys.</div><?php
   } else {
