@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.23';
+const MS_VERSION = '1.15.24';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -301,6 +301,7 @@ function ms_profile_default_settings(): array {
     'density' => 'standard',
     'scheme' => 'ocean',
     'customColors' => ms_custom_theme_defaults(),
+    'customThemeSaved' => false,
     'sqlRows' => 1000,
     'selectRows' => 50,
     'paginationPosition' => 'bottom',
@@ -350,6 +351,7 @@ function ms_profile_normalize_settings(array $source): array {
       $settings['customColors'][$mode][$key] = is_string($color) && preg_match('/\A#[0-9a-fA-F]{6}\z/', $color) === 1 ? strtolower($color) : $fallback;
     }
   }
+  $settings['customThemeSaved'] = ($source['customThemeSaved'] ?? false) === true || $settings['scheme'] === 'custom' || $settings['customColors'] !== $defaults['customColors'];
   $settings['sqlRows'] = max(1, min(100000, (int)($source['sqlRows'] ?? $defaults['sqlRows'])));
   $settings['selectRows'] = max(1, min(500, (int)($source['selectRows'] ?? $defaults['selectRows'])));
   $settings['paginationPosition'] = in_array((string)($source['paginationPosition'] ?? ''), $pagination, true) ? (string)$source['paginationPosition'] : $defaults['paginationPosition'];
@@ -4455,6 +4457,7 @@ try {
           'density' => p('density'),
           'scheme' => p('scheme'),
           'customColors' => isset($_POST['customColors']) && is_array($_POST['customColors']) ? $_POST['customColors'] : $current['customColors'],
+          'customThemeSaved' => $current['customThemeSaved'] || p('customThemeSaved') === '1',
           'sqlRows' => (int)p('sqlRows', '1000'),
           'selectRows' => (int)p('selectRows', '50'),
           'paginationPosition' => p('paginationPosition', 'bottom'),
@@ -6343,6 +6346,9 @@ function page_foot(): void {
     const customPreview=settingsForm.querySelector('[data-ms-custom-preview]');
     const customFields=Array.from(settingsForm.querySelectorAll('[data-ms-custom-color]'));
     const customPickers=Array.from(settingsForm.querySelectorAll('[data-ms-custom-picker]'));
+    const customSavedFlag=document.getElementById('ms-custom-theme-saved');
+    let customThemeDraftExists=false;
+    const markCustomDraft=()=>{customThemeDraftExists=true;if(customSavedFlag)customSavedFlag.value='1';};
     let editingCustomMode=settings.theme==='dark'?'dark':'light';
     const customPalette=mode=>{
       const colors={};
@@ -6434,13 +6440,34 @@ function page_foot(): void {
     };
     settingsForm.addEventListener('change',event=>{
       if(event.target.name==='theme')setCustomMode(settingsForm.elements.theme.value);
+      if(event.target.name==='scheme'&&event.target.value==='custom')markCustomDraft();
       if(customEditor)customEditor.hidden=settingsForm.elements.scheme.value!=='custom';
       previewSettings();
     });
+    const mixWhite=hex=>'#'+[1,3,5].map(index=>Math.round(parseInt(hex.slice(index,index+2),16)*.55+255*.45).toString(16).padStart(2,'0')).join('');
+    settingsForm.querySelectorAll('[data-ms-custom-from]').forEach(button=>button.addEventListener('click',()=>{
+      if((settings.customThemeSaved||customThemeDraftExists)&&!confirm('A custom theme already exists in this profile. Starting from '+button.dataset.msCustomLabel+' will replace both of its palettes when you save. Continue?'))return;
+      const defaults=window.msSettingsMeta.defaults.customColors;
+      const accent=button.dataset.msCustomAccent;
+      const contrast=button.dataset.msCustomFrom==='contrast';
+      const palettes={
+        light:{...defaults.light,accent,accent_hover:button.dataset.msCustomHover,accent_text:'#ffffff',link:button.dataset.msCustomLink},
+        dark:{...defaults.dark,accent:contrast?'#facc15':accent,accent_hover:contrast?'#eab308':button.dataset.msCustomHover,accent_text:contrast?'#111111':'#ffffff',link:contrast?'#fde047':mixWhite(accent)}
+      };
+      customFields.forEach(input=>{input.value=palettes[input.dataset.msCustomModeName][input.dataset.msCustomKey];});
+      customPickers.forEach(picker=>{picker.value=palettes[picker.dataset.msCustomModeName][picker.dataset.msCustomKey];});
+      settingsForm.querySelector('#scheme-custom').checked=true;
+      if(customEditor)customEditor.hidden=false;
+      markCustomDraft();
+      setCustomMode(settingsForm.elements.theme.value);
+      previewSettings();
+      customEditor?.scrollIntoView({behavior:'smooth',block:'start'});
+    }));
     settingsForm.querySelectorAll('[data-ms-custom-mode-button]').forEach(button=>button.addEventListener('click',()=>setCustomMode(button.dataset.msCustomModeButton)));
     customPickers.forEach(picker=>picker.addEventListener('input',()=>{
       const text=customFields.find(input=>input.dataset.msCustomModeName===picker.dataset.msCustomModeName&&input.dataset.msCustomKey===picker.dataset.msCustomKey);
       if(text)text.value=picker.value;
+      markCustomDraft();
       renderCustomPreview();previewSettings();
     }));
     customFields.forEach(input=>input.addEventListener('input',()=>{
@@ -6448,6 +6475,7 @@ function page_foot(): void {
         const picker=customPickers.find(item=>item.dataset.msCustomModeName===input.dataset.msCustomModeName&&item.dataset.msCustomKey===input.dataset.msCustomKey);
         if(picker)picker.value=input.value;
       }
+      markCustomDraft();
       renderCustomPreview();previewSettings();
     }));
     customFields.forEach(input=>input.addEventListener('invalid',()=>{
@@ -6458,6 +6486,7 @@ function page_foot(): void {
       const defaults=window.msSettingsMeta.defaults.customColors;
       customFields.forEach(input=>{input.value=defaults[input.dataset.msCustomModeName][input.dataset.msCustomKey];});
       customPickers.forEach(picker=>{picker.value=defaults[picker.dataset.msCustomModeName][picker.dataset.msCustomKey];});
+      markCustomDraft();
       renderCustomPreview();previewSettings();
     });
     const showMenu=document.getElementById('ms-menu-show-all');
@@ -11224,7 +11253,8 @@ function render_column_display_settings(): void {
 }
 
 function page_settings(): void {
-  $customColors = ms_profile_settings()['customColors'];
+  $profileSettings = ms_profile_settings();
+  $customColors = $profileSettings['customColors'];
   $densities = [
     'ultracompact' => ['Ultracompact', 'Maximum information density for large tables.'],
     'compact' => ['Compact', 'More rows and controls without feeling cramped.'],
@@ -11232,16 +11262,16 @@ function page_settings(): void {
     'large' => ['Large', 'Larger controls and generous spacing for touch use.']
   ];
   $schemes = [
-    'ocean' => ['Ocean Blue', '#0d6efd', 'Familiar, clear and neutral.'],
-    'indigo' => ['Indigo', '#6610f2', 'Technical and focused.'],
-    'emerald' => ['Emerald', '#198754', 'Calm, positive and operational.'],
-    'teal' => ['Teal', '#0f766e', 'Low-fatigue professional palette.'],
-    'ruby' => ['Ruby', '#c92a2a', 'Strong emphasis for critical workflows.'],
-    'amber' => ['Amber', '#a65f00', 'Warm, readable and understated.'],
-    'violet' => ['Violet', '#7c3aed', 'Distinctive without losing clarity.'],
-    'rose' => ['Rose', '#be185d', 'Warm modern interface accent.'],
-    'slate' => ['Slate', '#475569', 'Distraction-free administrative look.'],
-    'contrast' => ['High Contrast', '#111827', 'Maximum separation and visibility.']
+    'ocean' => ['Ocean Blue', '#0d6efd', 'Familiar, clear and neutral.', '#0b5ed7', '#0a58ca'],
+    'indigo' => ['Indigo', '#6610f2', 'Technical and focused.', '#520dc2', '#5b0cd6'],
+    'emerald' => ['Emerald', '#198754', 'Calm, positive and operational.', '#146c43', '#157347'],
+    'teal' => ['Teal', '#0f766e', 'Low-fatigue professional palette.', '#115e59', '#0f766e'],
+    'ruby' => ['Ruby', '#c92a2a', 'Strong emphasis for critical workflows.', '#a61e1e', '#b42323'],
+    'amber' => ['Amber', '#a65f00', 'Warm, readable and understated.', '#854d0e', '#925400'],
+    'violet' => ['Violet', '#7c3aed', 'Distinctive without losing clarity.', '#6d28d9', '#6d28d9'],
+    'rose' => ['Rose', '#be185d', 'Warm modern interface accent.', '#9d174d', '#ad1457'],
+    'slate' => ['Slate', '#475569', 'Distraction-free administrative look.', '#334155', '#3f4c5f'],
+    'contrast' => ['High Contrast', '#111827', 'Maximum separation and visibility.', '#000000', '#111827']
   ];
   $menuItems = [
     'databases' => ['fa-database', 'Databases'],
@@ -11311,7 +11341,7 @@ function page_settings(): void {
     <?php if($activeProfile!=='Default'){ ?><div class="col-lg-4"><div class="d-flex flex-wrap gap-2"><form method="post" class="d-flex gap-2 flex-grow-1"><input type="hidden" name="action" value="rename_profile"><?= csrf_field() ?><input class="form-control" name="profile_name" value="<?= h($activeProfile) ?>" maxlength="80" required><button class="btn btn-secondary text-nowrap"><i class="fa-solid fa-pen me-1"></i>Rename</button></form><form method="post"><input type="hidden" name="action" value="delete_profile"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete profile <?= h($activeProfile) ?> and all of its settings?"><i class="fa-solid fa-trash"></i></button></form></div></div><?php } ?>
     </div><div class="form-text mt-3">Default always exists. New profiles copy the complete active profile by default; turn the switch off to start from clean defaults. No legacy configuration is imported.</div>
   </div></section>
-  <form id="ms-settings-form" method="post"><input type="hidden" name="action" value="save_profile_settings"><?= csrf_field() ?>
+  <form id="ms-settings-form" method="post"><input type="hidden" name="action" value="save_profile_settings"><input type="hidden" name="customThemeSaved" id="ms-custom-theme-saved" value="<?= $profileSettings['customThemeSaved'] ? '1' : '0' ?>"><?= csrf_field() ?>
     <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-circle-half-stroke me-2"></i>Appearance mode</h2></div><div class="card-body"><div class="row g-3">
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-light" value="light"><label class="settings-choice card h-100" for="theme-light"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-warning"><i class="fa-solid fa-sun"></i></span><span><strong class="d-block">Light</strong><span class="text-body-secondary">Bright background for well-lit environments.</span></span></div></label></div>
       <div class="col-md-6"><input class="btn-check" type="radio" name="theme" id="theme-dark" value="dark"><label class="settings-choice card h-100" for="theme-dark"><div class="card-body d-flex align-items-center gap-3"><span class="display-6 text-primary"><i class="fa-solid fa-moon"></i></span><span><strong class="d-block">Dark</strong><span class="text-body-secondary">Reduced glare for low-light environments.</span></span></div></label></div>
@@ -11321,8 +11351,8 @@ function page_settings(): void {
       <div class="col-sm-6 col-xl-3"><input class="btn-check" type="radio" name="density" id="density-<?= h($key) ?>" value="<?= h($key) ?>"><label class="settings-choice card h-100" for="density-<?= h($key) ?>"><div class="card-body"><strong class="d-block mb-1"><?= h($label) ?></strong><span class="small text-body-secondary"><?= h($description) ?></span></div></label></div>
     <?php } ?></div></div></section>
 
-    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-palette me-2"></i>Color scheme</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($schemes as $key => [$label, $color, $description]) { ?>
-      <div class="col-sm-6 col-lg-4 col-xl-3 col-xxl-2"><input class="btn-check" type="radio" name="scheme" id="scheme-<?= h($key) ?>" value="<?= h($key) ?>"><label class="settings-choice card h-100" for="scheme-<?= h($key) ?>"><div class="card-body"><div class="scheme-swatch mb-2" style="--swatch:<?= h($color) ?>"></div><strong class="d-block"><?= h($label) ?></strong><span class="small text-body-secondary"><?= h($description) ?></span></div></label></div>
+    <section class="card mb-3" data-ms-settings-collapsible><div class="card-header"><h2 class="h5 mb-0"><i class="fa-solid fa-palette me-2"></i>Color scheme</h2></div><div class="card-body"><div class="row g-3"><?php foreach ($schemes as $key => [$label, $color, $description, $hover, $link]) { ?>
+      <div class="col-sm-6 col-lg-4 col-xl-3 col-xxl-2 d-flex flex-column"><input class="btn-check" type="radio" name="scheme" id="scheme-<?= h($key) ?>" value="<?= h($key) ?>"><label class="settings-choice card flex-grow-1" for="scheme-<?= h($key) ?>"><div class="card-body"><div class="scheme-swatch mb-2" style="--swatch:<?= h($color) ?>"></div><strong class="d-block"><?= h($label) ?></strong><span class="small text-body-secondary"><?= h($description) ?></span></div></label><button type="button" class="btn btn-outline-primary btn-sm mt-2" data-ms-custom-from="<?= h($key) ?>" data-ms-custom-label="<?= h($label) ?>" data-ms-custom-accent="<?= h($color) ?>" data-ms-custom-hover="<?= h($hover) ?>" data-ms-custom-link="<?= h($link) ?>">Start custom from here</button></div>
     <?php } ?>
       <div class="col-sm-6 col-lg-4 col-xl-3 col-xxl-2"><input class="btn-check" type="radio" name="scheme" id="scheme-custom" value="custom"><label class="settings-choice card h-100" for="scheme-custom"><div class="card-body"><div class="scheme-swatch mb-2" id="ms-custom-scheme-swatch" style="--swatch:<?= h($customColors['light']['accent']) ?>"></div><strong class="d-block">Custom</strong><span class="small text-body-secondary">One saved palette with light and dark colors.</span></div></label></div>
     </div>
