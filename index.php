@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.20';
+const MS_VERSION = '1.15.21';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -273,6 +273,7 @@ function ms_profile_default_settings(): array {
     'sqlRows' => 1000,
     'selectRows' => 50,
     'paginationPosition' => 'bottom',
+    'selectToolsPosition' => 'before',
     'truncateCells' => false,
     'rawDbView' => false,
     'schemaColumnWidth' => 3,
@@ -313,6 +314,7 @@ function ms_profile_normalize_settings(array $source): array {
   $settings['sqlRows'] = max(1, min(100000, (int)($source['sqlRows'] ?? $defaults['sqlRows'])));
   $settings['selectRows'] = max(1, min(500, (int)($source['selectRows'] ?? $defaults['selectRows'])));
   $settings['paginationPosition'] = in_array((string)($source['paginationPosition'] ?? ''), $pagination, true) ? (string)$source['paginationPosition'] : $defaults['paginationPosition'];
+  $settings['selectToolsPosition'] = ($source['selectToolsPosition'] ?? '') === 'after' ? 'after' : 'before';
   $settings['truncateCells'] = !empty($source['truncateCells']);
   $settings['rawDbView'] = !empty($source['rawDbView']);
   $schemaWidth = (int)($source['schemaColumnWidth'] ?? $defaults['schemaColumnWidth']);
@@ -787,13 +789,13 @@ function ms_profile_master_relation(string $database, string $table): ?array {
   return $relation;
 }
 
-function ms_pdf_template_default_field(int $index, string $orientation): array {
+function ms_pdf_template_default_field(int $index, string $orientation, bool $showHeader = false): array {
   $pageWidth = $orientation === 'landscape' ? 297.0 : 210.0;
   $pageHeight = $orientation === 'landscape' ? 210.0 : 297.0;
   $columnWidth = ($pageWidth - 36.0) / 2.0;
   $rowsPerPage = (int)floor(($pageHeight - 32.0) / 18.0);
   $row = intdiv($index, 2);
-  return ['x' => 12.0 + ($index % 2) * ($columnWidth + 12.0), 'y' => intdiv($row, $rowsPerPage) * $pageHeight + 16.0 + ($row % $rowsPerPage) * 18.0, 'width' => $columnWidth, 'height' => 15.5, 'font_size' => 10.0, 'background_color' => '', 'foreground_color' => '', 'show_name' => true];
+  return ['x' => 12.0 + ($index % 2) * ($columnWidth + 12.0), 'y' => intdiv($row, $rowsPerPage) * $pageHeight + ($showHeader ? 20.0 : 16.0) + ($row % $rowsPerPage) * 18.0, 'width' => $columnWidth, 'height' => 15.5, 'font_size' => 10.0, 'background_color' => '', 'foreground_color' => '', 'show_name' => true];
 }
 
 function ms_pdf_template_color($value): string {
@@ -812,15 +814,22 @@ function ms_profile_pdf_template(string $database, string $table): array {
     $fields[$column]['foreground_color'] = ms_pdf_template_color($field['foreground_color'] ?? '');
     $fields[$column]['show_name'] = ($field['show_name'] ?? true) !== false;
   }
-  return ['orientation' => $orientation, 'fields' => $fields];
+  return ['orientation' => $orientation, 'show_header' => ($source['show_header'] ?? false) === true, 'show_footer' => ($source['show_footer'] ?? false) === true, 'fields' => $fields];
 }
 
 function ms_profile_save_pdf_template(string $database, string $table, array $source, array $allowedColumns): void {
   $orientation = $source['orientation'] ?? null;
   if (!in_array($orientation, ['portrait', 'landscape'], true)) throw new RuntimeException('Choose a valid PDF page orientation.');
+  foreach (['show_header', 'show_footer'] as $option) {
+    if (isset($source[$option]) && !is_bool($source[$option])) throw new RuntimeException('Invalid PDF header or footer setting.');
+  }
+  $showHeader = ($source['show_header'] ?? false) === true;
+  $showFooter = ($source['show_footer'] ?? false) === true;
   if (!isset($source['fields']) || !is_array($source['fields']) || count($source['fields']) > count($allowedColumns)) throw new RuntimeException('Invalid PDF template fields.');
   $pageWidth = $orientation === 'landscape' ? 297.0 : 210.0;
   $pageHeight = $orientation === 'landscape' ? 210.0 : 297.0;
+  $topInset = $showHeader ? 20.0 : 0.0;
+  $bottomInset = $showFooter ? 20.0 : 2.0;
   $fields = [];
   foreach ($source['fields'] as $column => $position) {
     if (!is_string($column) || !in_array($column, $allowedColumns, true) || !is_array($position)) throw new RuntimeException('Invalid PDF template field.');
@@ -832,7 +841,7 @@ function ms_profile_save_pdf_template(string $database, string $table, array $so
     $width = (float)$position['width'];
     $height = (float)$position['height'];
     $size = (float)$position['font_size'];
-    if ($x < 0 || $y < 0 || $y >= $pageHeight * 100 || $width < 20 || $height < 8 || $size < 6 || $size > 36 || $x + $width > $pageWidth + 0.01 || fmod($y, $pageHeight) + $height > $pageHeight - 2 + 0.01) throw new RuntimeException('A PDF field is outside the A4 page or has an invalid size.');
+    if ($x < 0 || $y < 0 || $y >= $pageHeight * 100 || $width < 20 || $height < 8 || $size < 6 || $size > 36 || $x + $width > $pageWidth + 0.01 || fmod($y, $pageHeight) < $topInset - 0.01 || fmod($y, $pageHeight) + $height > $pageHeight - $bottomInset + 0.01) throw new RuntimeException('A PDF field is outside the printable body or has an invalid size.');
     foreach (['background_color', 'foreground_color'] as $colorKey) {
       if (isset($position[$colorKey]) && (!is_string($position[$colorKey]) || ($position[$colorKey] !== '' && ms_pdf_template_color($position[$colorKey]) === ''))) throw new RuntimeException('Choose a valid PDF field color.');
     }
@@ -842,8 +851,8 @@ function ms_profile_save_pdf_template(string $database, string $table, array $so
       'foreground_color' => ms_pdf_template_color($position['foreground_color'] ?? ''),
       'show_name' => ($position['show_name'] ?? true) !== false];
   }
-  ms_profile_update_table($database, $table, static function (array $config) use ($orientation, $fields): array {
-    $config['pdf_template'] = ['orientation' => $orientation, 'fields' => $fields];
+  ms_profile_update_table($database, $table, static function (array $config) use ($orientation, $showHeader, $showFooter, $fields): array {
+    $config['pdf_template'] = ['orientation' => $orientation, 'show_header' => $showHeader, 'show_footer' => $showFooter, 'fields' => $fields];
     return $config;
   });
 }
@@ -4169,12 +4178,12 @@ try {
           }
           $label = trim((string)($labels[$name] ?? ''));
           $position = $template['fields'][$name] ?? null;
-          if (!is_array($position)) $position = ms_pdf_template_default_field(count($fields), $template['orientation']);
+          if (!is_array($position)) $position = ms_pdf_template_default_field(count($fields), $template['orientation'], $template['show_header']);
           $fields[] = ['column' => $name, 'label' => $label !== '' ? $label : $name, 'value' => $display, 'image_url' => $imageUrl, 'position' => $position];
           $totalBytes += strlen($display);
           if ($totalBytes > 2097152) throw new RuntimeException('This row is too large to render as a browser PDF (over 2 MB of text).');
         }
-        echo json_encode(['ok' => true, 'table' => $table, 'display_name' => ms_profile_table_display_name($database, $table), 'orientation' => $template['orientation'], 'fields' => $fields], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        echo json_encode(['ok' => true, 'table' => $table, 'display_name' => ms_profile_table_display_name($database, $table), 'orientation' => $template['orientation'], 'show_header' => $template['show_header'], 'show_footer' => $template['show_footer'], 'fields' => $fields], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
       } catch (Throwable $ajaxError) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => $ajaxError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
@@ -4409,6 +4418,7 @@ try {
           'sqlRows' => (int)p('sqlRows', '1000'),
           'selectRows' => (int)p('selectRows', '50'),
           'paginationPosition' => p('paginationPosition', 'bottom'),
+          'selectToolsPosition' => p('selectToolsPosition', 'before'),
           'truncateCells' => p('truncateCells') === '1',
           'rawDbView' => !empty($current['rawDbView']),
           'schemaColumnWidth' => (int)($current['schemaColumnWidth'] ?? 3),
@@ -5496,6 +5506,7 @@ try {
 }
 
 function page_head(string $title, bool $authenticated): void {
+  $namedPageLoader = isset($_GET['pageid']) && is_scalar($_GET['pageid']) && trim((string)$_GET['pageid']) !== '';
   $clientSettings = ms_profile_settings();
   $clientSettings['hiddenSidebarObjects'] = selected_db() !== '' ? ms_profile_hidden_sidebar(selected_db()) : [];
   $clientSettingsJson = json_encode($clientSettings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
@@ -5594,6 +5605,11 @@ function page_head(string $title, bool $authenticated): void {
     .ms-pdf-template-workspace{max-height:70vh;overflow:auto;background:var(--bs-tertiary-bg);border-radius:.5rem;padding:1.25rem}.ms-pdf-template-page{position:relative;width:min(100%,680px);aspect-ratio:210/297;margin:0 auto 1.7rem;background:#fff;color:#212529;box-shadow:0 .5rem 2rem rgba(0,0,0,.22);overflow:hidden;user-select:none}.ms-pdf-template-page.ms-pdf-landscape{width:min(100%,860px);aspect-ratio:297/210}.ms-pdf-template-field{position:absolute;box-sizing:border-box;display:block;overflow:hidden;padding:0;border:1px dashed #adb5bd;background:#f8f9fa;color:#212529;cursor:grab;touch-action:none;text-align:left;font-family:Arial,sans-serif;line-height:1.24}.ms-pdf-template-field:active{cursor:grabbing}.ms-pdf-template-field.ms-selected{border:2px solid #0d6efd;background:#e7f1ff;z-index:2}.ms-pdf-template-label,.ms-pdf-template-value{display:block;overflow-wrap:anywhere;white-space:pre-wrap}.ms-pdf-template-label{font-weight:600;font-size:.9em;line-height:1.15}.ms-pdf-template-value{font-weight:400}.ms-pdf-template-field.ms-pdf-overflow::after{content:'continued…';position:absolute;right:12px;bottom:0;padding:0 2px;background:#fff;color:#6c757d;font:9px system-ui,sans-serif}.ms-pdf-template-resizer{position:absolute;right:0;top:0;bottom:0;width:10px;background:rgba(13,110,253,.25);cursor:ew-resize;touch-action:none}.ms-pdf-template-resizer-corner{position:absolute;right:0;bottom:0;width:13px;height:13px;background:#0d6efd;cursor:nwse-resize;touch-action:none}.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer,.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer-corner{display:none}.ms-pdf-template-page-number{position:absolute;bottom:3px;right:8px;font:11px system-ui,sans-serif;color:#adb5bd;pointer-events:none}.ms-pdf-template-inspector{min-width:0}.ms-pdf-template-inspector input{min-width:0}.ms-pdf-template-field:focus-visible{outline:3px solid #0d6efd;outline-offset:1px}
     .ms-pdf-template-field.ms-selected{outline:2px solid #0d6efd;outline-offset:1px}
     .ms-pdf-template-field.ms-pdf-overflow::after{background:var(--ms-pdf-field-bg,#fff);color:var(--ms-pdf-field-color,#6c757d)}
+    .ms-pdf-template-band{position:absolute;color:#6b7280;font-family:Arial,sans-serif;white-space:nowrap;overflow:hidden;pointer-events:none;z-index:4}
+    .ms-pdf-template-header{border-bottom:1px solid #aab0b8;text-overflow:ellipsis}
+    .ms-pdf-template-footer{border-top:1px solid #aab0b8;display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+    .ms-pdf-template-footer span{min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .ms-select-panel-deferred{display:none!important}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -5605,6 +5621,12 @@ function page_head(string $title, bool $authenticated): void {
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name{cursor:default}
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:hover,
     .ms-layout-table[data-ms-pretty-mode="view"] .ms-col-header-name:focus{color:inherit;text-decoration:none}
+    .ms-layout-table[data-ms-view-mode="table"][data-ms-pretty-mode="view"] th[data-ms-column]{cursor:pointer}
+    .ms-layout-table[data-ms-view-mode="table"][data-ms-pretty-mode="view"] th[data-ms-column]:focus-visible{outline:2px solid var(--ms-accent);outline-offset:-2px}
+    .ms-layout-table[data-ms-view-mode="table"][data-ms-pretty-mode="view"] .ms-col-header-name{cursor:pointer}
+    .ms-layout-table[data-ms-view-mode="table"][data-ms-pretty-mode="view"] th[data-ms-column]:hover .ms-col-header-name{color:var(--ms-accent);text-decoration:underline}
+    .ms-col-header-sort{flex:none;margin-left:.35rem;color:var(--ms-accent)}
+    .ms-layout-table[data-ms-pretty-mode="edit"] .ms-col-header-sort{display:none}
     .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main,.ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{display:flex;width:100%;max-width:100%}
     .ms-layout-table th.text-center[data-ms-header-alignment="center"] .ms-col-header-main{justify-content:center}
     .ms-layout-table th.text-end[data-ms-header-alignment="right"] .ms-col-header-main{justify-content:flex-end}
@@ -5666,7 +5688,7 @@ function page_head(string $title, bool $authenticated): void {
     .ms-json-raw{max-height:55vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
     html[data-density="standard"]{--ms-table-font-size:14px;--ms-table-line-height:1.3;--ms-table-pad-y:.42rem;--ms-table-pad-x:.55rem;--ms-cell-max-width:420px;--ms-cell-max-height:9rem}
     html[data-density="large"]{--sidebar:295px;--ms-table-font-size:16px;--ms-table-line-height:1.42;--ms-table-pad-y:.7rem;--ms-table-pad-x:.82rem;--ms-cell-max-width:560px;--ms-cell-max-height:12rem;--ms-sql-editor-font-size:1rem;--ms-sql-editor-min-height:280px;font-size:17px}html[data-density="large"] .main{padding:1.6rem}html[data-density="large"] .sidebar{padding:1.3rem!important}html[data-density="large"] .form-control,html[data-density="large"] .form-select,html[data-density="large"] .btn{font-size:1rem;padding:.58rem .8rem}html[data-density="large"] .card-body,html[data-density="large"] .card-header,html[data-density="large"] .card-footer{padding:1.25rem}html[data-density="large"] .nav-link,html[data-density="large"] .list-group-item{padding:.7rem .85rem}
-    .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
+    .ms-page-loader{position:fixed;inset:0;z-index:20000;display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--bs-body-bg) 88%,transparent);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}.ms-page-loader[hidden]{display:none!important}.ms-page-loader-box{min-width:280px;max-width:90vw;padding:2rem 2.5rem;border:1px solid var(--bs-border-color);border-radius:1rem;background:var(--bs-body-bg);box-shadow:0 1.5rem 4rem rgba(0,0,0,.22);text-align:center}.ms-page-spinner{width:5rem;height:5rem;margin:0 auto 1.25rem;border:.5rem solid rgba(var(--ms-accent-rgb),.18);border-top-color:var(--ms-accent);border-radius:50%;animation:ms-page-spin .8s linear infinite}.ms-page-loader-text{font-size:1.6rem;font-weight:700;letter-spacing:.01em;color:var(--bs-body-color)}.ms-page-loader-text.ms-page-loader-named{font-weight:400}.ms-page-loader-named strong{font-weight:700}@keyframes ms-page-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.ms-page-spinner{animation-duration:1.6s}}
     .ms-sql-editor-wrap{position:relative;border-radius:var(--bs-border-radius);background:var(--bs-body-bg)}.ms-sql-highlight{position:absolute;inset:0;z-index:1;margin:0;box-sizing:border-box;border-style:solid;border-color:transparent;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--bs-body-color);background:var(--bs-body-bg);border-radius:inherit}.ms-smart-sql-input{position:relative;z-index:2;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:var(--bs-body-color);resize:vertical}.ms-smart-sql-input::selection{background:rgba(var(--ms-accent-rgb),.28)}.ms-sql-highlight .sql-k{color:#7c3aed;font-weight:700}.ms-sql-highlight .sql-t{color:#0f766e;font-weight:600}.ms-sql-highlight .sql-f{color:#2563eb}.ms-sql-highlight .sql-s{color:#b45309}.ms-sql-highlight .sql-i{color:#be185d}.ms-sql-highlight .sql-c{color:#6b7280;font-style:italic}.ms-sql-highlight .sql-n{color:#0891b2}.ms-sql-highlight .sql-v{color:#9333ea}.ms-sql-highlight .sql-o{color:#dc2626}.ms-sql-autocomplete{position:absolute;z-index:1200;min-width:280px;max-width:min(460px,calc(100% - 8px));max-height:280px;overflow:auto;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);box-shadow:0 .8rem 2.2rem rgba(0,0,0,.22);padding:.3rem}.ms-sql-autocomplete[hidden]{display:none!important}.ms-sql-suggestion{display:flex;align-items:center;gap:.6rem;width:100%;border:0;border-radius:.35rem;background:transparent;color:var(--bs-body-color);text-align:left;padding:.48rem .6rem}.ms-sql-suggestion:hover,.ms-sql-suggestion.active{background:rgba(var(--ms-accent-rgb),.12)}.ms-sql-suggestion-icon{width:1.35rem;text-align:center;color:var(--ms-accent)}.ms-sql-suggestion-main{min-width:0;flex:1}.ms-sql-suggestion-name{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-suggestion-meta{display:block;font-size:.75em;color:var(--bs-secondary-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-sql-autocomplete-title{padding:.25rem .55rem .35rem;color:var(--bs-secondary-color);font-size:.75em;text-transform:uppercase;letter-spacing:.06em;font-weight:700}html[data-bs-theme="dark"] .ms-sql-highlight .sql-k{color:#c4b5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-t{color:#5eead4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-f{color:#93c5fd}html[data-bs-theme="dark"] .ms-sql-highlight .sql-s{color:#fbbf24}html[data-bs-theme="dark"] .ms-sql-highlight .sql-i{color:#f9a8d4}html[data-bs-theme="dark"] .ms-sql-highlight .sql-c{color:#94a3b8}html[data-bs-theme="dark"] .ms-sql-highlight .sql-n{color:#67e8f9}html[data-bs-theme="dark"] .ms-sql-highlight .sql-v{color:#d8b4fe}html[data-bs-theme="dark"] .ms-sql-highlight .sql-o{color:#fca5a5}
     .settings-choice{cursor:pointer;border:2px solid var(--bs-border-color);transition:border-color .15s,transform .15s}.settings-choice:hover{border-color:rgba(var(--ms-accent-rgb),.55);transform:translateY(-1px)}.btn-check:checked+.settings-choice{border-color:var(--ms-accent);box-shadow:0 0 0 .2rem rgba(var(--ms-accent-rgb),.15)}.scheme-swatch{height:2rem;border-radius:.4rem;background:var(--swatch);box-shadow:inset 0 0 0 1px rgba(0,0,0,.1)}
     .ms-settings-save-sticky{position:sticky;top:0;z-index:1030;display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"title save" "subtitle save";align-items:center;column-gap:1rem;row-gap:.1rem;margin-bottom:1rem;padding:.75rem 1rem;border:1px solid var(--bs-border-color);border-radius:.5rem;background:var(--bs-body-bg);box-shadow:0 .25rem .75rem rgba(0,0,0,.08)}
@@ -5701,10 +5723,10 @@ function page_head(string $title, bool $authenticated): void {
   </style>
 </head>
 <body>
-<div id="ms-page-loader" class="ms-page-loader" role="status" aria-live="polite" aria-label="Loading">
+<div id="ms-page-loader" class="ms-page-loader" role="status" aria-live="polite" aria-label="<?= $namedPageLoader?'Loading '.h($title).' page...':'Loading' ?>">
   <div class="ms-page-loader-box">
     <div class="ms-page-spinner" aria-hidden="true"></div>
-    <div id="ms-page-loader-text" class="ms-page-loader-text">Loading...</div>
+    <div id="ms-page-loader-text" class="ms-page-loader-text<?= $namedPageLoader?' ms-page-loader-named':'' ?>"><?= $namedPageLoader?'Loading <strong>'.h($title).'</strong> page...':'Loading...' ?></div>
   </div>
 </div>
 <script>
@@ -5712,11 +5734,18 @@ function page_head(string $title, bool $authenticated): void {
   'use strict';
   const loader = document.getElementById('ms-page-loader');
   const label = document.getElementById('ms-page-loader-text');
+  const defaultMarkup = label ? label.innerHTML : 'Loading...';
+  const defaultText = label ? label.textContent.trim() : 'Loading...';
+  const hasNamedDefault = !!(label && label.classList.contains('ms-page-loader-named'));
   window.msShowPageLoader = text => {
     if (!loader) return;
-    if (label) label.textContent = text || 'Loading...';
+    if (label) {
+      label.classList.toggle('ms-page-loader-named', !text && hasNamedDefault);
+      if (text) label.textContent = text;
+      else label.innerHTML = defaultMarkup;
+    }
     loader.hidden = false;
-    loader.setAttribute('aria-label', text || 'Loading...');
+    loader.setAttribute('aria-label', text || defaultText);
   };
   window.msHidePageLoader = () => {
     if (loader) loader.hidden = true;
@@ -6221,7 +6250,8 @@ function page_foot(): void {
       const density=settingsForm.querySelector(`[name="density"][value="${settings.density}"]`);
       const scheme=settingsForm.querySelector(`[name="scheme"][value="${settings.scheme}"]`);
       const paginationPosition=settingsForm.querySelector(`[name="paginationPosition"][value="${settings.paginationPosition}"]`);
-      if(theme)theme.checked=true;if(density)density.checked=true;if(scheme)scheme.checked=true;if(paginationPosition)paginationPosition.checked=true;
+      const selectToolsPosition=settingsForm.querySelector(`[name="selectToolsPosition"][value="${settings.selectToolsPosition||'before'}"]`);
+      if(theme)theme.checked=true;if(density)density.checked=true;if(scheme)scheme.checked=true;if(paginationPosition)paginationPosition.checked=true;if(selectToolsPosition)selectToolsPosition.checked=true;
       settingsForm.elements.sqlRows.value=settings.sqlRows;
       settingsForm.elements.selectRows.value=settings.selectRows;
       settingsForm.elements.truncateCells.checked=!!settings.truncateCells;
@@ -6264,7 +6294,7 @@ function page_foot(): void {
     });
     renderHiddenSidebarSettings();
     settingsForm.addEventListener('change',()=>{
-      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,rawDbView:settings.rawDbView,displayObjectsBeforeDb:settingsForm.elements.displayObjectsBeforeDb.checked,menu:{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
+      const preview={theme:settingsForm.elements.theme.value,density:settingsForm.elements.density.value,scheme:settingsForm.elements.scheme.value,sqlRows:Math.max(1,Math.min(100000,Number.parseInt(settingsForm.elements.sqlRows.value,10)||window.msSettingsMeta.defaults.sqlRows)),selectRows:Math.max(1,Math.min(500,Number.parseInt(settingsForm.elements.selectRows.value,10)||window.msSettingsMeta.defaults.selectRows)),paginationPosition:settingsForm.elements.paginationPosition.value,selectToolsPosition:settingsForm.elements.selectToolsPosition.value,truncateCells:settingsForm.elements.truncateCells.checked,rawDbView:settings.rawDbView,displayObjectsBeforeDb:settingsForm.elements.displayObjectsBeforeDb.checked,menu:{},hiddenSidebarObjects:settings.hiddenSidebarObjects||{}};
       window.msSettingsMeta.menuKeys.forEach(key=>{const input=settingsForm.querySelector(`[name="menu[${key}]"]`);preview.menu[key]=!!(input&&input.checked);});
       window.msApplySettings(preview);
     });
@@ -6465,6 +6495,8 @@ function page_foot(): void {
     const orientation=data.orientation==='landscape'?'landscape':'portrait';
     const pageWidth=orientation==='landscape'?297:210;
     const pageHeight=orientation==='landscape'?210:297;
+    const showHeader=data.show_header===true,showFooter=data.show_footer===true;
+    const bodyTop=showHeader?20:0,bodyBottom=showFooter?pageHeight-20:pageHeight-2;
     const fields=Array.isArray(data.fields)?data.fields:[];
     if(!fields.length)throw new Error('There are no visible fields to print.');
     const pictures=await loadImages(fields);
@@ -6478,6 +6510,7 @@ function page_foot(): void {
       const foreground=typeof pos.foreground_color==='string'&&/^#[0-9a-f]{6}$/i.test(pos.foreground_color)?pos.foreground_color:'';
       const fieldData={...field,x:Number(pos.x),y:globalY-pageIndex*pageHeight,width:Number(pos.width),height:Number(pos.height||15.5),size:Number(pos.font_size),background,foreground,showName:pos.show_name!==false};
       if(![fieldData.x,fieldData.width,fieldData.height,fieldData.size].every(Number.isFinite)||fieldData.x<0||fieldData.width<20||fieldData.x+fieldData.width>pageWidth+.1)throw new Error('A field size is outside the PDF template.');
+      if(fieldData.y<bodyTop-.1||fieldData.y+fieldData.height>bodyBottom+.1)throw new Error('A field overlaps the PDF header or footer. Reopen the template and save it.');
       if(!grouped.has(pageIndex))grouped.set(pageIndex,[]);
       grouped.get(pageIndex).push(fieldData);
     }
@@ -6504,7 +6537,7 @@ function page_foot(): void {
         const valueMm=size*25.4/72;
         const lineHeight=valueMm*1.24;
         const textX=field.x,textY=field.y,space=Math.min(field.width,pageWidth-field.x);
-        const available=Math.max(0,Math.min(Math.max(8,field.height),pageHeight-2-textY));
+        const available=Math.max(0,Math.min(Math.max(8,field.height),bodyBottom-textY));
         if(field.background){ctx.fillStyle=field.background;ctx.fillRect(textX,textY,space,available);}
         ctx.fillStyle=field.foreground||'#555555';ctx.font=`600 ${labelMm}px Arial, sans-serif`;
         const labelLines=field.showName?wrapText(ctx,field.label,space):[];
@@ -6554,15 +6587,49 @@ function page_foot(): void {
         if(pdf.getNumberOfPages()>=200)throw new Error('This row needs too many PDF pages to generate in the browser.');
         pdf.addPage('a4',orientation);
         prepare();
-        if(item.background){ctx.fillStyle=item.background;ctx.fillRect(12,10,pageWidth-24,pageHeight-20);}
+        if(item.background){const top=showHeader?20:10,bottom=showFooter?pageHeight-20:pageHeight-10;ctx.fillStyle=item.background;ctx.fillRect(12,top,pageWidth-24,bottom-top);}
         ctx.font=`600 ${Math.min(4,mm*1.1)}px Arial, sans-serif`;
         ctx.fillStyle=item.foreground||'#333333';
-        ctx.fillText(fitLabel(ctx,item.label?`${item.label} (continued)`:'Continued value',pageWidth-24),12,12);
+        ctx.fillText(fitLabel(ctx,item.label?`${item.label} (continued)`:'Continued value',pageWidth-24),12,showHeader?21:12);
         ctx.font=`${mm}px Arial, sans-serif`;
         ctx.fillStyle=item.foreground||'#111111';
-        let y=19;
-        while(offset<lines.length&&y+lineHeight<=pageHeight-12){ctx.fillText(lines[offset++],12,y);y+=lineHeight;}
+        let y=showHeader?28:19;
+        const lastLine=showFooter?pageHeight-20:pageHeight-12;
+        while(offset<lines.length&&y+lineHeight<=lastLine){ctx.fillText(lines[offset++],12,y);y+=lineHeight;}
         addPage();
+      }
+    }
+    if(showHeader||showFooter){
+      const totalPages=pdf.getNumberOfPages();
+      const printed=new Date(),pad=value=>String(value).padStart(2,'0');
+      const timestamp=pad(printed.getDate())+'-'+pad(printed.getMonth()+1)+'-'+printed.getFullYear()+' '+pad(printed.getHours())+':'+pad(printed.getMinutes())+':'+pad(printed.getSeconds());
+      const tableName=String(data.table||'');
+      for(let pageNumber=1;pageNumber<=totalPages;pageNumber++){
+        pdf.setPage(pageNumber);
+        pdf.setFont('helvetica','normal');
+        pdf.setFontSize(9);
+        pdf.setTextColor(107,114,128);
+        pdf.setDrawColor(170,176,184);
+        pdf.setLineWidth(.3);
+        if(showHeader){
+          const characters=Array.from(tableName),width=pageWidth-24;
+          let name=tableName;
+          if(pdf.getTextWidth(name)>width){
+            let low=0,high=characters.length;
+            while(low<high){
+              const middle=Math.ceil((low+high)/2);
+              if(pdf.getTextWidth(characters.slice(0,middle).join('')+'…')<=width)low=middle;else high=middle-1;
+            }
+            name=characters.slice(0,low).join('')+'…';
+          }
+          pdf.text(name,12,11);
+          pdf.line(12,16,pageWidth-12,16);
+        }
+        if(showFooter){
+          pdf.line(12,pageHeight-16,pageWidth-12,pageHeight-16);
+          pdf.text(timestamp,12,pageHeight-8);
+          pdf.text('Page '+pageNumber+'/'+totalPages,pageWidth-12,pageHeight-8,{align:'right'});
+        }
       }
     }
     const identity=fields.find(field=>/^(?:id|uuid)$/i.test(field.column||''));
@@ -7198,12 +7265,12 @@ function page_structure(mysqli $db): void {
     <div class="card mt-3"><div class="card-header">Add column</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_column"><?= csrf_field() ?><?php column_form_fields($db,['type'=>'VARCHAR','length'=>'255','nullable'=>true]); ?><div class="row mt-2"><div class="col-md-3"><select class="form-select" name="position"><option value="">At end</option><option value="FIRST">First</option><?php foreach($columns as $c){?><option value="<?= h($c['COLUMN_NAME']) ?>">After <?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col"><button class="btn btn-primary">Add column</button></div></div></form></div></div>
     <div class="card mt-3" id="msQuickColumns"><div class="card-header d-flex align-items-center gap-2"><i class="fa-solid fa-bolt"></i><strong>Quick field operations</strong></div><div class="card-body"><p class="text-body-secondary small mb-2">This section is only for quick clone/delete operations and quick renaming. For the details and properties of each field, use the column properties above.</p><form method="post" id="msQuickRenameForm" class="d-none"><input type="hidden" name="action" value="quick_rename_column"><input type="hidden" name="column" value=""><input type="hidden" name="new_name" value=""><?= csrf_field() ?></form><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Field</th><th>Type</th><th class="text-end">Quick actions</th></tr></thead><tbody><?php foreach($columns as $column){$quickName=(string)$column['COLUMN_NAME'];?><tr><td><button type="button" class="btn btn-link p-0 border-0 text-decoration-none code" data-ms-quick-rename="<?= h($quickName) ?>" title="Click to rename"><?= h($quickName) ?></button></td><td><span class="code"><?= h((string)$column['COLUMN_TYPE']) ?></span></td><td class="text-end"><div class="d-inline-flex gap-1"><form method="post" class="d-inline"><input type="hidden" name="action" value="quick_clone_column"><input type="hidden" name="column" value="<?= h($quickName) ?>"><?= csrf_field() ?><button class="btn btn-outline-secondary btn-sm" type="submit" title="Clone <?= h($quickName) ?>" aria-label="Clone <?= h($quickName) ?>"><i class="fa-solid fa-clone"></i></button></form><form method="post" class="d-inline"><input type="hidden" name="action" value="drop_column"><input type="hidden" name="column" value="<?= h($quickName) ?>"><?= csrf_field() ?><button class="btn btn-outline-danger btn-sm" type="submit" data-confirm="Drop column <?= h($quickName) ?> and all its data?" title="Delete <?= h($quickName) ?>" aria-label="Delete <?= h($quickName) ?>"><i class="fa-solid fa-trash"></i></button></form></div></td></tr><?php }?></tbody></table></div></div></div>
   </div>
-  <div class="tab-pane fade" id="indexes"><?php render_indexes($db,$table,$indexes,$columns); ?></div>
-  <div class="tab-pane fade" id="foreign"><?php render_foreign_keys($db,$table,$foreign,$columns); ?></div>
-  <div class="tab-pane fade" id="checks"><?php render_checks($db,$checks); ?></div>
-  <div class="tab-pane fade" id="table-triggers"><?php render_table_triggers($triggers); ?></div>
-  <div class="tab-pane fade" id="partitions"><?php render_partitions($db,$table); ?></div>
-  <div class="tab-pane fade" id="table-settings"><?php render_table_settings($db,$table,$status); ?></div></div>
+  <div class="tab-pane fade" id="indexes"><?php render_indexes($db,$table,$indexes,$columns); render_structure_help('indexes'); ?></div>
+  <div class="tab-pane fade" id="foreign"><?php render_foreign_keys($db,$table,$foreign,$columns); render_structure_help('foreign'); ?></div>
+  <div class="tab-pane fade" id="checks"><?php render_checks($db,$checks); render_structure_help('checks'); ?></div>
+  <div class="tab-pane fade" id="table-triggers"><?php render_table_triggers($triggers); render_structure_help('triggers'); ?></div>
+  <div class="tab-pane fade" id="partitions"><?php render_partitions($db,$table); render_structure_help('partitions'); ?></div>
+  <div class="tab-pane fade" id="table-settings"><?php render_table_settings($db,$table,$status); render_structure_help('table'); ?></div></div>
   <script>
   (()=>{
     'use strict';
@@ -7314,6 +7381,81 @@ function page_structure(mysqli $db): void {
     });
   })();
   </script><?php
+}
+
+function render_structure_help(string $topic): void {
+  $topics = [
+    'indexes' => [
+      'title' => 'Indexes',
+      'what' => 'An index helps the database find matching rows without reading every row, much like an index in a book. A primary key identifies each row, while a unique index also prevents duplicate values.',
+      'when' => 'Indexes are useful for columns you often filter, join or sort by. They take storage space and add work when rows are inserted or updated; column order matters in a multi-column index.',
+      'example' => 'CREATE INDEX idx_orders_customer ON orders (customer_id);',
+      'result' => 'A query filtering orders by customer_id may use this index to locate that customer’s orders faster.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/create-index.html',
+    ],
+    'foreign' => [
+      'title' => 'Foreign keys',
+      'what' => 'A foreign key links a column in one table to a key in another table. The database checks the relationship so an order cannot refer to a customer that does not exist.',
+      'when' => 'The referenced and local columns need compatible types, suitable indexes and a storage engine that enforces foreign keys. Delete and update rules determine what happens when a referenced row changes.',
+      'example' => "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer\n  FOREIGN KEY (customer_id) REFERENCES customers(id)\n  ON DELETE RESTRICT;",
+      'result' => 'If customer 42 does not exist, an order with customer_id = 42 is rejected. RESTRICT prevents deleting a customer while orders still refer to that customer.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/create-table-foreign-keys.html',
+    ],
+    'checks' => [
+      'title' => 'Checks',
+      'what' => 'A CHECK constraint is a rule for values in each row. When enforced, the database rejects an insert or update whose values break the rule.',
+      'when' => 'Use checks for rules that belong to one row, such as a nonnegative price. Support and enforcement depend on the database product and version.',
+      'example' => 'ALTER TABLE products ADD CONSTRAINT chk_products_price CHECK (price >= 0);',
+      'result' => 'An insert or update that sets price to -1 fails on a server that enforces this constraint.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/create-table-check-constraints.html',
+    ],
+    'triggers' => [
+      'title' => 'Triggers',
+      'what' => 'A trigger runs SQL automatically when rows are inserted, updated or deleted. It runs before or after the chosen event, once for each affected row.',
+      'when' => 'Triggers can fill a value or keep an audit trail. Their work happens as part of the write, so remember to account for it when debugging or measuring performance.',
+      'example' => "CREATE TRIGGER orders_created BEFORE INSERT ON orders\n  FOR EACH ROW SET NEW.created_at = CURRENT_TIMESTAMP;",
+      'result' => 'Before each new order is inserted, the trigger sets its created_at column to the current time.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/create-trigger.html',
+    ],
+    'partitions' => [
+      'title' => 'Partitions',
+      'what' => 'Partitioning splits one logical table into smaller pieces according to a rule, such as a date range. Queries still address the table by its usual name.',
+      'when' => 'A query can skip irrelevant partitions when its filter matches the partition rule. Partitioning has restrictions: in MySQL, the partitioning columns must belong to every unique key, and InnoDB partitioned tables cannot use foreign keys.',
+      'example' => "CREATE TABLE orders_by_year (order_date DATE NOT NULL, amount DECIMAL(10,2))\nPARTITION BY RANGE COLUMNS(order_date) (\n  PARTITION p_before_2026 VALUES LESS THAN ('2026-01-01'),\n  PARTITION p_future VALUES LESS THAN (MAXVALUE)\n);",
+      'result' => 'Orders dated before 2026 go into the first partition; later orders go into the second.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/partitioning-overview.html',
+    ],
+    'table' => [
+      'title' => 'Table settings',
+      'what' => 'These settings describe the table itself: its name, storage engine, text collation, next auto-increment value and comment. The actions below them can also empty or drop the table.',
+      'when' => 'Changing the engine or collation can affect data and take time on a large table. Empty table removes all rows; Drop table removes both the table and its rows.',
+      'example' => "ALTER TABLE orders COMMENT = 'Customer purchases';",
+      'result' => 'The table’s comment becomes “Customer purchases”; its rows stay in place.',
+      'docs' => 'https://dev.mysql.com/doc/refman/8.4/en/alter-table.html',
+    ],
+  ];
+  if (!isset($topics[$topic])) return;
+  $help = $topics[$topic];
+  $id = 'ms-structure-help-' . $topic;
+  ?>
+  <div class="mt-3 mb-3">
+    <button class="btn btn-outline-info" type="button" data-bs-toggle="collapse" data-bs-target="#<?= h($id) ?>" aria-expanded="false" aria-controls="<?= h($id) ?>"><i class="fa-solid fa-circle-question me-1" aria-hidden="true"></i>Help me understand</button>
+    <div class="collapse" id="<?= h($id) ?>">
+      <article class="card mt-3" aria-label="<?= h($help['title']) ?> help">
+        <div class="card-body">
+          <h2 class="h5 mb-3"><?= h($help['title']) ?></h2>
+          <p><?= h($help['what']) ?></p>
+          <p><?= h($help['when']) ?></p>
+          <h3 class="h6">Example</h3>
+          <pre class="bg-body-tertiary border rounded p-3 overflow-auto"><code><?= h($help['example']) ?></code></pre>
+          <p><?= h($help['result']) ?></p>
+          <p class="small text-body-secondary">Examples use MySQL 8.4 syntax. MariaDB and MySQL are related but not fully compatible: SQL syntax, supported features and restrictions can differ by product and version. Check your server’s documentation before running an example. <a href="https://mariadb.com/docs/release-notes/community-server/about/compatibility-and-differences/mariadb-vs-mysql-compatibility" target="_blank" rel="noopener noreferrer">MariaDB compatibility guide <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></a></p>
+          <a href="<?= h($help['docs']) ?>" target="_blank" rel="noopener noreferrer">Read the official MySQL documentation for <?= h(strtolower($help['title'])) ?> <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></a>
+        </div>
+      </article>
+    </div>
+  </div>
+  <?php
 }
 
 function render_table_triggers(array $triggers): void {
@@ -7738,6 +7880,7 @@ function page_select(mysqli $db): void {
   $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $viewMode=!$aggregated&&g('view_mode')==='cards'?'cards':'table';
+  $selectToolsAfter=ms_profile_settings()['selectToolsPosition']==='after';
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
   $softDeleteRule=$aggregated?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
@@ -7806,7 +7949,7 @@ function page_select(mysqli $db): void {
   $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" data-ms-row-count-pill data-ms-total-rows="'.h((string)$allRowsTotal).'" data-ms-count-partial="'.($where||$aggregated?'1':'0').'" data-ms-result-unit="'.($aggregated?'result rows':'rows').'" aria-label="'.h(number_format($shownRows).' '.$rowCountLabel).'">'.h($rowCount).'</span>';
   title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
   ?>
-  <section class="card mb-3 no-print" aria-label="Saved views" data-ms-view-presets data-ms-table="<?= h($table) ?>" data-ms-preset-seed="<?= h($presetSeedJson) ?>">
+  <section class="card mb-3 no-print<?= $selectToolsAfter?' ms-select-panel-deferred':'' ?>" aria-label="Saved views" data-ms-select-panel data-ms-view-presets data-ms-table="<?= h($table) ?>" data-ms-preset-seed="<?= h($presetSeedJson) ?>">
     <div class="card-body">
       <div class="d-flex flex-wrap align-items-center gap-2 mb-2"><strong><i class="fa-solid fa-bookmark me-1"></i>Saved views</strong><span class="small text-body-secondary">Restore filters, sort, visible fields, column layout, page size and table/card view.</span></div>
       <?php if($viewPresets['private']||$viewPresets['shared']){ ?>
@@ -7871,6 +8014,8 @@ function page_select(mysqli $db): void {
       <div class="modal-body">
         <div class="d-flex flex-wrap align-items-end gap-2 mb-3">
           <div><label class="form-label" for="ms-pdf-orientation">A4 orientation</label><select class="form-select" id="ms-pdf-orientation"><option value="portrait">Portrait</option><option value="landscape">Landscape</option></select></div>
+          <label class="form-check form-switch ms-ios-switch mb-1"><input class="form-check-input" type="checkbox" id="ms-pdf-show-header"><span class="form-check-label">Header · table name</span></label>
+          <label class="form-check form-switch ms-ios-switch mb-1"><input class="form-check-input" type="checkbox" id="ms-pdf-show-footer"><span class="form-check-label">Footer · print time and page</span></label>
           <button class="btn btn-outline-secondary" type="button" id="ms-pdf-add-page"><i class="fa-solid fa-file-circle-plus me-1"></i>Add page</button>
           <button class="btn btn-outline-secondary" type="button" id="ms-pdf-reset"><i class="fa-solid fa-rotate-left me-1"></i>Reset layout</button>
           <span class="small text-body-secondary" id="ms-pdf-page-count" aria-live="polite"></span>
@@ -8134,6 +8279,8 @@ function page_select(mysqli $db): void {
     const columns=Array.isArray(data.columns)?data.columns:[];
     const workspace=document.getElementById('ms-pdf-template-workspace');
     const orientationInput=document.getElementById('ms-pdf-orientation');
+    const headerInput=document.getElementById('ms-pdf-show-header');
+    const footerInput=document.getElementById('ms-pdf-show-footer');
     const pageCountLabel=document.getElementById('ms-pdf-page-count');
     const selectedLabel=document.getElementById('ms-pdf-selected-name');
     const status=document.getElementById('ms-pdf-save-status');
@@ -8147,19 +8294,24 @@ function page_select(mysqli $db): void {
     let state,selected=new Set(),lastSelected=-1,extraPages=1,drag=null,edited=false;
     const dimensions=()=>orientationInput.value==='landscape'?{width:297,height:210}:{width:210,height:297};
     const rounded=value=>Math.round(value*100)/100;
+    const printTime=date=>{
+      const two=value=>String(value).padStart(2,'0');
+      return two(date.getDate())+'-'+two(date.getMonth()+1)+'-'+date.getFullYear()+' '+two(date.getHours())+':'+two(date.getMinutes())+':'+two(date.getSeconds());
+    };
     const colorOrEmpty=value=>typeof value==='string'&&/^#[0-9a-f]{6}$/i.test(value)?value.toLowerCase():'';
     const defaultField=index=>{
       const size=dimensions(),width=(size.width-36)/2,perPage=Math.floor((size.height-32)/18),row=Math.floor(index/2);
-      return {x:12+(index%2)*(width+12),y:Math.floor(row/perPage)*size.height+16+(row%perPage)*18,width,height:15.5,font_size:10,background_color:'',foreground_color:'',show_name:true};
+      return {x:12+(index%2)*(width+12),y:Math.floor(row/perPage)*size.height+(headerInput.checked?20:16)+(row%perPage)*18,width,height:15.5,font_size:10,background_color:'',foreground_color:'',show_name:true};
     };
     const clampField=field=>{
       const size=dimensions();
+      const top=headerInput.checked?20:0,bottom=footerInput.checked?20:2;
       field.width=rounded(Math.max(20,Math.min(size.width,Number(field.width)||20)));
       field.x=rounded(Math.max(0,Math.min(size.width-field.width,Number(field.x)||0)));
-      field.height=rounded(Math.max(8,Math.min(size.height-2,Number(field.height)||15.5)));
-      field.y=rounded(Math.max(0,Math.min(size.height*100-field.height-2,Number(field.y)||0)));
+      field.height=rounded(Math.max(8,Math.min(size.height-top-bottom,Number(field.height)||15.5)));
+      field.y=rounded(Math.max(0,Math.min(size.height*100-field.height-bottom,Number(field.y)||0)));
       const page=Math.floor(field.y/size.height),within=field.y-page*size.height;
-      field.y=rounded(page*size.height+Math.min(size.height-field.height-2,within));
+      field.y=rounded(page*size.height+Math.max(top,Math.min(size.height-field.height-bottom,within)));
       field.font_size=rounded(Math.max(6,Math.min(36,Number(field.font_size)||10)));
       field.background_color=colorOrEmpty(field.background_color);
       field.foreground_color=colorOrEmpty(field.foreground_color);
@@ -8168,6 +8320,8 @@ function page_select(mysqli $db): void {
     };
     const resetFromSeed=()=>{
       orientationInput.value=seed.orientation==='landscape'?'landscape':'portrait';
+      headerInput.checked=seed.show_header===true;
+      footerInput.checked=seed.show_footer===true;
       const stored=seed.fields&&typeof seed.fields==='object'?seed.fields:{};
       const physicalNames=new Set(Array.isArray(data.all_columns)?data.all_columns:columns.map(column=>column.name));
       const knownFields=Object.create(null);
@@ -8214,8 +8368,36 @@ function page_select(mysqli $db): void {
       page.setAttribute('aria-label','A4 '+orientationInput.value+' page '+(index+1));
       const number=document.createElement('span');
       number.className='ms-pdf-template-page-number';number.textContent='Page '+(index+1);
+      number.hidden=footerInput.checked;
       page.appendChild(number);
       workspace.appendChild(page);
+      const size=dimensions(),fontSize=9*25.4/72*(page.clientWidth/size.width)+'px';
+      if(headerInput.checked){
+        const header=document.createElement('div');
+        header.className='ms-pdf-template-band ms-pdf-template-header';
+        header.textContent=data.table;
+        header.style.left=12/size.width*100+'%';
+        header.style.right=12/size.width*100+'%';
+        header.style.top=7/size.height*100+'%';
+        header.style.height=9/size.height*100+'%';
+        header.style.fontSize=fontSize;
+        page.appendChild(header);
+      }
+      if(footerInput.checked){
+        const footer=document.createElement('div');
+        footer.className='ms-pdf-template-band ms-pdf-template-footer';
+        footer.style.left=12/size.width*100+'%';
+        footer.style.right=12/size.width*100+'%';
+        footer.style.top=(size.height-16)/size.height*100+'%';
+        footer.style.height=10/size.height*100+'%';
+        footer.style.fontSize=fontSize;
+        const timestamp=document.createElement('span');
+        timestamp.textContent=printTime(new Date());
+        const pageLabel=document.createElement('span');
+        pageLabel.textContent='Page '+(index+1)+'/'+pageCount();
+        footer.append(timestamp,pageLabel);
+        page.appendChild(footer);
+      }
       return page;
     };
     const render=()=>{
@@ -8400,6 +8582,11 @@ function page_select(mysqli $db): void {
       selected.forEach(name=>{state.fields[name].show_name=showName.checked;});
       edited=true;status.textContent='Unsaved changes';render();
     });
+    [headerInput,footerInput].forEach(input=>input.addEventListener('change',()=>{
+      if(!state)return;
+      columns.forEach(column=>clampField(state.fields[column.name]));
+      edited=true;status.textContent='Unsaved changes';render();
+    }));
     orientationInput.addEventListener('change',()=>{
       if(!state)return;
       const oldSize=state.orientation==='landscape'?{width:297,height:210}:{width:210,height:297};
@@ -8428,7 +8615,7 @@ function page_select(mysqli $db): void {
       const button=event.currentTarget;
       button.disabled=true;status.classList.remove('text-danger');status.textContent='Saving PDF template…';
       try{
-        const template={orientation:orientationInput.value,fields:state.fields};
+        const template={orientation:orientationInput.value,show_header:headerInput.checked,show_footer:footerInput.checked,fields:state.fields};
         await window.msConfigPost('pdf_template',{table:data.table,template_json:JSON.stringify(template)});
         seed=JSON.parse(JSON.stringify(template));
         edited=false;status.textContent='PDF template saved.';
@@ -8448,7 +8635,7 @@ function page_select(mysqli $db): void {
     [data-ms-filter-from][hidden]{display:none!important}
     [data-ms-filter-main]:not(.ms-filter-between) .form-control{border-top-left-radius:var(--bs-border-radius);border-bottom-left-radius:var(--bs-border-radius)}
   </style>
-  <div class="card mb-3 no-print"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+  <div class="card mb-3 no-print<?= $selectToolsAfter?' ms-select-panel-deferred':'' ?>" data-ms-select-panel><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
     <button class="btn btn-sm btn-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#queryBuilder"><i class="fa-solid fa-filter me-1"></i>Search, aggregate, sort and limit</button>
     <div class="input-group input-group-sm" style="width:min(100%,24rem)">
       <label class="visually-hidden" for="ms-global-search">Search all columns</label>
@@ -8600,7 +8787,7 @@ function page_select(mysqli $db): void {
     });
   })();
   </script>
-  <div class="card mb-3 no-print"><div class="card-body py-2">
+  <div class="card mb-3 no-print<?= $selectToolsAfter?' ms-select-panel-deferred':'' ?>" data-ms-select-panel><div class="card-body py-2">
     <?php
       $exportQuery = array_intersect_key($returnQuery, array_flip(['global_search', 'filter_col', 'filter_op', 'filter_val', 'filter_val_to', 'filter_unit', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
       $exportQuery['limit'] = $limit;
@@ -8672,6 +8859,12 @@ function page_select(mysqli $db): void {
     <div class="form-text">Runs the query again on MySQL, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
   </div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
+  <?php
+    $orderColumnValues=is_array($_GET['order_col']??null)?$_GET['order_col']:[];
+    $orderDirectionValues=is_array($_GET['order_dir']??null)?$_GET['order_dir']:[];
+    $primaryOrderColumn=is_string($orderColumnValues[0]??null)?$orderColumnValues[0]:'';
+    $primaryOrderDirection=strtoupper((string)($orderDirectionValues[0]??'ASC'))==='DESC'?'descending':'ascending';
+  ?>
   <form method="post" id="ms-select-row-form"><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?= csrf_field() ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table<?= !$aggregated?' ms-layout-table':'' ?>"<?php if(!$aggregated){ ?> data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($table) ?>" data-ms-view-mode="<?= h($viewMode) ?>" data-ms-pretty-mode="<?= $prettyEdit&&$viewMode==='table'?'edit':'view' ?>" data-ms-columns="<?= h($layoutColumnsJson) ?>" data-ms-layout="<?= h($savedLayoutJson) ?>"<?php } ?>><thead><tr><?php
     if(!$aggregated){if($editable){?><th data-ms-static-column="selection"><input class="form-check-input" type="checkbox" data-check-all=".row-check"></th><?php }?><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php }
     foreach($headers as $header){
@@ -8693,12 +8886,58 @@ function page_select(mysqli $db): void {
       $enumValues=(string)($headerMeta['DATA_TYPE']??'')==='enum'?ms_enum_values((string)($headerMeta['COLUMN_TYPE']??'')):[];
       $enumJson=json_encode($enumValues,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($enumJson))$enumJson='[]';
       $isSoftDeleteColumn=$softDeleteRule!==null&&$softDeleteRule['column']===$header;
-      ?><th<?php if(!$aggregated){ ?> tabindex="0" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      $headerSort=$header===$primaryOrderColumn?$primaryOrderDirection:'none';
+      ?><th<?php if(!$aggregated){ ?> tabindex="0" aria-sort="<?= $headerSort ?>" title="<?= h($prettyEdit?'Column settings: '.$visibleHeader:'Sort '.$visibleHeader.' '.($headerSort==='ascending'?'descending':'ascending')) ?>" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span><?php if($headerSort!=='none'){ ?><span class="ms-col-header-sort" aria-hidden="true"><i class="fa-solid fa-arrow-<?= $headerSort==='ascending'?'up':'down' ?>"></i></span><?php } ?></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
   <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if(!$aggregated){ ?>
+  <script>
+  (()=>{
+    'use strict';
+    const table=document.querySelector('#ms-select-row-form [data-ms-table-layout]');
+    const form=document.getElementById('ms-query-builder-form');
+    if(!table||!form)return;
+    const columns=form.querySelectorAll('[name="order_col[]"]');
+    const directions=form.querySelectorAll('[name="order_dir[]"]');
+    if(columns.length<2||directions.length<2)return;
+    const sortBy=header=>{
+      if(table.dataset.msPrettyMode!=='view'||table.dataset.msViewMode!=='table')return;
+      const column=header.dataset.msColumn;
+      if(!Array.from(columns[0].options).some(option=>option.value===column))return;
+      const destination=new URL(location.href);
+      const current=destination.searchParams.getAll('order_col[]')[0]||'';
+      const currentDirection=destination.searchParams.getAll('order_dir[]')[0]||'ASC';
+      const direction=current===column&&currentDirection.toUpperCase()!=='DESC'?'DESC':'ASC';
+      columns[0].value=column;directions[0].value=direction;
+      columns[1].value='';directions[1].value='ASC';
+      destination.searchParams.delete('order_col[]');
+      destination.searchParams.delete('order_dir[]');
+      destination.searchParams.append('order_col[]',column);
+      destination.searchParams.append('order_dir[]',direction);
+      destination.searchParams.delete('p');
+      if(typeof window.msShowPageLoader==='function')window.msShowPageLoader('Sorting rows...');
+      location.assign(destination.toString());
+    };
+    table.addEventListener('click',event=>{
+      const target=event.target instanceof Element?event.target:null;
+      const header=target?.closest('thead th[data-ms-column]');
+      if(!header||target.closest('button,a,input,select,[data-ms-column-drag-handle],[data-ms-col-resizer]'))return;
+      if(window.getSelection()?.toString())return;
+      sortBy(header);
+    });
+    table.addEventListener('keydown',event=>{
+      if(event.key!=='Enter'&&event.key!==' ')return;
+      const header=event.target instanceof Element?event.target.closest('thead th[data-ms-column]'):null;
+      if(!header||event.target!==header)return;
+      if(table.dataset.msPrettyMode!=='view'||table.dataset.msViewMode!=='table')return;
+      event.preventDefault();sortBy(header);
+    });
+  })();
+  </script>
+  <?php } ?>
   <script>
   (() => {
     'use strict';
@@ -9509,6 +9748,18 @@ function page_select(mysqli $db): void {
     $englishSort[]=['column'=>(string)$sortColumn,'direction'=>strtoupper((string)($englishSortDirections[$index]??'ASC'))==='DESC'?'DESC':'ASC'];
   }
   if($showAll){?><div class="alert alert-info mt-3 mb-0 no-print"><i class="fa-solid fa-list me-1"></i>All <?= h(number_format($total)) ?> result(s) are displayed. <a href="<?= h(url(['show_all'=>null,'p'=>null,'limit'=>null])) ?>">Return to paginated view</a>.</div><?php }else{render_select_pagination($page,$pages,'bottom');}?>
+  <?php if($selectToolsAfter){ ?>
+    <div id="ms-select-tools-after"></div>
+    <script>
+    (() => {
+      const destination=document.getElementById('ms-select-tools-after');
+      document.querySelectorAll('[data-ms-select-panel]').forEach(panel=>{
+        destination.appendChild(panel);
+        panel.classList.remove('ms-select-panel-deferred');
+      });
+    })();
+    </script>
+  <?php } ?>
   <div class="d-flex flex-wrap align-items-center gap-2 small text-body-secondary mt-2">
     <span class="code flex-grow-1 text-break">Query: <?= h($sql) ?></span>
     <button class="btn btn-outline-secondary btn-sm no-print" type="button" id="ms-copy-select-query"><i class="fa-solid fa-copy me-1"></i>Copy query</button>
@@ -10915,6 +11166,7 @@ function page_settings(): void {
       <div class="col-md-6"><label class="form-label" for="settings-sql-rows">Default number of rows in Execute SQL</label><input class="form-control" type="number" name="sqlRows" id="settings-sql-rows" min="1" max="100000" step="1" required><div class="form-text">Result sets display this many rows unless “Show all result rows” is enabled. Exports still include the complete result.</div></div>
       <div class="col-md-6"><label class="form-label" for="settings-select-rows">Rows per page in Select</label><input class="form-control" type="number" name="selectRows" id="settings-select-rows" min="1" max="500" step="1" required><div class="form-text">Used as the default page size when browsing a table or view.</div></div>
       <div class="col-12"><label class="form-label d-block">Table pagination position</label><div class="btn-group flex-wrap" role="group" aria-label="Table pagination position"><input class="btn-check" type="radio" name="paginationPosition" id="pagination-top" value="top"><label class="btn btn-outline-secondary" for="pagination-top"><i class="fa-solid fa-arrow-up me-1"></i>Top</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-bottom" value="bottom"><label class="btn btn-outline-secondary" for="pagination-bottom"><i class="fa-solid fa-arrow-down me-1"></i>Bottom</label><input class="btn-check" type="radio" name="paginationPosition" id="pagination-both" value="both"><label class="btn btn-outline-secondary" for="pagination-both"><i class="fa-solid fa-arrows-up-down me-1"></i>Both</label></div><div class="form-text">Choose where page navigation is shown while browsing table contents.</div></div>
+      <div class="col-12"><label class="form-label d-block">Saved views, search and downloads</label><div class="btn-group flex-wrap" role="group" aria-label="Position of table controls"><input class="btn-check" type="radio" name="selectToolsPosition" id="select-tools-before" value="before"><label class="btn btn-outline-secondary" for="select-tools-before"><i class="fa-solid fa-arrow-up me-1"></i>Before data</label><input class="btn-check" type="radio" name="selectToolsPosition" id="select-tools-after" value="after"><label class="btn btn-outline-secondary" for="select-tools-after"><i class="fa-solid fa-arrow-down me-1"></i>After data</label></div><div class="form-text">Choose where Saved Views, Search/Aggregate, and Download appear on the Select page. Before data is the default.</div></div>
       <div class="col-12"><div class="border rounded p-3"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" role="switch" name="truncateCells" value="1" id="settings-truncate-cells"><label class="form-check-label fw-semibold" for="settings-truncate-cells">Thin, single-line table rows</label></div><div class="form-text ms-4">Keep every displayed cell on one line and replace overflowing text with an ellipsis. The complete value is not changed in the database.</div></div></div>
       <div class="col-12"><div class="alert alert-info mb-0"><i class="fa-solid fa-table-columns me-2"></i>Column order is saved automatically per profile/table. Column widths are saved only when you press <strong>Save Widths</strong> on the Select page. Left-sidebar visibility, display rules, saved searches, private saved views and query history are profile-specific. Shared saved views are available across logins on the same server. Restore defaults resets the active profile, including its private saved views.</div></div>
     </div></div></section>
