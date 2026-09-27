@@ -5506,7 +5506,7 @@ try {
 }
 
 function page_head(string $title, bool $authenticated): void {
-  $namedPageLoader = isset($_GET['pageid']) && is_scalar($_GET['pageid']) && trim((string)$_GET['pageid']) !== '';
+  $namedPageLoader = isset($_GET['page']) && is_scalar($_GET['page']) && trim((string)$_GET['page']) !== '';
   $clientSettings = ms_profile_settings();
   $clientSettings['hiddenSidebarObjects'] = selected_db() !== '' ? ms_profile_hidden_sidebar(selected_db()) : [];
   $clientSettingsJson = json_encode($clientSettings, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
