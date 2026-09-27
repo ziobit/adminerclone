@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.19';
+const MS_VERSION = '1.15.20';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -793,7 +793,11 @@ function ms_pdf_template_default_field(int $index, string $orientation): array {
   $columnWidth = ($pageWidth - 36.0) / 2.0;
   $rowsPerPage = (int)floor(($pageHeight - 32.0) / 18.0);
   $row = intdiv($index, 2);
-  return ['x' => 12.0 + ($index % 2) * ($columnWidth + 12.0), 'y' => intdiv($row, $rowsPerPage) * $pageHeight + 16.0 + ($row % $rowsPerPage) * 18.0, 'width' => $columnWidth, 'height' => 15.5, 'font_size' => 10.0];
+  return ['x' => 12.0 + ($index % 2) * ($columnWidth + 12.0), 'y' => intdiv($row, $rowsPerPage) * $pageHeight + 16.0 + ($row % $rowsPerPage) * 18.0, 'width' => $columnWidth, 'height' => 15.5, 'font_size' => 10.0, 'background_color' => '', 'foreground_color' => '', 'show_name' => true];
+}
+
+function ms_pdf_template_color($value): string {
+  return is_string($value) && preg_match('/\A#[0-9a-fA-F]{6}\z/', $value) === 1 ? strtolower($value) : '';
 }
 
 function ms_profile_pdf_template(string $database, string $table): array {
@@ -801,7 +805,13 @@ function ms_profile_pdf_template(string $database, string $table): array {
   if (!is_array($source)) $source = [];
   $orientation = ($source['orientation'] ?? '') === 'landscape' ? 'landscape' : 'portrait';
   $fields = isset($source['fields']) && is_array($source['fields']) ? $source['fields'] : [];
-  foreach ($fields as $column => $field) if (is_array($field) && !isset($field['height'])) $fields[$column]['height'] = 15.5;
+  foreach ($fields as $column => $field) {
+    if (!is_array($field)) continue;
+    if (!isset($field['height'])) $fields[$column]['height'] = 15.5;
+    $fields[$column]['background_color'] = ms_pdf_template_color($field['background_color'] ?? '');
+    $fields[$column]['foreground_color'] = ms_pdf_template_color($field['foreground_color'] ?? '');
+    $fields[$column]['show_name'] = ($field['show_name'] ?? true) !== false;
+  }
   return ['orientation' => $orientation, 'fields' => $fields];
 }
 
@@ -823,7 +833,14 @@ function ms_profile_save_pdf_template(string $database, string $table, array $so
     $height = (float)$position['height'];
     $size = (float)$position['font_size'];
     if ($x < 0 || $y < 0 || $y >= $pageHeight * 100 || $width < 20 || $height < 8 || $size < 6 || $size > 36 || $x + $width > $pageWidth + 0.01 || fmod($y, $pageHeight) + $height > $pageHeight - 2 + 0.01) throw new RuntimeException('A PDF field is outside the A4 page or has an invalid size.');
-    $fields[$column] = ['x' => round($x, 2), 'y' => round($y, 2), 'width' => round($width, 2), 'height' => round($height, 2), 'font_size' => round($size, 2)];
+    foreach (['background_color', 'foreground_color'] as $colorKey) {
+      if (isset($position[$colorKey]) && (!is_string($position[$colorKey]) || ($position[$colorKey] !== '' && ms_pdf_template_color($position[$colorKey]) === ''))) throw new RuntimeException('Choose a valid PDF field color.');
+    }
+    if (isset($position['show_name']) && !is_bool($position['show_name'])) throw new RuntimeException('Invalid PDF field name setting.');
+    $fields[$column] = ['x' => round($x, 2), 'y' => round($y, 2), 'width' => round($width, 2), 'height' => round($height, 2), 'font_size' => round($size, 2),
+      'background_color' => ms_pdf_template_color($position['background_color'] ?? ''),
+      'foreground_color' => ms_pdf_template_color($position['foreground_color'] ?? ''),
+      'show_name' => ($position['show_name'] ?? true) !== false];
   }
   ms_profile_update_table($database, $table, static function (array $config) use ($orientation, $fields): array {
     $config['pdf_template'] = ['orientation' => $orientation, 'fields' => $fields];
@@ -5575,6 +5592,8 @@ function page_head(string $title, bool $authenticated): void {
     body{min-height:100vh}.sidebar{width:var(--sidebar);position:fixed;inset:0 auto 0 0;overflow:auto;background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}.main{margin-left:var(--sidebar);padding:1.25rem}.brand{font-weight:700;letter-spacing:.02em}.ms-raw-db-switch{margin-top:.45rem;display:flex;justify-content:center}.ms-raw-db-switch .form-check{min-height:0;padding-left:0!important;width:max-content}.ms-raw-db-switch .form-check-input{cursor:pointer}.ms-raw-db-switch .form-check-label{cursor:pointer;line-height:1.15}.table{font-size:var(--ms-table-font-size);line-height:var(--ms-table-line-height)}.table>:not(caption)>*>*{padding:var(--ms-table-pad-y) var(--ms-table-pad-x)}.table-scroll{overflow:auto;max-height:70vh}.table-scroll th{position:sticky;top:0;z-index:2;background:var(--bs-body-bg)}.ms-layout-table th[data-ms-column]{user-select:none;padding-right:calc(var(--ms-table-pad-x) + .8rem)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ms-col-header-main{display:inline-flex;align-items:center;max-width:calc(100% - .15rem);min-width:0;white-space:nowrap;vertical-align:middle}.ms-col-header-name{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}.ms-col-header-name:hover,.ms-col-header-name:focus{color:var(--ms-accent);text-decoration:underline}.ms-col-drag-handle{display:inline-flex;flex:0 0 auto;align-items:center;justify-content:center;margin-right:.35rem;padding:0 .1rem;color:var(--bs-secondary-color);cursor:grab;opacity:.45;vertical-align:middle;touch-action:none}.ms-layout-table th[data-ms-column]:hover .ms-col-drag-handle,.ms-col-drag-handle:focus{opacity:1}.ms-col-drag-handle:active{cursor:grabbing}.ms-layout-table th.ms-column-dragging{opacity:.45}.ms-layout-table th.ms-column-drop-before{box-shadow:inset 3px 0 0 var(--ms-accent)}.ms-layout-table th.ms-column-drop-after{box-shadow:inset -3px 0 0 var(--ms-accent)}.ms-col-resizer{position:absolute;top:0;right:-3px;bottom:0;width:8px;cursor:col-resize;z-index:4;touch-action:none}.ms-col-resizer::after{content:"";position:absolute;top:20%;bottom:20%;left:3px;border-left:1px solid var(--bs-border-color)}body.ms-column-resizing{cursor:col-resize!important;user-select:none!important}.cell-value{display:inline-block;max-width:var(--ms-cell-max-width);max-height:var(--ms-cell-max-height);overflow:auto;white-space:pre-wrap;line-height:inherit}.ms-data-table>thead>tr>th{font-size:inherit;line-height:inherit}.ms-data-table>tbody>tr>td{font-size:inherit;line-height:inherit}.ms-row-actions-cell{width:1%;white-space:nowrap}.ms-row-actions{display:inline-flex;align-items:center;gap:.16rem;white-space:nowrap}.ms-row-action{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--bs-secondary-color);padding:.08rem .14rem;line-height:1;text-decoration:none;border-radius:.2rem;cursor:pointer}.ms-row-action:hover,.ms-row-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-row-action.ms-row-delete{color:var(--bs-danger)}.ms-row-action.ms-row-delete:hover,.ms-row-action.ms-row-delete:focus{color:var(--bs-danger);background:var(--bs-danger-bg-subtle)}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column]{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value{display:block;max-width:100%;max-height:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}html[data-truncate-cells="true"] .ms-layout-table tbody td[data-ms-column] .cell-value br{display:none}.sql-editor{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:var(--ms-sql-editor-font-size);min-height:var(--ms-sql-editor-min-height);tab-size:2}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.schema-canvas{position:relative;min-height:650px;background-image:radial-gradient(var(--bs-border-color) 1px,transparent 1px);background-size:20px 20px}.schema-table{position:relative;display:inline-block;vertical-align:top;width:240px;margin:12px}.schema-grid>.schema-col .schema-table{display:block;width:100%;margin:0}.schema-grid>.schema-col{min-width:0}.schema-width-picker .btn{white-space:nowrap}.schema-line{color:var(--ms-accent)}.nav-link.active{font-weight:600}.danger-zone{border:1px solid var(--bs-danger-border-subtle);background:var(--bs-danger-bg-subtle)}.ms-sidebar-object-row{display:flex;align-items:center;gap:.2rem;padding:0}.ms-sidebar-object-name{display:flex;align-items:center;min-width:0;flex:1;padding:.5rem .32rem;line-height:1.2;color:var(--bs-body-color);text-decoration:none;border-radius:.25rem}.ms-sidebar-object-name:hover,.ms-sidebar-object-name:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-object-actions{display:inline-flex;flex:0 0 auto;align-items:center;gap:.05rem}.ms-sidebar-object-action{display:inline-flex;align-items:center;justify-content:center;width:1.55rem;height:auto;padding:.5rem .12rem;line-height:1.2;border-radius:.25rem;color:var(--bs-secondary-color);text-decoration:none}.ms-sidebar-object-action:hover,.ms-sidebar-object-action:focus{color:var(--ms-accent);background:var(--bs-tertiary-bg)}.ms-sidebar-section-divider{margin:.55rem 0;border:0;border-top:2px solid var(--bs-border-color);opacity:1}.ms-db-tools .nav-link{padding-left:.32rem;padding-right:.32rem}
     .ms-table-icon-trigger{display:inline-flex;align-items:center;justify-content:center;width:2.75rem;height:2.75rem;padding:0;border-radius:.65rem}.ms-table-icon-trigger i{pointer-events:none}.ms-icon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(8.75rem,1fr));gap:.5rem;max-height:54vh;overflow:auto;padding:.15rem}.ms-icon-choice{position:relative;display:flex;min-width:0;min-height:5.6rem;flex-direction:column;align-items:center;justify-content:center;gap:.45rem;padding:.65rem .4rem;border:1px solid var(--bs-border-color);border-radius:.55rem;background:var(--bs-body-bg);color:var(--bs-body-color);text-align:center;transition:border-color .12s,background-color .12s,box-shadow .12s,transform .12s}.ms-icon-choice:hover,.ms-icon-choice:focus{border-color:rgba(var(--ms-accent-rgb),.7);background:rgba(var(--ms-accent-rgb),.07);transform:translateY(-1px)}.ms-icon-choice.active{border-color:var(--ms-accent);background:rgba(var(--ms-accent-rgb),.12);box-shadow:0 0 0 .15rem rgba(var(--ms-accent-rgb),.14)}.ms-icon-choice[hidden]{display:none!important}.ms-icon-choice i{font-size:1.55rem;line-height:1.2}.ms-icon-choice-name{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem}.ms-icon-choice-style{position:absolute;top:.25rem;right:.3rem;color:var(--bs-secondary-color);font-size:.58rem;line-height:1;text-transform:uppercase}.ms-icon-empty{min-height:9rem}.ms-selected-icon{display:inline-flex;align-items:center;gap:.55rem;min-width:0}.ms-selected-icon code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ms-icon-grid .ms-icon-choice i,.ms-selected-icon i{color:var(--ms-icon-preview-color,inherit)}.ms-icon-color-palette{display:flex;flex-wrap:wrap;align-items:center;gap:.55rem}.ms-icon-color-choice{display:inline-flex;align-items:center;justify-content:center;width:2.35rem;height:2.35rem;padding:.22rem;border:2px solid transparent;border-radius:50%;background:transparent;transition:border-color .12s,box-shadow .12s,transform .12s}.ms-icon-color-choice:hover,.ms-icon-color-choice:focus{transform:translateY(-1px);border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-color-choice.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-color-swatch{display:block;width:100%;height:100%;border-radius:50%;background:var(--ms-icon-color);box-shadow:inset 0 0 0 1px rgba(0,0,0,.18)}.ms-icon-color-choice.ms-icon-color-auto{width:auto;border-radius:.55rem;padding:.25rem .6rem;gap:.38rem;color:var(--bs-body-color);background:var(--bs-body-bg)}.ms-icon-color-auto-swatch{display:inline-flex;align-items:center;justify-content:center;width:1.45rem;height:1.45rem;border-radius:50%;border:1px solid var(--bs-border-color);background:linear-gradient(135deg,var(--bs-body-bg) 0 46%,var(--bs-secondary-bg) 46% 54%,var(--bs-body-bg) 54% 100%);font-size:.65rem}.ms-icon-custom-color{display:inline-flex;align-items:center;gap:.45rem;padding:.2rem .55rem .2rem .25rem;border:2px solid var(--bs-border-color);border-radius:.55rem;cursor:pointer;background:var(--bs-body-bg);transition:border-color .12s,box-shadow .12s}.ms-icon-custom-color:hover{border-color:rgba(var(--ms-accent-rgb),.55)}.ms-icon-custom-color.active{border-color:var(--ms-accent);box-shadow:0 0 0 .16rem rgba(var(--ms-accent-rgb),.16)}.ms-icon-custom-color input[type="color"]{width:2rem;height:2rem;padding:.1rem;border:0;border-radius:.35rem;background:transparent;cursor:pointer}.ms-icon-custom-color span{font-size:.82rem;font-weight:600}
     .ms-pdf-template-workspace{max-height:70vh;overflow:auto;background:var(--bs-tertiary-bg);border-radius:.5rem;padding:1.25rem}.ms-pdf-template-page{position:relative;width:min(100%,680px);aspect-ratio:210/297;margin:0 auto 1.7rem;background:#fff;color:#212529;box-shadow:0 .5rem 2rem rgba(0,0,0,.22);overflow:hidden;user-select:none}.ms-pdf-template-page.ms-pdf-landscape{width:min(100%,860px);aspect-ratio:297/210}.ms-pdf-template-field{position:absolute;box-sizing:border-box;display:block;overflow:hidden;padding:0;border:1px dashed #adb5bd;background:#f8f9fa;color:#212529;cursor:grab;touch-action:none;text-align:left;font-family:Arial,sans-serif;line-height:1.24}.ms-pdf-template-field:active{cursor:grabbing}.ms-pdf-template-field.ms-selected{border:2px solid #0d6efd;background:#e7f1ff;z-index:2}.ms-pdf-template-label,.ms-pdf-template-value{display:block;overflow-wrap:anywhere;white-space:pre-wrap}.ms-pdf-template-label{font-weight:600;font-size:.9em;line-height:1.15}.ms-pdf-template-value{font-weight:400}.ms-pdf-template-field.ms-pdf-overflow::after{content:'continued…';position:absolute;right:12px;bottom:0;padding:0 2px;background:#fff;color:#6c757d;font:9px system-ui,sans-serif}.ms-pdf-template-resizer{position:absolute;right:0;top:0;bottom:0;width:10px;background:rgba(13,110,253,.25);cursor:ew-resize;touch-action:none}.ms-pdf-template-resizer-corner{position:absolute;right:0;bottom:0;width:13px;height:13px;background:#0d6efd;cursor:nwse-resize;touch-action:none}.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer,.ms-pdf-template-field:not(.ms-selected) .ms-pdf-template-resizer-corner{display:none}.ms-pdf-template-page-number{position:absolute;bottom:3px;right:8px;font:11px system-ui,sans-serif;color:#adb5bd;pointer-events:none}.ms-pdf-template-inspector{min-width:0}.ms-pdf-template-inspector input{min-width:0}.ms-pdf-template-field:focus-visible{outline:3px solid #0d6efd;outline-offset:1px}
+    .ms-pdf-template-field.ms-selected{outline:2px solid #0d6efd;outline-offset:1px}
+    .ms-pdf-template-field.ms-pdf-overflow::after{background:var(--ms-pdf-field-bg,#fff);color:var(--ms-pdf-field-color,#6c757d)}
     a{color:var(--ms-link)}.text-primary{color:var(--ms-accent)!important}.bg-primary{background-color:var(--ms-accent)!important}.border-primary{border-color:var(--ms-accent)!important}.nav-pills{--bs-nav-pills-link-active-bg:var(--ms-accent)}.page-link{color:var(--ms-link)}.active>.page-link,.page-link.active{background-color:var(--ms-accent);border-color:var(--ms-accent);color:var(--ms-accent-text)}.form-check-input:checked{background-color:var(--ms-accent);border-color:var(--ms-accent)}.form-control:focus,.form-select:focus,.form-check-input:focus{border-color:rgba(var(--ms-accent-rgb),.65);box-shadow:0 0 0 .25rem rgba(var(--ms-accent-rgb),.2)}
     .btn-primary{--bs-btn-color:var(--ms-accent-text);--bs-btn-bg:var(--ms-accent);--bs-btn-border-color:var(--ms-accent);--bs-btn-hover-color:var(--ms-accent-text);--bs-btn-hover-bg:var(--ms-accent-hover);--bs-btn-hover-border-color:var(--ms-accent-hover);--bs-btn-active-color:var(--ms-accent-text);--bs-btn-active-bg:var(--ms-accent-hover);--bs-btn-active-border-color:var(--ms-accent-hover);--bs-btn-disabled-color:var(--ms-accent-text);--bs-btn-disabled-bg:var(--ms-accent);--bs-btn-disabled-border-color:var(--ms-accent)}
     html[data-density="ultracompact"]{--sidebar:205px;--ms-table-font-size:14px;--ms-table-line-height:1.02;--ms-table-pad-y:.035rem;--ms-table-pad-x:.16rem;--ms-cell-max-width:260px;--ms-cell-max-height:4.5rem;--ms-sql-editor-font-size:.9rem;--ms-sql-editor-min-height:120px}html[data-density="ultracompact"] .main{padding:.22rem}html[data-density="ultracompact"] .sidebar{padding:.22rem!important}html[data-density="ultracompact"] .form-control,html[data-density="ultracompact"] .form-select,html[data-density="ultracompact"] .btn{font-size:inherit;padding:.06rem .22rem;min-height:0;line-height:1.15}html[data-density="ultracompact"] .card-body,html[data-density="ultracompact"] .card-header,html[data-density="ultracompact"] .card-footer{padding:.18rem .28rem}html[data-density="ultracompact"] .nav-link,html[data-density="ultracompact"] .list-group-item{padding:.08rem .18rem}html[data-density="ultracompact"] .mb-4{margin-bottom:.22rem!important}html[data-density="ultracompact"] .mb-3{margin-bottom:.16rem!important}html[data-density="ultracompact"] .mb-2{margin-bottom:.1rem!important}html[data-density="ultracompact"] .mb-1{margin-bottom:.06rem!important}html[data-density="ultracompact"] .mt-3{margin-top:.16rem!important}html[data-density="ultracompact"] .mt-2{margin-top:.1rem!important}html[data-density="ultracompact"] .mt-1{margin-top:.06rem!important}html[data-density="ultracompact"] .p-3{padding:.22rem!important}html[data-density="ultracompact"] .p-2{padding:.14rem!important}html[data-density="ultracompact"] .py-3{padding-top:.22rem!important;padding-bottom:.22rem!important}html[data-density="ultracompact"] .py-2{padding-top:.14rem!important;padding-bottom:.14rem!important}html[data-density="ultracompact"] .px-3{padding-left:.22rem!important;padding-right:.22rem!important}html[data-density="ultracompact"] .px-2{padding-left:.14rem!important;padding-right:.14rem!important}html[data-density="ultracompact"] .gap-3{gap:.22rem!important}html[data-density="ultracompact"] .gap-2{gap:.14rem!important}html[data-density="ultracompact"] .g-3{--bs-gutter-x:.22rem;--bs-gutter-y:.22rem}html[data-density="ultracompact"] .g-2{--bs-gutter-x:.14rem;--bs-gutter-y:.14rem}html[data-density="ultracompact"] hr{margin:.22rem 0}html[data-density="ultracompact"] .alert{padding:.18rem .28rem;margin-bottom:.18rem}html[data-density="ultracompact"] .badge{padding:.15em .28em}html[data-density="ultracompact"] .pagination{margin-bottom:.12rem}html[data-density="ultracompact"] .page-link{padding:.08rem .22rem}html[data-density="ultracompact"] h1,html[data-density="ultracompact"] h2,html[data-density="ultracompact"] h3,html[data-density="ultracompact"] h4,html[data-density="ultracompact"] h5,html[data-density="ultracompact"] h6{margin-bottom:.08rem}
@@ -6455,7 +6474,9 @@ function page_foot(): void {
       const globalY=Number(pos.y);
       if(!Number.isFinite(globalY)||globalY<0||globalY>=100*pageHeight)throw new Error('A field position is outside the PDF template.');
       const pageIndex=Math.floor(globalY/pageHeight);
-      const fieldData={...field,x:Number(pos.x),y:globalY-pageIndex*pageHeight,width:Number(pos.width),height:Number(pos.height||15.5),size:Number(pos.font_size)};
+      const background=typeof pos.background_color==='string'&&/^#[0-9a-f]{6}$/i.test(pos.background_color)?pos.background_color:'';
+      const foreground=typeof pos.foreground_color==='string'&&/^#[0-9a-f]{6}$/i.test(pos.foreground_color)?pos.foreground_color:'';
+      const fieldData={...field,x:Number(pos.x),y:globalY-pageIndex*pageHeight,width:Number(pos.width),height:Number(pos.height||15.5),size:Number(pos.font_size),background,foreground,showName:pos.show_name!==false};
       if(![fieldData.x,fieldData.width,fieldData.height,fieldData.size].every(Number.isFinite)||fieldData.x<0||fieldData.width<20||fieldData.x+fieldData.width>pageWidth+.1)throw new Error('A field size is outside the PDF template.');
       if(!grouped.has(pageIndex))grouped.set(pageIndex,[]);
       grouped.get(pageIndex).push(fieldData);
@@ -6484,21 +6505,22 @@ function page_foot(): void {
         const lineHeight=valueMm*1.24;
         const textX=field.x,textY=field.y,space=Math.min(field.width,pageWidth-field.x);
         const available=Math.max(0,Math.min(Math.max(8,field.height),pageHeight-2-textY));
-        ctx.fillStyle='#555555';ctx.font=`600 ${labelMm}px Arial, sans-serif`;
-        const labelLines=wrapText(ctx,field.label,space);
+        if(field.background){ctx.fillStyle=field.background;ctx.fillRect(textX,textY,space,available);}
+        ctx.fillStyle=field.foreground||'#555555';ctx.font=`600 ${labelMm}px Arial, sans-serif`;
+        const labelLines=field.showName?wrapText(ctx,field.label,space):[];
         const labelHeight=labelMm*1.15;
         const maxLabels=Math.max(0,Math.floor(available/labelHeight));
         const shownLabels=Math.min(labelLines.length,maxLabels);
         for(let n=0;n<shownLabels;n++)ctx.fillText(labelLines[n],textX,textY+n*labelHeight);
-        ctx.fillStyle='#111111';ctx.font=`${valueMm}px Arial, sans-serif`;
-        const valueY=textY+shownLabels*labelHeight+1.25;
+        ctx.fillStyle=field.foreground||'#111111';ctx.font=`${valueMm}px Arial, sans-serif`;
+        const valueY=textY+(shownLabels?shownLabels*labelHeight+1.25:0);
         const image=field.image_url?pictures.get(field.image_url):null;
         if(image&&image.naturalWidth&&image.naturalHeight){
           const boxHeight=Math.max(0,available-(valueY-textY));
           const scale=Math.min(space/image.naturalWidth,boxHeight/image.naturalHeight);
           if(scale>0&&image.naturalHeight*scale>=3){
             ctx.drawImage(image,textX,valueY,image.naturalWidth*scale,image.naturalHeight*scale);
-            if(labelLines.length>shownLabels)overflow.push({label:String(field.label||field.column||''),value:String(field.value??''),size});
+            if(labelLines.length>shownLabels)overflow.push({label:field.showName?String(field.label||field.column||''):'',value:String(field.value??''),size,background:field.background,foreground:field.foreground});
             continue;
           }
         }
@@ -6511,10 +6533,10 @@ function page_foot(): void {
         for(let n=0;n<fitCount;n++)ctx.fillText(lines[n],textX,valueY+n*lineHeight);
         if(needsAppendix){
           if(markerFits){
-            ctx.fillStyle='#6b7280';ctx.font=`${markerSize}px Arial, sans-serif`;
+            ctx.fillStyle=field.foreground||'#6b7280';ctx.font=`${markerSize}px Arial, sans-serif`;
             ctx.fillText(fitLabel(ctx,'Continued in appendix',space),textX,textY+available-markerSize);
           }
-          overflow.push({label:String(field.label||field.column||''),value:String(field.value??''),size});
+          overflow.push({label:field.showName?String(field.label||field.column||''):'',value:String(field.value??''),size,background:field.background,foreground:field.foreground});
         }
       }
       if(index)pdf.addPage('a4',orientation);
@@ -6526,17 +6548,18 @@ function page_foot(): void {
       const mm=size*25.4/72;
       const lineHeight=mm*1.35;
       ctx.font=`${mm}px Arial, sans-serif`;
-      const lines=wrapText(ctx,item.label+'\n\n'+item.value,pageWidth-24);
+      const lines=wrapText(ctx,(item.label?item.label+'\n\n':'')+item.value,pageWidth-24);
       let offset=0;
       while(offset<lines.length){
         if(pdf.getNumberOfPages()>=200)throw new Error('This row needs too many PDF pages to generate in the browser.');
         pdf.addPage('a4',orientation);
         prepare();
+        if(item.background){ctx.fillStyle=item.background;ctx.fillRect(12,10,pageWidth-24,pageHeight-20);}
         ctx.font=`600 ${Math.min(4,mm*1.1)}px Arial, sans-serif`;
-        ctx.fillStyle='#333333';
-        ctx.fillText(fitLabel(ctx,`${item.label} (continued)`,pageWidth-24),12,12);
+        ctx.fillStyle=item.foreground||'#333333';
+        ctx.fillText(fitLabel(ctx,item.label?`${item.label} (continued)`:'Continued value',pageWidth-24),12,12);
         ctx.font=`${mm}px Arial, sans-serif`;
-        ctx.fillStyle='#111111';
+        ctx.fillStyle=item.foreground||'#111111';
         let y=19;
         while(offset<lines.length&&y+lineHeight<=pageHeight-12){ctx.fillText(lines[offset++],12,y);y+=lineHeight;}
         addPage();
@@ -7864,6 +7887,15 @@ function page_select(mysqli $db): void {
                 <div class="col-6"><label class="form-label" for="ms-pdf-height">Height (mm)</label><input class="form-control form-control-sm" id="ms-pdf-height" type="number" min="8" step="0.1" disabled></div>
                 <div class="col-6"><label class="form-label" for="ms-pdf-font-size">Font size (pt)</label><input class="form-control form-control-sm" id="ms-pdf-font-size" type="number" min="6" max="36" step="0.5" disabled></div>
               </div>
+              <div class="border-top mt-3 pt-3">
+                <div class="fw-semibold mb-2">Field appearance</div>
+                <div class="row g-2">
+                  <div class="col-6"><label class="form-label small mb-1" for="ms-pdf-background-color">Background</label><input class="form-control form-control-color" type="color" id="ms-pdf-background-color" value="#ffffff" title="Choose a background color" disabled><label class="form-check small mt-1"><input class="form-check-input" type="checkbox" id="ms-pdf-background-enabled" disabled><span class="form-check-label">Use color</span></label></div>
+                  <div class="col-6"><label class="form-label small mb-1" for="ms-pdf-foreground-color">Foreground</label><input class="form-control form-control-color" type="color" id="ms-pdf-foreground-color" value="#111111" title="Choose a text color" disabled><label class="form-check small mt-1"><input class="form-check-input" type="checkbox" id="ms-pdf-foreground-enabled" disabled><span class="form-check-label">Use color</span></label></div>
+                  <div class="col-12"><label class="form-check mt-1"><input class="form-check-input" type="checkbox" id="ms-pdf-show-name" disabled checked><span class="form-check-label">Print field name</span></label></div>
+                </div>
+                <div class="form-text">Without a background color the page remains unfilled. Without a foreground color the PDF uses its existing text colors.</div>
+              </div>
             </div></div>
           </div>
           <div class="col-lg-9"><div class="ms-pdf-template-workspace" id="ms-pdf-template-workspace" aria-label="PDF page preview"></div></div>
@@ -8106,13 +8138,19 @@ function page_select(mysqli $db): void {
     const selectedLabel=document.getElementById('ms-pdf-selected-name');
     const status=document.getElementById('ms-pdf-save-status');
     const inputs={x:document.getElementById('ms-pdf-x'),y:document.getElementById('ms-pdf-y'),width:document.getElementById('ms-pdf-width'),height:document.getElementById('ms-pdf-height'),font_size:document.getElementById('ms-pdf-font-size')};
+    const appearance={
+      background:{picker:document.getElementById('ms-pdf-background-color'),enabled:document.getElementById('ms-pdf-background-enabled'),key:'background_color',defaultColor:'#ffffff'},
+      foreground:{picker:document.getElementById('ms-pdf-foreground-color'),enabled:document.getElementById('ms-pdf-foreground-enabled'),key:'foreground_color',defaultColor:'#111111'}
+    };
+    const showName=document.getElementById('ms-pdf-show-name');
     let seed=data.template&&typeof data.template==='object'?data.template:{orientation:'portrait',fields:{}};
     let state,selected=new Set(),lastSelected=-1,extraPages=1,drag=null,edited=false;
     const dimensions=()=>orientationInput.value==='landscape'?{width:297,height:210}:{width:210,height:297};
     const rounded=value=>Math.round(value*100)/100;
+    const colorOrEmpty=value=>typeof value==='string'&&/^#[0-9a-f]{6}$/i.test(value)?value.toLowerCase():'';
     const defaultField=index=>{
       const size=dimensions(),width=(size.width-36)/2,perPage=Math.floor((size.height-32)/18),row=Math.floor(index/2);
-      return {x:12+(index%2)*(width+12),y:Math.floor(row/perPage)*size.height+16+(row%perPage)*18,width,height:15.5,font_size:10};
+      return {x:12+(index%2)*(width+12),y:Math.floor(row/perPage)*size.height+16+(row%perPage)*18,width,height:15.5,font_size:10,background_color:'',foreground_color:'',show_name:true};
     };
     const clampField=field=>{
       const size=dimensions();
@@ -8123,6 +8161,9 @@ function page_select(mysqli $db): void {
       const page=Math.floor(field.y/size.height),within=field.y-page*size.height;
       field.y=rounded(page*size.height+Math.min(size.height-field.height-2,within));
       field.font_size=rounded(Math.max(6,Math.min(36,Number(field.font_size)||10)));
+      field.background_color=colorOrEmpty(field.background_color);
+      field.foreground_color=colorOrEmpty(field.foreground_color);
+      field.show_name=field.show_name!==false;
       return field;
     };
     const resetFromSeed=()=>{
@@ -8151,6 +8192,20 @@ function page_select(mysqli $db): void {
         input.value=one?String(one[key]):common?String(state.fields[names[0]][key]):'';
         input.placeholder=names.length>1?'Mixed':'';
       });
+      Object.values(appearance).forEach(control=>{
+        const first=names.length?state.fields[names[0]][control.key]:'';
+        const common=names.length&&names.every(name=>state.fields[name][control.key]===first);
+        control.picker.disabled=!names.length;
+        control.enabled.disabled=!names.length;
+        control.picker.value=first||control.defaultColor;
+        control.enabled.checked=!!first&&!!common;
+        control.enabled.indeterminate=!!names.length&&!common;
+      });
+      showName.disabled=!names.length;
+      const firstName=names.length?state.fields[names[0]].show_name:true;
+      const sameName=names.length&&names.every(name=>state.fields[name].show_name===firstName);
+      showName.checked=names.length?firstName:true;
+      showName.indeterminate=!!names.length&&!sameName;
     };
     const createPage=index=>{
       const page=document.createElement('div');
@@ -8182,16 +8237,21 @@ function page_select(mysqli $db): void {
         element.style.width=field.width/size.width*100+'%';
         element.style.height=field.height/size.height*100+'%';
         element.style.fontSize=field.font_size*25.4/72*(page.clientWidth/size.width)+'px';
+        element.style.backgroundColor=field.background_color||'transparent';
+        element.style.color=field.foreground_color||'#212529';
+        element.style.setProperty('--ms-pdf-field-bg',field.background_color||'#ffffff');
+        element.style.setProperty('--ms-pdf-field-color',field.foreground_color||'#6c757d');
         const label=document.createElement('span');label.className='ms-pdf-template-label';label.textContent=column.label||column.name;
         const value=document.createElement('span');value.className='ms-pdf-template-value';value.textContent=String(column.sample??'Sample value');
         const resizer=document.createElement('span');resizer.className='ms-pdf-template-resizer';resizer.setAttribute('aria-hidden','true');
         const corner=document.createElement('span');corner.className='ms-pdf-template-resizer-corner';corner.setAttribute('aria-hidden','true');
-        element.append(label,value,resizer,corner);
+        if(field.show_name)element.appendChild(label);
+        element.append(value,resizer,corner);
         page.appendChild(element);
       });
       workspace.querySelectorAll('[data-pdf-field]').forEach(element=>{
         const label=element.querySelector('.ms-pdf-template-label'),value=element.querySelector('.ms-pdf-template-value');
-        element.classList.toggle('ms-pdf-overflow',Boolean(label&&value&&label.offsetHeight+value.offsetHeight>element.clientHeight-4));
+        element.classList.toggle('ms-pdf-overflow',Boolean(value&&(label?.offsetHeight||0)+value.offsetHeight>element.clientHeight-4));
       });
       pageCountLabel.textContent=count+' A4 '+(count===1?'page':'pages')+' · '+columns.length+' visible '+(columns.length===1?'field':'fields');
       updateInspector();
@@ -8322,6 +8382,24 @@ function page_select(mysqli $db): void {
       });
       edited=true;status.textContent='Unsaved changes';render();
     }));
+    Object.values(appearance).forEach(control=>{
+      control.picker.addEventListener('input',()=>{
+        if(!selected.size)return;
+        selected.forEach(name=>{state.fields[name][control.key]=colorOrEmpty(control.picker.value);});
+        edited=true;status.textContent='Unsaved changes';render();
+      });
+      control.enabled.addEventListener('change',()=>{
+        if(!selected.size)return;
+        const color=control.enabled.checked?colorOrEmpty(control.picker.value):'';
+        selected.forEach(name=>{state.fields[name][control.key]=color;});
+        edited=true;status.textContent='Unsaved changes';render();
+      });
+    });
+    showName.addEventListener('change',()=>{
+      if(!selected.size)return;
+      selected.forEach(name=>{state.fields[name].show_name=showName.checked;});
+      edited=true;status.textContent='Unsaved changes';render();
+    });
     orientationInput.addEventListener('change',()=>{
       if(!state)return;
       const oldSize=state.orientation==='landscape'?{width:297,height:210}:{width:210,height:297};
@@ -8340,7 +8418,10 @@ function page_select(mysqli $db): void {
     });
     document.getElementById('ms-pdf-add-page').addEventListener('click',()=>{extraPages=pageCount()+1;render();workspace.lastElementChild?.scrollIntoView({block:'nearest',behavior:'smooth'});});
     document.getElementById('ms-pdf-reset').addEventListener('click',()=>{
-      columns.forEach((column,index)=>{state.fields[column.name]=defaultField(index);});
+      columns.forEach((column,index)=>{
+        const {x,y,width,height,font_size}=defaultField(index);
+        state.fields[column.name]={...state.fields[column.name],x,y,width,height,font_size};
+      });
       selected.clear();extraPages=1;edited=true;status.textContent='Unsaved changes';render();
     });
     document.getElementById('ms-pdf-save').addEventListener('click',async event=>{
