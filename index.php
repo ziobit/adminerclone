@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.17.0';
+const MS_VERSION = '1.18.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -109,7 +109,7 @@ function go(array $changes = [], string $flash = '', string $type = 'success'): 
 }
 
 function ms_allowed_pages(): array {
-  return ['databases','database','create_table','structure','select','clone_rows','row','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics','settings'];
+  return ['databases','database','global_search','repair_recipes','create_table','structure','select','clone_rows','row','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics','settings'];
 }
 
 function ms_clean_navigation_value($value, int $depth = 0) {
@@ -530,6 +530,8 @@ function ms_profile_default_settings(): array {
     'menu' => [
       'databases' => true,
       'database' => true,
+      'global_search' => true,
+      'repair_recipes' => true,
       'sql' => true,
       'query_builder' => true,
       'import' => true,
@@ -1263,6 +1265,258 @@ function ms_profile_delete_search(string $database, string $table, string $name)
   });
 }
 
+function ms_named_tool_id(string $id): string {
+  if (preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1) throw new RuntimeException('Invalid saved item.');
+  return $id;
+}
+
+function ms_global_search_schema(mysqli $db): array {
+  $rows = db_all($db, "SELECT TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND DATA_TYPE NOT IN ('tinyblob','blob','mediumblob','longblob','binary','varbinary','geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection') ORDER BY TABLE_NAME,ORDINAL_POSITION");
+  $schema = [];
+  foreach ($rows as $row) {
+    $table = (string)$row['TABLE_NAME'];
+    $column = (string)$row['COLUMN_NAME'];
+    $schema[$table][$column] = ['type'=>(string)$row['DATA_TYPE'],'column_type'=>(string)$row['COLUMN_TYPE']];
+  }
+  return $schema;
+}
+
+function ms_global_search_normalize(array $source, array $schema): array {
+  $term = trim((string)($source['term'] ?? ''));
+  if (strlen($term) > 1000 || preg_match('//u', $term) !== 1) throw new RuntimeException('Search text must be valid UTF-8 and at most 1,000 bytes.');
+  $mode = (string)($source['mode'] ?? 'contains');
+  if (!in_array($mode, ['contains','starts','exact'], true)) $mode = 'contains';
+  $sourceColumns = isset($source['columns']) && is_array($source['columns']) ? $source['columns'] : [];
+  $columns = [];
+  $selected = 0;
+  foreach ($sourceColumns as $table => $names) {
+    $table = (string)$table;
+    if (!isset($schema[$table]) || !is_array($names)) continue;
+    foreach ($names as $name) {
+      $name = (string)$name;
+      if (!isset($schema[$table][$name]) || isset($columns[$table][$name])) continue;
+      if (++$selected > 100) throw new RuntimeException('Choose at most 100 fields for a global search.');
+      $columns[$table][$name] = true;
+    }
+  }
+  $clean = [];
+  foreach ($columns as $table => $names) $clean[$table] = array_keys($names);
+  if (count($clean) > 50) throw new RuntimeException('Choose fields from at most 50 tables.');
+  return ['term'=>$term,'mode'=>$mode,'columns'=>$clean];
+}
+
+function ms_profile_global_searches(string $database): array {
+  $databaseConfig = ms_profile_database_config($database);
+  $entries = isset($databaseConfig['global_searches']) && is_array($databaseConfig['global_searches']) ? $databaseConfig['global_searches'] : [];
+  $result = [];
+  foreach ($entries as $id => $entry) {
+    if (!is_string($id) || preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1 || !is_array($entry) || !is_array($entry['definition'] ?? null)) continue;
+    $result[$id] = $entry;
+  }
+  uasort($result, static function (array $a, array $b): int { return strnatcasecmp((string)($a['name'] ?? ''), (string)($b['name'] ?? '')); });
+  return $result;
+}
+
+function ms_profile_save_global_search(string $database, string $name, array $definition): string {
+  $name = ms_saved_search_name($name);
+  $savedId = '';
+  ms_profile_update_database($database, static function (array $config) use ($name, $definition, &$savedId): array {
+    if (!isset($config['global_searches']) || !is_array($config['global_searches'])) $config['global_searches'] = [];
+    foreach ($config['global_searches'] as $id => $entry) {
+      if (is_array($entry) && strcasecmp((string)($entry['name'] ?? ''), $name) === 0) { $savedId = (string)$id; break; }
+    }
+    if ($savedId === '') {
+      if (count($config['global_searches']) >= 100) throw new RuntimeException('This database already has 100 saved global searches.');
+      do { $savedId = bin2hex(random_bytes(8)); } while (isset($config['global_searches'][$savedId]));
+    }
+    $config['global_searches'][$savedId] = ['name'=>$name,'definition'=>$definition,'updated_at'=>time()];
+    return $config;
+  });
+  return $savedId;
+}
+
+function ms_profile_delete_global_search(string $database, string $id): void {
+  $id = ms_named_tool_id($id);
+  ms_profile_update_database($database, static function (array $config) use ($id): array {
+    if (!isset($config['global_searches'][$id])) throw new RuntimeException('Saved global search not found.');
+    unset($config['global_searches'][$id]);
+    if (empty($config['global_searches'])) unset($config['global_searches']);
+    return $config;
+  });
+}
+
+function ms_global_search_run(mysqli $db, array $definition): array {
+  $term = (string)($definition['term'] ?? '');
+  $mode = (string)($definition['mode'] ?? 'contains');
+  $results = [];
+  if ($term === '') return $results;
+  $needle = qs($db, $term);
+  foreach (($definition['columns'] ?? []) as $table => $columns) {
+    if (!is_array($columns) || !$columns || !table_exists($db, (string)$table)) continue;
+    $clauses = [];
+    foreach ($columns as $column) {
+      $value = 'CAST(' . qi((string)$column) . ' AS CHAR)';
+      if ($mode === 'exact') $clauses[] = $value . ' = ' . $needle;
+      elseif ($mode === 'starts') $clauses[] = 'LEFT(' . $value . ',CHAR_LENGTH(' . $needle . ')) = ' . $needle;
+      else $clauses[] = 'LOCATE(' . $needle . ',' . $value . ') > 0';
+    }
+    if (!$clauses) continue;
+    $where = '(' . implode(' OR ', $clauses) . ')';
+    $count = db_one($db, 'SELECT COUNT(*) AS n FROM ' . qi((string)$table) . ' WHERE ' . $where);
+    $rows = db_all($db, 'SELECT ' . implode(',', array_map('qi', array_map('strval', $columns))) . ' FROM ' . qi((string)$table) . ' WHERE ' . $where . ' LIMIT 25');
+    $total = (int)($count['n'] ?? 0);
+    if ($total > 0) $results[] = ['table'=>(string)$table,'columns'=>array_values(array_map('strval',$columns)),'rows'=>$rows,'total'=>$total];
+  }
+  return $results;
+}
+
+function ms_repair_recipe_normalize(array $source): array {
+  $name = ms_saved_search_name((string)($source['name'] ?? ''));
+  $preview = trim((string)($source['preview_sql'] ?? ''));
+  $repair = trim((string)($source['repair_sql'] ?? ''));
+  $previewStatements = split_sql_script($preview);
+  $repairStatements = split_sql_script($repair);
+  if ($preview === '' || strlen($preview) > 65536 || count($previewStatements) !== 1 || preg_match('/\A\s*SELECT\b/i', $previewStatements[0]) !== 1) {
+    throw new RuntimeException('Preview SQL must contain exactly one SELECT statement, without a trailing second statement.');
+  }
+  if ($repair === '' || strlen($repair) > 65536 || count($repairStatements) !== 1 || preg_match('/\A\s*UPDATE\s+(?:`(?:``|[^`])+`|[A-Za-z0-9_$]+)\s+SET\b/is', $repairStatements[0]) !== 1) {
+    throw new RuntimeException('Repair SQL must be one simple single-table UPDATE … SET statement. JOIN updates and multiple statements are not allowed.');
+  }
+  $maxRows = max(1, min(1000, (int)($source['max_rows'] ?? 25)));
+  return ['name'=>$name,'preview_sql'=>$previewStatements[0],'repair_sql'=>$repairStatements[0],'max_rows'=>$maxRows];
+}
+
+function ms_profile_repair_recipes(string $database): array {
+  $databaseConfig = ms_profile_database_config($database);
+  $entries = isset($databaseConfig['repair_recipes']) && is_array($databaseConfig['repair_recipes']) ? $databaseConfig['repair_recipes'] : [];
+  $result = [];
+  foreach ($entries as $id => $entry) {
+    if (!is_string($id) || preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1 || !is_array($entry)) continue;
+    try { $result[$id] = ms_repair_recipe_normalize($entry); } catch (Throwable $ignored) {}
+  }
+  uasort($result, static function (array $a, array $b): int { return strnatcasecmp($a['name'], $b['name']); });
+  return $result;
+}
+
+function ms_profile_save_repair_recipe(string $database, array $source, string $requestedId = ''): string {
+  $recipe = ms_repair_recipe_normalize($source);
+  $requestedId = $requestedId !== '' ? ms_named_tool_id($requestedId) : '';
+  $savedId = $requestedId;
+  ms_profile_update_database($database, static function (array $config) use ($recipe, &$savedId): array {
+    if (!isset($config['repair_recipes']) || !is_array($config['repair_recipes'])) $config['repair_recipes'] = [];
+    if ($savedId === '') {
+      foreach ($config['repair_recipes'] as $id => $entry) {
+        if (is_array($entry) && strcasecmp((string)($entry['name'] ?? ''), $recipe['name']) === 0) { $savedId = (string)$id; break; }
+      }
+    }
+    if ($savedId === '') {
+      if (count($config['repair_recipes']) >= 100) throw new RuntimeException('This database already has 100 repair recipes.');
+      do { $savedId = bin2hex(random_bytes(8)); } while (isset($config['repair_recipes'][$savedId]));
+    }
+    $config['repair_recipes'][$savedId] = $recipe + ['updated_at'=>time()];
+    return $config;
+  });
+  return $savedId;
+}
+
+function ms_profile_delete_repair_recipe(string $database, string $id): void {
+  $id = ms_named_tool_id($id);
+  ms_profile_update_database($database, static function (array $config) use ($id): array {
+    if (!isset($config['repair_recipes'][$id])) throw new RuntimeException('Repair recipe not found.');
+    unset($config['repair_recipes'][$id]);
+    if (empty($config['repair_recipes'])) unset($config['repair_recipes']);
+    return $config;
+  });
+}
+
+function ms_sql_parameter_names(string ...$statements): array {
+  $names = [];
+  foreach ($statements as $sql) {
+    if (preg_match_all('/:([A-Za-z_][A-Za-z0-9_]*)/', $sql, $matches)) {
+      foreach ($matches[1] as $name) if (!in_array((string)$name, $names, true)) $names[] = (string)$name;
+    }
+  }
+  return $names;
+}
+
+function ms_repair_parameters_from_post(array $expected): array {
+  $values = isset($_POST['repair_value']) && is_array($_POST['repair_value']) ? $_POST['repair_value'] : [];
+  $types = isset($_POST['repair_type']) && is_array($_POST['repair_type']) ? $_POST['repair_type'] : [];
+  $parameters = [];
+  foreach ($expected as $name) {
+    $type = (string)($types[$name] ?? 'text');
+    if (!in_array($type, ['text','number','null'], true)) throw new RuntimeException('Invalid parameter type for :' . $name . '.');
+    $parameters[$name] = ['type'=>$type,'value'=>(string)($values[$name] ?? '')];
+  }
+  return $parameters;
+}
+
+function ms_repair_update_table(string $sql): string {
+  if (preg_match('/\A\s*UPDATE\s+(?:`((?:``|[^`])+)`|([A-Za-z0-9_$]+))\s+SET\b/is', $sql, $match) !== 1) {
+    throw new RuntimeException('Only simple single-table UPDATE … SET repair statements are allowed.');
+  }
+  return isset($match[1]) && $match[1] !== '' ? str_replace('``', '`', $match[1]) : (string)$match[2];
+}
+
+function ms_repair_assert_transactional_table(mysqli $db, string $sql): void {
+  $table = ms_repair_update_table($sql);
+  $row = db_one($db, 'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table) . ' AND TABLE_TYPE=\'BASE TABLE\'');
+  $engine = (string)($row['ENGINE'] ?? '');
+  $support = $engine !== '' ? db_one($db, 'SELECT TRANSACTIONS FROM information_schema.ENGINES WHERE ENGINE=' . qs($db, $engine)) : null;
+  if (strtoupper((string)($support['TRANSACTIONS'] ?? 'NO')) !== 'YES') throw new RuntimeException('Repair recipes require a transactional table engine; ' . ($engine !== '' ? $engine : $table) . ' cannot guarantee rollback.');
+}
+
+function ms_repair_preview(mysqli $db, string $id, array $recipe, array $parameters): array {
+  $previewSql = ms_expand_sql_parameters($db, $recipe['preview_sql'], $parameters);
+  $repairSql = ms_expand_sql_parameters($db, $recipe['repair_sql'], $parameters);
+  ms_repair_assert_transactional_table($db, $repairSql);
+  $limit = (int)$recipe['max_rows'];
+  $result = $db->query('SELECT * FROM (' . $previewSql . ') AS `ms_repair_preview` LIMIT ' . ($limit + 1));
+  if (!$result instanceof mysqli_result) throw new RuntimeException('Repair preview failed: ' . $db->error);
+  $rows = [];
+  while ($row = $result->fetch_assoc()) $rows[] = $row;
+  $fields = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
+  $result->free();
+  $overflow = count($rows) > $limit;
+  if ($overflow) $rows = array_slice($rows, 0, $limit);
+  $token = '';
+  if (!$overflow && $rows) {
+    $token = bin2hex(random_bytes(24));
+    $previews = isset($_SESSION['ms_repair_previews']) && is_array($_SESSION['ms_repair_previews']) ? $_SESSION['ms_repair_previews'] : [];
+    foreach ($previews as $key => $entry) if (!is_array($entry) || (int)($entry['created_at'] ?? 0) < time() - 600) unset($previews[$key]);
+    while (count($previews) >= 5) array_shift($previews);
+    $previews[$token] = ['database'=>selected_db(),'recipe_id'=>$id,'recipe_hash'=>hash('sha256', json_encode($recipe) ?: ''),'repair_sql'=>$repairSql,'max_rows'=>$limit,'preview_rows'=>count($rows),'created_at'=>time()];
+    $_SESSION['ms_repair_previews'] = $previews;
+  }
+  return ['fields'=>$fields,'rows'=>$rows,'overflow'=>$overflow,'token'=>$token,'max_rows'=>$limit];
+}
+
+function ms_repair_execute(mysqli $db, string $token): int {
+  if (preg_match('/\A[0-9a-f]{48}\z/', $token) !== 1) throw new RuntimeException('Invalid or expired repair preview.');
+  $entry = $_SESSION['ms_repair_previews'][$token] ?? null;
+  if (!is_array($entry) || (string)($entry['database'] ?? '') !== selected_db() || (int)($entry['created_at'] ?? 0) < time() - 600) throw new RuntimeException('The repair preview expired. Preview the recipe again.');
+  $recipes = ms_profile_repair_recipes(selected_db());
+  $recipe = $recipes[(string)($entry['recipe_id'] ?? '')] ?? null;
+  if (!is_array($recipe) || !hash_equals((string)($entry['recipe_hash'] ?? ''), hash('sha256', json_encode($recipe) ?: ''))) throw new RuntimeException('The recipe changed after preview. Preview it again.');
+  $sql = (string)($entry['repair_sql'] ?? '');
+  $maxRows = max(1, (int)($entry['max_rows'] ?? 1));
+  $previewRows = max(0, (int)($entry['preview_rows'] ?? 0));
+  ms_repair_assert_transactional_table($db, $sql);
+  if (!$db->begin_transaction()) throw new RuntimeException('Unable to start the repair transaction: ' . $db->error);
+  try {
+    if (!$db->query($sql)) throw new RuntimeException('Repair failed: ' . $db->error);
+    $affected = max(0, (int)$db->affected_rows);
+    if ($affected > $maxRows) throw new RuntimeException('Repair matched ' . $affected . ' changed rows, above the safety limit of ' . $maxRows . '. The transaction was rolled back.');
+    if ($affected > $previewRows) throw new RuntimeException('Repair changed more rows than the preview returned (' . $affected . ' instead of at most ' . $previewRows . '). The transaction was rolled back.');
+    if (!$db->commit()) throw new RuntimeException('Unable to commit the repair: ' . $db->error);
+    unset($_SESSION['ms_repair_previews'][$token]);
+    return $affected;
+  } catch (Throwable $error) {
+    $db->rollback();
+    throw $error;
+  }
+}
+
 function ms_view_preset_server_key(): string {
   $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
   return hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? ''));
@@ -1319,6 +1573,7 @@ function ms_view_preset_list(string $database, string $table): array {
       if (!is_string($id) || !is_array($entry) || !is_array($entry['snapshot'] ?? null)) continue;
       $result[$scope][] = ['id' => $id, 'name' => (string)($entry['name'] ?? ''),
         'owner' => (string)($entry['owner_label'] ?? ''),
+        'pinned' => !empty($entry['pinned']),
         'can_manage' => $scope === 'private' || ($entry['owner'] ?? '') === $owner];
     }
     usort($result[$scope], static function (array $a, array $b): int { return strnatcasecmp($a['name'], $b['name']); });
@@ -1326,13 +1581,13 @@ function ms_view_preset_list(string $database, string $table): array {
   return $result;
 }
 
-function ms_view_preset_save(string $database, string $table, string $scope, string $name, array $snapshot, array $columns): void {
+function ms_view_preset_save(string $database, string $table, string $scope, string $name, array $snapshot, array $columns, bool $pinned = false): void {
   $name = ms_saved_search_name($name);
   if (!in_array($scope, ['private','shared'], true)) throw new RuntimeException('Invalid preset scope.');
   $snapshot = ms_view_preset_normalize($snapshot, $columns);
   $owner = ms_server_config_key();
   $ownerLabel = (string)($_SESSION['ms_login']['user'] ?? '');
-  ms_profile_config_mutate(static function (array $config) use ($database, $table, $scope, $name, $snapshot, $owner, $ownerLabel): array {
+  ms_profile_config_mutate(static function (array $config) use ($database, $table, $scope, $name, $snapshot, $owner, $ownerLabel, $pinned): array {
     if ($scope === 'private') {
       $profile = ms_active_profile_name();
       $bucket =& $config['profiles'][$profile]['servers'][$owner]['databases'][$database]['tables'][$table]['view_presets'];
@@ -1352,9 +1607,68 @@ function ms_view_preset_save(string $database, string $table, string $scope, str
       do { $id = bin2hex(random_bytes(8)); } while (isset($bucket[$id]));
     }
     $bucket[$id] = ['name' => $name, 'owner' => $owner, 'owner_label' => $ownerLabel,
-      'snapshot' => $snapshot, 'updated_at' => time()];
+      'snapshot' => $snapshot, 'pinned' => $pinned, 'updated_at' => time()];
     return $config;
   });
+}
+
+function ms_view_preset_set_pinned(string $database, string $table, string $scope, string $id, bool $pinned): void {
+  if (!in_array($scope, ['private','shared'], true) || preg_match('/\A[0-9a-f]{16}\z/', $id) !== 1) throw new RuntimeException('Invalid preset.');
+  $owner = ms_server_config_key();
+  ms_profile_config_mutate(static function (array $config) use ($database, $table, $scope, $id, $pinned, $owner): array {
+    if ($scope === 'private') {
+      $bucket =& $config['profiles'][ms_active_profile_name()]['servers'][$owner]['databases'][$database]['tables'][$table]['view_presets'];
+    } else {
+      $bucket =& $config['shared_view_presets'][ms_view_preset_server_key()][$database][$table];
+    }
+    if (!is_array($bucket) || !isset($bucket[$id]) || !is_array($bucket[$id])) throw new RuntimeException('Preset not found.');
+    if ($scope === 'shared' && ($bucket[$id]['owner'] ?? '') !== $owner) throw new RuntimeException('Only the creator can pin or unpin this shared preset.');
+    $bucket[$id]['pinned'] = $pinned;
+    $bucket[$id]['updated_at'] = time();
+    return $config;
+  });
+}
+
+function ms_problem_queue_list(string $database): array {
+  $config = ms_profile_config_read();
+  $owner = ms_server_config_key();
+  $profile = ms_active_profile_name();
+  $privateTables = $config['profiles'][$profile]['servers'][$owner]['databases'][$database]['tables'] ?? [];
+  $sharedTables = $config['shared_view_presets'][ms_view_preset_server_key()][$database] ?? [];
+  $result = [];
+  foreach (['private'=>$privateTables,'shared'=>$sharedTables] as $scope=>$tables) {
+    if (!is_array($tables)) continue;
+    foreach ($tables as $table=>$tableConfig) {
+      $bucket = $scope === 'private' ? ($tableConfig['view_presets'] ?? []) : $tableConfig;
+      if (!is_array($bucket)) continue;
+      foreach ($bucket as $id=>$entry) {
+        if (!is_string($id) || !is_array($entry) || empty($entry['pinned']) || !is_array($entry['snapshot'] ?? null)) continue;
+        $result[] = ['scope'=>$scope,'table'=>(string)$table,'id'=>$id,'name'=>(string)($entry['name'] ?? ''),'owner'=>(string)($entry['owner_label'] ?? ''),'snapshot'=>$entry['snapshot']];
+      }
+    }
+  }
+  usort($result, static function (array $a, array $b): int { return strnatcasecmp($a['name'], $b['name']); });
+  return $result;
+}
+
+function ms_problem_queue_count(mysqli $db, array $queue): array {
+  $table = (string)($queue['table'] ?? '');
+  if ($table === '' || !table_exists($db, $table)) return ['count'=>0,'error'=>'Table not found'];
+  $columns = table_columns($db, $table);
+  try {
+    $snapshot = ms_view_preset_normalize(is_array($queue['snapshot'] ?? null) ? $queue['snapshot'] : [], array_column($columns, 'COLUMN_NAME'));
+    $before = $_GET;
+    try {
+      $_GET = array_merge(['page'=>'select','table'=>$table], $snapshot['query']);
+      [, $countSql] = build_select_query($db, $table, $columns);
+      $row = db_one($db, $countSql);
+      return ['count'=>(int)($row['n'] ?? 0),'error'=>''];
+    } finally {
+      $_GET = $before;
+    }
+  } catch (Throwable $error) {
+    return ['count'=>0,'error'=>$error->getMessage()];
+  }
 }
 
 function ms_view_preset_get(string $database, string $table, string $scope, string $id): array {
@@ -2143,7 +2457,8 @@ function ms_diagnostics_run(): array {
     'Pagination, filters, sort and presets',
     'Table, card, Pretty View and session state',
     'Explain, Analyze, Duplicates and export',
-    'Soft delete, relations and virtual keys'
+    'Soft delete, relations and virtual keys',
+    'Problem queues, global search and repair recipes'
   ];
   $report = [
     'version' => MS_VERSION,
@@ -2324,6 +2639,20 @@ function ms_diagnostics_run(): array {
       } finally {
         $_GET = $before;
       }
+    });
+
+    ms_diagnostics_add_case($report['results'], $groups[5], 'Pinned problem queue counts its saved filter', 'Saved-view count query', ['table'=>'parents','filter'=>'deleted = 0'], ['count'=>2,'error'=>''], static function () use ($diag): array {
+      return ms_problem_queue_count($diag, ['table'=>'parents','snapshot'=>['query'=>['filter_col'=>['deleted'],'filter_op'=>['='],'filter_val'=>['0']],'hidden'=>[],'order'=>[],'widths'=>[],'view_mode'=>'table','raw_db_view'=>false]]);
+    });
+    ms_diagnostics_add_case($report['results'], $groups[5], 'Named global search respects selected fields', 'Search parents.label for Alpha', ['mode'=>'exact','fields'=>['parents.label']], ['table'=>'parents','total'=>2], static function () use ($diag): array {
+      $schema = ms_global_search_schema($diag);
+      $definition = ms_global_search_normalize(['term'=>'Alpha','mode'=>'exact','columns'=>['parents'=>['label']]], $schema);
+      $results = ms_global_search_run($diag, $definition);
+      return ['table'=>(string)($results[0]['table']??''),'total'=>(int)($results[0]['total']??-1)];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[5], 'Repair recipe accepts one bounded parameterized UPDATE', 'Local repair validation', ['preview'=>'SELECT','repair'=>'UPDATE','max_rows'=>2], ['table'=>'parents','parameters'=>['id','new_label'],'max_rows'=>2], static function (): array {
+      $recipe = ms_repair_recipe_normalize(['name'=>'Rename parent','preview_sql'=>'SELECT id,label FROM parents WHERE id = :id;','repair_sql'=>'UPDATE parents SET label = :new_label WHERE id = :id;','max_rows'=>2]);
+      return ['table'=>ms_repair_update_table($recipe['repair_sql']),'parameters'=>ms_sql_parameter_names($recipe['preview_sql'],$recipe['repair_sql']),'max_rows'=>$recipe['max_rows']];
     });
   } catch (Throwable $setupError) {
     if (!$report['results']) {
@@ -4611,7 +4940,7 @@ try {
           $widths = json_decode(p('widths_json'), true);
           if (!is_array($widths)) throw new RuntimeException('Invalid column widths.');
           ms_profile_set_table_widths($database, $table, $widths, $columns);
-        } elseif (in_array($configAction, ['save_view_preset','apply_view_preset','delete_view_preset'], true)) {
+        } elseif (in_array($configAction, ['save_view_preset','apply_view_preset','delete_view_preset','pin_view_preset'], true)) {
           $database = selected_db();
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
           $table = p('table');
@@ -4623,9 +4952,11 @@ try {
             if (strlen($raw) > 65536) throw new RuntimeException('The preset is too large.');
             $snapshot = json_decode($raw, true);
             if (!is_array($snapshot) || json_last_error() !== JSON_ERROR_NONE) throw new RuntimeException('Invalid preset data.');
-            ms_view_preset_save($database, $table, $scope, p('name'), $snapshot, $columns);
+            ms_view_preset_save($database, $table, $scope, p('name'), $snapshot, $columns, p('pinned') === '1');
           } elseif ($configAction === 'apply_view_preset') {
             $presetUrl = ms_view_preset_apply($database, $table, $scope, p('id'), $columns);
+          } elseif ($configAction === 'pin_view_preset') {
+            ms_view_preset_set_pinned($database, $table, $scope, p('id'), p('pinned') === '1');
           } else {
             ms_view_preset_delete($database, $table, $scope, p('id'));
           }
@@ -5056,6 +5387,65 @@ try {
 
       if (selected_db() !== '' && !$db->select_db(selected_db())) {
         throw new RuntimeException($db->error);
+      }
+
+      if (in_array($action, ['open_problem_queue','run_global_search','save_global_search','delete_global_search','save_repair_recipe','delete_repair_recipe','preview_repair_recipe','execute_repair_recipe'], true) && selected_db() === '') {
+        throw new RuntimeException('Choose a database first.');
+      }
+
+      if ($action === 'open_problem_queue') {
+        $table = p('queue_table');
+        if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('The problem-queue table is no longer available.');
+        $columns = array_values(array_map('strval', array_column(table_columns($db, $table), 'COLUMN_NAME')));
+        $target = ms_view_preset_apply(selected_db(), $table, p('queue_scope'), p('queue_id'), $columns);
+        header('Location: ' . $target);
+        exit;
+      }
+
+      if (in_array($action, ['run_global_search','save_global_search'], true)) {
+        if (selected_db() === '') throw new RuntimeException('Choose a database first.');
+        $schema = ms_global_search_schema($db);
+        $definition = ms_global_search_normalize(['term'=>p('term'),'mode'=>p('mode'),'columns'=>isset($_POST['columns'])&&is_array($_POST['columns'])?$_POST['columns']:[]], $schema);
+        if ($definition['term'] === '') throw new RuntimeException('Enter a value to search for.');
+        if (!$definition['columns']) throw new RuntimeException('Choose at least one searchable field.');
+        $_SESSION['ms_global_search_current'][selected_db()] = $definition;
+        if ($action === 'save_global_search') {
+          $savedId = ms_profile_save_global_search(selected_db(), p('search_name'), $definition);
+          go(['page'=>'global_search','saved'=>$savedId], 'Global search saved.');
+        }
+        go(['page'=>'global_search','saved'=>null], 'Global search completed.', 'info');
+      }
+
+      if ($action === 'delete_global_search') {
+        ms_profile_delete_global_search(selected_db(), p('saved_id'));
+        go(['page'=>'global_search','saved'=>null], 'Saved global search deleted.');
+      }
+
+      if ($action === 'save_repair_recipe') {
+        $savedId = ms_profile_save_repair_recipe(selected_db(), ['name'=>p('recipe_name'),'preview_sql'=>p('preview_sql'),'repair_sql'=>p('repair_sql'),'max_rows'=>(int)p('max_rows','25')], p('recipe_id'));
+        go(['page'=>'repair_recipes','recipe'=>$savedId,'new'=>null], 'Repair recipe saved.');
+      }
+
+      if ($action === 'delete_repair_recipe') {
+        ms_profile_delete_repair_recipe(selected_db(), p('recipe_id'));
+        go(['page'=>'repair_recipes','recipe'=>null,'new'=>null], 'Repair recipe deleted.');
+      }
+
+      if ($action === 'preview_repair_recipe') {
+        $recipeId = ms_named_tool_id(p('recipe_id'));
+        $recipe = ms_profile_repair_recipes(selected_db())[$recipeId] ?? null;
+        if (!is_array($recipe)) throw new RuntimeException('Repair recipe not found.');
+        $parameters = ms_repair_parameters_from_post(ms_sql_parameter_names($recipe['preview_sql'], $recipe['repair_sql']));
+        $repairPreview = ms_repair_preview($db, $recipeId, $recipe, $parameters);
+        $_GET = ['page'=>'repair_recipes','recipe'=>$recipeId];
+      }
+
+      if ($action === 'execute_repair_recipe') {
+        $token = p('repair_token');
+        $entry = $_SESSION['ms_repair_previews'][$token] ?? null;
+        $recipeId = is_array($entry) ? (string)($entry['recipe_id'] ?? '') : '';
+        $affected = ms_repair_execute($db, $token);
+        go(['page'=>'repair_recipes','recipe'=>$recipeId], 'Repair completed safely: ' . $affected . ' row(s) changed.');
       }
 
       if (strpos($action, 'column_view_') === 0) {
@@ -6106,7 +6496,7 @@ function page_head(string $title, bool $authenticated): void {
   <script>
     (() => {
       'use strict';
-      const menuKeys = ['databases','database','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics'];
+      const menuKeys = ['databases','database','global_search','repair_recipes','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics'];
       const defaults = <?= $defaultSettingsJson ?>;
       const serverSettings = <?= $clientSettingsJson ?>;
       const csrf = <?= $csrfJson ?>;
@@ -7429,6 +7819,8 @@ function render_sidebar(): void {
   $items = [
     ['databases', 'fa-database', 'Databases'],
     ['database', 'fa-table-list', 'Database'],
+    ['global_search', 'fa-magnifying-glass', 'Global search'],
+    ['repair_recipes', 'fa-screwdriver-wrench', 'Repair recipes'],
     ['sql', 'fa-terminal', 'SQL command'],
     ['query_builder', 'fa-code-branch', 'Query builder'],
     ['import', 'fa-file-import', 'Import'],
@@ -7620,7 +8012,10 @@ function page_databases(mysqli $db): void {
 function page_database(mysqli $db): void {
   $rows = db_all($db, "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_ROWS,DATA_LENGTH,INDEX_LENGTH,TABLE_COLLATION,TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_TYPE,TABLE_NAME");
   $size = 0; foreach ($rows as $row) $size += (int)$row['DATA_LENGTH'] + (int)$row['INDEX_LENGTH'];
-  title_bar(selected_db(), count($rows) . ' object(s), ' . number_format($size / 1048576, 2) . ' MB', '<a class="btn btn-primary" href="?page=create_table"><i class="fa-solid fa-plus me-1"></i>Create table</a>');
+  $queues = ms_problem_queue_list(selected_db());
+  $actions = '<div class="d-flex flex-wrap gap-2"><a class="btn btn-secondary" href="?page=global_search"><i class="fa-solid fa-magnifying-glass me-1"></i>Global search</a><a class="btn btn-secondary" href="?page=repair_recipes"><i class="fa-solid fa-screwdriver-wrench me-1"></i>Repair recipes</a><a class="btn btn-primary" href="?page=create_table"><i class="fa-solid fa-plus me-1"></i>Create table</a></div>';
+  title_bar(selected_db(), count($rows) . ' object(s), ' . number_format($size / 1048576, 2) . ' MB', $actions);
+  if ($queues) { ?><section class="card mb-4"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong><i class="fa-solid fa-thumbtack me-2"></i>Problem queues</strong><span class="small text-body-secondary">Live counts from pinned saved views</span></div><div class="card-body"><div class="row g-3"><?php foreach($queues as $queue){$status=ms_problem_queue_count($db,$queue);$hasError=$status['error']!=='';$count=(int)$status['count'];?><div class="col-md-6 col-xl-4"><div class="border rounded p-3 h-100 d-flex justify-content-between align-items-center gap-3"><div class="min-w-0"><div class="fw-semibold text-truncate" title="<?= h($queue['name']) ?>"><?= h($queue['name']) ?></div><div class="small text-body-secondary text-truncate"><?= h($queue['table']) ?><?= $queue['scope']==='shared'?' · shared':'' ?></div><?php if($hasError){?><div class="small text-danger" title="<?= h($status['error']) ?>">Unable to count</div><?php } ?></div><form method="post" class="text-center flex-shrink-0"><input type="hidden" name="action" value="open_problem_queue"><input type="hidden" name="queue_table" value="<?= h($queue['table']) ?>"><input type="hidden" name="queue_scope" value="<?= h($queue['scope']) ?>"><input type="hidden" name="queue_id" value="<?= h($queue['id']) ?>"><?= csrf_field() ?><button class="btn <?= !$hasError&&$count>0?'btn-warning':'btn-outline-secondary' ?>"<?= $hasError?' disabled':'' ?>><span class="d-block fs-4 fw-bold lh-1"><?= $hasError?'!':h(number_format($count)) ?></span><span class="small">Open</span></button></form></div></div><?php } ?></div></div></section><?php }
   ?><div class="card mb-4"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Name</th><th>Type</th><th>Engine</th><th class="text-end">Rows</th><th class="text-end">Size</th><th>Collation</th><th>Comment</th><th></th></tr></thead><tbody><?php foreach ($rows as $row) { $table=(string)$row['TABLE_NAME']; ?><tr><td><a href="?page=select&amp;table=<?= urlencode($table) ?>"><?= h($table) ?></a></td><td><?= h($row['TABLE_TYPE']) ?></td><td><?= h($row['ENGINE']) ?></td><td class="text-end"><?= h(number_format((int)$row['TABLE_ROWS'])) ?></td><td class="text-end"><?= h(number_format(((int)$row['DATA_LENGTH']+(int)$row['INDEX_LENGTH'])/1024,1)) ?> KB</td><td><?= h($row['TABLE_COLLATION']) ?></td><td><?= h($row['TABLE_COMMENT']) ?></td><td class="text-end"><?php if ($row['TABLE_TYPE']==='BASE TABLE') { ?><a class="btn btn-secondary btn-sm" href="?page=structure&amp;table=<?= urlencode($table) ?>">Structure</a><?php } ?></td></tr><?php } ?></tbody></table></div></div>
   <div class="card danger-zone"><div class="card-body"><h2 class="h5 text-danger">Drop database</h2><p>This permanently removes every object and row in <strong><?= h(selected_db()) ?></strong>.</p><form method="post" class="row g-2 align-items-end"><input type="hidden" name="action" value="drop_database"><?= csrf_field() ?><div class="col-md-6"><label class="form-label">Type the database name to confirm</label><input class="form-control" name="confirm_name" required></div><div class="col-auto"><button class="btn btn-danger" data-confirm="Permanently drop this database?">Drop database</button></div></form></div></div><?php
 }
@@ -8713,20 +9108,22 @@ function page_select(mysqli $db): void {
       <?php if($viewPresets['private']||$viewPresets['shared']){ ?>
         <div class="d-flex flex-wrap gap-2 mb-3" style="max-height:10rem;overflow:auto" aria-label="Open a saved view">
           <?php foreach(['private'=>'Private','shared'=>'Shared'] as $scope=>$scopeLabel)foreach($viewPresets[$scope] as $preset){ ?>
-            <button class="btn btn-sm <?= $scope==='shared'?'btn-outline-primary':'btn-outline-secondary' ?>" type="button" data-ms-apply-preset data-scope="<?= h($scope) ?>" data-id="<?= h($preset['id']) ?>" title="<?= h($scopeLabel.($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?>" aria-label="<?= h('Open '.$scopeLabel.' view '.$preset['name']) ?>"><i class="fa-solid <?= $scope==='shared'?'fa-users':'fa-lock' ?> me-1" aria-hidden="true"></i><?= h($preset['name']) ?></button>
+            <button class="btn btn-sm <?= $scope==='shared'?'btn-outline-primary':'btn-outline-secondary' ?>" type="button" data-ms-apply-preset data-scope="<?= h($scope) ?>" data-id="<?= h($preset['id']) ?>" title="<?= h($scopeLabel.($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?>" aria-label="<?= h('Open '.$scopeLabel.' view '.$preset['name']) ?>"><i class="fa-solid <?= !empty($preset['pinned'])?'fa-thumbtack':($scope==='shared'?'fa-users':'fa-lock') ?> me-1" aria-hidden="true"></i><?= h($preset['name']) ?></button>
           <?php } ?>
         </div>
       <?php } ?>
       <div class="d-flex flex-wrap gap-2 align-items-end">
         <div style="min-width:min(100%,15rem)"><label class="form-label small mb-1" for="ms-view-preset-name">Name</label><input class="form-control form-control-sm" id="ms-view-preset-name" data-ms-preset-name maxlength="100" placeholder="Fatture insolute &gt; 30 giorni"></div>
         <div><label class="form-label small mb-1" for="ms-view-preset-scope">Access</label><select class="form-select form-select-sm" id="ms-view-preset-scope" data-ms-preset-scope><option value="private">Private to this login and profile</option><option value="shared">Shared on this server</option></select></div>
+        <div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="ms-view-preset-pinned" data-ms-preset-pinned><label class="form-check-label small" for="ms-view-preset-pinned">Pin as problem queue</label></div>
         <button class="btn btn-sm btn-primary" type="button" data-ms-save-preset><i class="fa-solid fa-floppy-disk me-1"></i>Save current view</button>
         <?php if($viewPresets['private']||$viewPresets['shared']){ ?>
-          <div><label class="form-label small mb-1" for="ms-view-preset-manage">Manage views</label><select class="form-select form-select-sm" id="ms-view-preset-manage" data-ms-preset-manage><option value="">Choose view…</option><?php foreach(['private'=>'Private','shared'=>'Shared'] as $scope=>$scopeLabel){if(!$viewPresets[$scope])continue;?><optgroup label="<?= h($scopeLabel) ?>"><?php foreach($viewPresets[$scope] as $preset){ ?><option value="<?= h($scope.':'.$preset['id']) ?>" data-ms-can-manage="<?= $preset['can_manage']?'1':'0' ?>" data-ms-preset-name="<?= h($preset['name']) ?>"><?= h($preset['name'].($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?></option><?php } ?></optgroup><?php } ?></select></div>
+          <div><label class="form-label small mb-1" for="ms-view-preset-manage">Manage views</label><select class="form-select form-select-sm" id="ms-view-preset-manage" data-ms-preset-manage><option value="">Choose view…</option><?php foreach(['private'=>'Private','shared'=>'Shared'] as $scope=>$scopeLabel){if(!$viewPresets[$scope])continue;?><optgroup label="<?= h($scopeLabel) ?>"><?php foreach($viewPresets[$scope] as $preset){ ?><option value="<?= h($scope.':'.$preset['id']) ?>" data-ms-can-manage="<?= $preset['can_manage']?'1':'0' ?>" data-ms-preset-name="<?= h($preset['name']) ?>" data-ms-preset-pinned="<?= !empty($preset['pinned'])?'1':'0' ?>"><?= h($preset['name'].($scope==='shared'&&$preset['owner']!==''?' · '.$preset['owner']:'')) ?></option><?php } ?></optgroup><?php } ?></select></div>
+          <button class="btn btn-sm btn-outline-warning" type="button" data-ms-pin-preset disabled><i class="fa-solid fa-thumbtack me-1"></i><span>Pin</span></button>
           <button class="btn btn-sm btn-outline-danger" type="button" data-ms-delete-preset disabled>Delete</button>
         <?php } ?>
       </div>
-      <div class="form-text">Saving under the same name updates your preset. Shared views can be opened by other logins; only their creator can delete them.</div>
+      <div class="form-text">Pinned views become live problem queues on the database home page. Shared views can be opened by other logins; only their creator can manage them.</div>
     </div>
   </section>
   <?php
@@ -9705,8 +10102,10 @@ function page_select(mysqli $db): void {
     const table=document.querySelector('#ms-select-row-form [data-ms-table-layout]');
     const nameInput=root.querySelector('[data-ms-preset-name]');
     const scopeInput=root.querySelector('[data-ms-preset-scope]');
+    const pinnedInput=root.querySelector('[data-ms-preset-pinned]');
     const saveButton=root.querySelector('[data-ms-save-preset]');
     const manage=root.querySelector('[data-ms-preset-manage]');
+    const pinButton=root.querySelector('[data-ms-pin-preset]');
     const deleteButton=root.querySelector('[data-ms-delete-preset]');
     const columns=Array.isArray(seed.columns)?seed.columns:[];
     const capture=()=>{
@@ -9754,7 +10153,7 @@ function page_select(mysqli $db): void {
       if(!name){nameInput.focus();return;}
       saveButton.disabled=true;
       try{
-        await window.msConfigPost('save_view_preset',{table:root.dataset.msTable,scope:scopeInput.value,name,preset_json:JSON.stringify(capture())});
+        await window.msConfigPost('save_view_preset',{table:root.dataset.msTable,scope:scopeInput.value,name,pinned:pinnedInput&&pinnedInput.checked?'1':'0',preset_json:JSON.stringify(capture())});
         location.reload();
       }catch(error){alert(error.message||String(error));saveButton.disabled=false;}
     });
@@ -9762,10 +10161,20 @@ function page_select(mysqli $db): void {
       manage.addEventListener('change',()=>{
         const option=manage.selectedOptions[0];
         deleteButton.disabled=!option||option.dataset.msCanManage!=='1';
+        if(pinButton){pinButton.disabled=!option||option.dataset.msCanManage!=='1';pinButton.querySelector('span').textContent=option&&option.dataset.msPresetPinned==='1'?'Unpin':'Pin';}
         if(!deleteButton.disabled){
           nameInput.value=option.dataset.msPresetName||'';
           scopeInput.value=manage.value.split(':',1)[0];
+          if(pinnedInput)pinnedInput.checked=option.dataset.msPresetPinned==='1';
         }
+      });
+      if(pinButton)pinButton.addEventListener('click',async()=>{
+        const option=manage.selectedOptions[0];
+        if(!option||option.dataset.msCanManage!=='1')return;
+        const [scope,id]=option.value.split(':');
+        pinButton.disabled=true;
+        try{await window.msConfigPost('pin_view_preset',{table:root.dataset.msTable,scope,id,pinned:option.dataset.msPresetPinned==='1'?'0':'1'});location.reload();}
+        catch(error){alert(error.message||String(error));pinButton.disabled=false;}
       });
       deleteButton.addEventListener('click',async()=>{
         const option=manage.selectedOptions[0];
@@ -11762,6 +12171,54 @@ function page_routines(mysqli $db): void {
   ?><div class="row g-3"><div class="col-lg-5"><div class="card"><table class="table mb-0"><thead><tr><th>Name</th><th>Type</th><th>Returns</th></tr></thead><tbody><?php foreach($rows as $r){?><tr><td><a href="?page=routines&amp;name=<?= urlencode((string)$r['ROUTINE_NAME']) ?>&amp;kind=<?= h($r['ROUTINE_TYPE']) ?>"><?= h($r['ROUTINE_NAME']) ?></a></td><td><?= h($r['ROUTINE_TYPE']) ?></td><td><?= h($r['DATA_TYPE']) ?></td></tr><?php }?></tbody></table></div></div><div class="col-lg-7"><?php if($name!==''){if($name==='__new__')$definition=$kind==='FUNCTION'?"CREATE FUNCTION `function_name` (`value` INT)\nRETURNS INT DETERMINISTIC\nRETURN `value` * 2":"CREATE PROCEDURE `procedure_name` (IN `value` INT)\nBEGIN\n  SELECT `value`;\nEND";?><div class="card mb-3"><div class="card-header"><?= $name==='__new__'?'Create':'Alter' ?> <?= h(strtolower($kind)) ?></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_object"><input type="hidden" name="kind" value="<?= h($kind) ?>"><input type="hidden" name="old_name" value="<?= h($name==='__new__'?'':$name) ?>"><?= csrf_field() ?><textarea class="form-control sql-editor" name="definition"><?= h($definition) ?></textarea><button class="btn btn-primary mt-2">Save</button></form></div></div><?php if($name!=='__new__'){$params=db_all($db,"SELECT PARAMETER_NAME,PARAMETER_MODE,DTD_IDENTIFIER FROM information_schema.PARAMETERS WHERE SPECIFIC_SCHEMA=DATABASE() AND SPECIFIC_NAME=".qs($db,$name)." AND PARAMETER_MODE IS NOT NULL ORDER BY ORDINAL_POSITION");?><div class="card"><div class="card-header">Call routine</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="call_routine"><input type="hidden" name="kind" value="<?= h($kind) ?>"><input type="hidden" name="name" value="<?= h($name) ?>"><?= csrf_field() ?><?php foreach($params as $param){?><label class="form-label"><?= h($param['PARAMETER_MODE'].' '.$param['PARAMETER_NAME'].' '.$param['DTD_IDENTIFIER']) ?></label><input class="form-control mb-2" name="arg[]"><?php }?><button class="btn btn-primary">Call</button></form></div></div><?php }}else{?><div class="alert alert-info">Select a routine to alter or call it.</div><?php }?></div></div><?php
 }
 
+function page_global_search(mysqli $db): void {
+  $database = selected_db();
+  $schema = ms_global_search_schema($db);
+  $saved = ms_profile_global_searches($database);
+  $savedId = g('saved');
+  $savedEntry = $savedId !== '' && isset($saved[$savedId]) ? $saved[$savedId] : null;
+  $source = is_array($savedEntry) ? $savedEntry['definition'] : ($_SESSION['ms_global_search_current'][$database] ?? []);
+  try { $definition = ms_global_search_normalize(is_array($source) ? $source : [], $schema); }
+  catch (Throwable $ignored) { $definition = ['term'=>'','mode'=>'contains','columns'=>[]]; }
+  $results = $definition['term'] !== '' && !empty($definition['columns']) ? ms_global_search_run($db, $definition) : [];
+  $hasSearch = $definition['term'] !== '' && !empty($definition['columns']);
+  $selectedMap = [];
+  foreach ($definition['columns'] as $table=>$columns) foreach ($columns as $column) $selectedMap[$table][$column] = true;
+  title_bar('Global database search', $database, '<a class="btn btn-secondary" href="?page=database"><i class="fa-solid fa-arrow-left me-1"></i>Database home</a>');
+  if ($saved) { ?><section class="card mb-3"><div class="card-body"><div class="d-flex flex-wrap align-items-center gap-2"><strong class="me-2"><i class="fa-solid fa-bookmark me-1"></i>Saved searches</strong><?php foreach($saved as $id=>$entry){?><a class="btn btn-sm <?= $id===$savedId?'btn-primary':'btn-outline-secondary' ?>" href="?page=global_search&amp;saved=<?= h($id) ?>"><?= h((string)$entry['name']) ?></a><?php } ?></div></div></section><?php }
+  ?>
+  <form method="post" id="msGlobalSearchForm"><input type="hidden" name="page" value="global_search"><?= csrf_field() ?>
+    <section class="card mb-3"><div class="card-body">
+      <div class="row g-3 align-items-end"><div class="col-lg-5"><label class="form-label" for="ms-global-search-term">Search value</label><input class="form-control form-control-lg" id="ms-global-search-term" name="term" value="<?= h($definition['term']) ?>" maxlength="1000" required></div><div class="col-lg-3"><label class="form-label" for="ms-global-search-mode">Match</label><select class="form-select form-select-lg" id="ms-global-search-mode" name="mode"><option value="contains"<?= $definition['mode']==='contains'?' selected':'' ?>>Contains</option><option value="starts"<?= $definition['mode']==='starts'?' selected':'' ?>>Starts with</option><option value="exact"<?= $definition['mode']==='exact'?' selected':'' ?>>Exact value</option></select></div><div class="col-lg-4"><label class="form-label" for="ms-global-search-name">Name when saving</label><input class="form-control form-control-lg" id="ms-global-search-name" name="search_name" maxlength="100" value="<?= h((string)($savedEntry['name'] ?? '')) ?>" placeholder="Product by code"></div></div>
+      <div class="d-flex flex-wrap gap-2 mt-3"><button class="btn btn-primary" name="action" value="run_global_search"><i class="fa-solid fa-magnifying-glass me-1"></i>Search selected fields</button><button class="btn btn-outline-primary" name="action" value="save_global_search"><i class="fa-solid fa-floppy-disk me-1"></i>Save with name</button><?php if(is_array($savedEntry)){?><button class="btn btn-outline-danger ms-auto" name="action" value="delete_global_search" formnovalidate data-confirm="Delete saved global search <?= h((string)$savedEntry['name']) ?>?"><i class="fa-solid fa-trash me-1"></i>Delete saved</button><input type="hidden" name="saved_id" value="<?= h($savedId) ?>"><?php } ?></div>
+    </div></section>
+    <section class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-table-columns me-2"></i>Tables and fields</strong><div><button class="btn btn-outline-secondary btn-sm" type="button" data-ms-global-all>All searchable fields</button> <button class="btn btn-outline-secondary btn-sm" type="button" data-ms-global-none>None</button></div></div><div class="card-body"><div class="row g-3"><?php foreach($schema as $table=>$columns){$selectedCount=count($selectedMap[$table]??[]);?><div class="col-lg-6"><details class="border rounded h-100"<?= $selectedCount?' open':'' ?> data-ms-global-table><summary class="p-3 d-flex align-items-center gap-2"><strong class="text-break flex-grow-1"><?= h($table) ?></strong><span class="badge text-bg-secondary" data-ms-global-count><?= h((string)$selectedCount) ?></span></summary><div class="border-top p-3"><div class="d-flex gap-2 mb-2"><button class="btn btn-outline-primary btn-sm" type="button" data-ms-table-all>All</button><button class="btn btn-outline-secondary btn-sm" type="button" data-ms-table-none>None</button></div><div class="row g-1"><?php foreach($columns as $column=>$meta){$id='msg-'.substr(hash('sha256',$table."\0".$column),0,16);?><div class="col-sm-6"><label class="form-check small text-truncate d-block" for="<?= h($id) ?>" title="<?= h($column.' · '.$meta['column_type']) ?>"><input class="form-check-input" type="checkbox" id="<?= h($id) ?>" name="columns[<?= h($table) ?>][]" value="<?= h($column) ?>"<?= !empty($selectedMap[$table][$column])?' checked':'' ?>> <span class="code"><?= h($column) ?></span> <span class="text-body-secondary"><?= h($meta['column_type']) ?></span></label></div><?php } ?></div></div></details></div><?php } ?></div><div class="form-text mt-3">Up to 100 fields across 50 tables. Binary, spatial and BLOB fields are excluded. Results are limited to 25 rows per table.</div></div></section>
+  </form>
+  <?php if($hasSearch){$totalMatches=array_sum(array_column($results,'total'));?><section class="mb-3"><div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3"><h2 class="h4 mb-0">Results for “<?= h($definition['term']) ?>”</h2><span class="badge text-bg-<?= $totalMatches?'primary':'secondary' ?> fs-6"><?= h(number_format($totalMatches)) ?> match(es)</span></div><?php if(!$results){?><div class="alert alert-secondary">No matching rows were found in the selected fields.</div><?php }foreach($results as $result){$displayColumns=array_slice($result['columns'],0,8);?><article class="card mb-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong><i class="fa-solid fa-table me-2"></i><?= h($result['table']) ?></strong><div><span class="badge text-bg-secondary me-2"><?= h(number_format($result['total'])) ?></span><a class="btn btn-outline-primary btn-sm" href="?<?= h(http_build_query(['page'=>'select','table'=>$result['table'],'global_search'=>$definition['term']])) ?>">Open table</a></div></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><?php foreach($displayColumns as $column){?><th><?= h($column) ?></th><?php } ?></tr></thead><tbody><?php foreach($result['rows'] as $row){?><tr><?php foreach($displayColumns as $column){?><td><?= render_value($row[$column]??null,240) ?></td><?php } ?></tr><?php } ?></tbody></table></div><?php if(count($result['columns'])>8){?><div class="card-footer small text-body-secondary">Showing the first 8 selected fields. Open the table to inspect complete rows.</div><?php } ?></article><?php } ?></section><?php } ?>
+  <script>
+  (()=>{'use strict';const form=document.getElementById('msGlobalSearchForm');if(!form)return;const refresh=box=>{const checks=Array.from(box.querySelectorAll('input[type="checkbox"]')),badge=box.querySelector('[data-ms-global-count]');if(badge)badge.textContent=String(checks.filter(item=>item.checked).length);};form.querySelectorAll('[data-ms-global-table]').forEach(box=>{box.querySelectorAll('input[type="checkbox"]').forEach(input=>input.addEventListener('change',()=>refresh(box)));box.querySelector('[data-ms-table-all]').addEventListener('click',()=>{box.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=true);refresh(box);});box.querySelector('[data-ms-table-none]').addEventListener('click',()=>{box.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=false);refresh(box);});});form.querySelector('[data-ms-global-all]').addEventListener('click',()=>form.querySelectorAll('[data-ms-global-table]').forEach(box=>{box.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=true);refresh(box);}));form.querySelector('[data-ms-global-none]').addEventListener('click',()=>form.querySelectorAll('[data-ms-global-table]').forEach(box=>{box.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=false);refresh(box);}));})();
+  </script><?php
+}
+
+function page_repair_recipes(mysqli $db, ?array $preview = null): void {
+  $database = selected_db();
+  $recipes = ms_profile_repair_recipes($database);
+  $id = g('recipe');
+  $recipe = $id !== '' && isset($recipes[$id]) ? $recipes[$id] : null;
+  $isNew = g('new') === '1' || $recipe === null;
+  $edit = $recipe ?? ['name'=>'','preview_sql'=>'SELECT * FROM `table_name` WHERE `id` = :id','repair_sql'=>'UPDATE `table_name` SET `field_name` = :new_value WHERE `id` = :id','max_rows'=>25];
+  $parameterNames = $recipe ? ms_sql_parameter_names($recipe['preview_sql'], $recipe['repair_sql']) : [];
+  $postedValues = isset($_POST['repair_value']) && is_array($_POST['repair_value']) ? $_POST['repair_value'] : [];
+  $postedTypes = isset($_POST['repair_type']) && is_array($_POST['repair_type']) ? $_POST['repair_type'] : [];
+  title_bar('Safe repair recipes', $database, '<a class="btn btn-secondary" href="?page=database"><i class="fa-solid fa-arrow-left me-1"></i>Database home</a> <a class="btn btn-primary" href="?page=repair_recipes&amp;new=1"><i class="fa-solid fa-plus me-1"></i>New recipe</a>');
+  ?><div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i>Each recipe is limited to one simple <code>UPDATE</code> on a transactional table. You must preview it first; updates above the configured row limit are rolled back automatically.</div>
+  <div class="row g-3"><div class="col-xl-4"><section class="card"><div class="card-header"><strong>Saved recipes</strong></div><div class="list-group list-group-flush"><?php if(!$recipes){?><div class="p-3 text-body-secondary">No repair recipes saved for this database.</div><?php }foreach($recipes as $recipeId=>$entry){?><a class="list-group-item list-group-item-action<?= $recipeId===$id?' active':'' ?>" href="?page=repair_recipes&amp;recipe=<?= h($recipeId) ?>"><i class="fa-solid fa-screwdriver-wrench me-2"></i><?= h($entry['name']) ?><span class="badge text-bg-secondary float-end"><?= h((string)$entry['max_rows']) ?> max</span></a><?php } ?></div></section></div><div class="col-xl-8">
+    <section class="card mb-3"><div class="card-header"><strong><?= $isNew?'Create recipe':'Edit recipe' ?></strong></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_repair_recipe"><input type="hidden" name="recipe_id" value="<?= h($isNew?'':$id) ?>"><?= csrf_field() ?><div class="row g-3"><div class="col-md-8"><label class="form-label">Name</label><input class="form-control" name="recipe_name" value="<?= h($edit['name']) ?>" maxlength="100" required></div><div class="col-md-4"><label class="form-label">Maximum changed rows</label><input class="form-control" type="number" name="max_rows" min="1" max="1000" value="<?= h((string)$edit['max_rows']) ?>" required></div><div class="col-12"><label class="form-label">Preview SELECT</label><textarea class="form-control sql-editor" name="preview_sql" rows="6" required><?= h($edit['preview_sql']) ?></textarea><div class="form-text">It should return exactly the rows the UPDATE is expected to change.</div></div><div class="col-12"><label class="form-label">Repair UPDATE</label><textarea class="form-control sql-editor" name="repair_sql" rows="6" required><?= h($edit['repair_sql']) ?></textarea><div class="form-text">Use named parameters such as <code>:id</code>, <code>:code</code> or <code>:new_value</code>. Only Text, Number and NULL values are accepted.</div></div><div class="col-12 d-flex justify-content-between"><button class="btn btn-primary"><i class="fa-solid fa-floppy-disk me-1"></i>Save recipe</button><?php if(!$isNew){?><button class="btn btn-outline-danger" type="submit" name="action" value="delete_repair_recipe" data-confirm="Delete repair recipe <?= h($edit['name']) ?>?"><i class="fa-solid fa-trash me-1"></i>Delete</button><?php } ?></div></div></form></div></section>
+    <?php if($recipe){?><section class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-eye me-2"></i>Preview <?= h($recipe['name']) ?></strong></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="preview_repair_recipe"><input type="hidden" name="recipe_id" value="<?= h($id) ?>"><?= csrf_field() ?><?php if(!$parameterNames){?><p class="text-body-secondary">This recipe has no parameters.</p><?php }else{?><div class="row g-3"><?php foreach($parameterNames as $name){$type=(string)($postedTypes[$name]??'text');?><div class="col-md-6"><label class="form-label"><code>:<?= h($name) ?></code></label><div class="input-group"><select class="form-select" name="repair_type[<?= h($name) ?>]" style="max-width:8rem"><option value="text"<?= $type==='text'?' selected':'' ?>>Text</option><option value="number"<?= $type==='number'?' selected':'' ?>>Number</option><option value="null"<?= $type==='null'?' selected':'' ?>>NULL</option></select><input class="form-control code" name="repair_value[<?= h($name) ?>]" value="<?= h((string)($postedValues[$name]??'')) ?>"></div></div><?php } ?></div><?php } ?><button class="btn btn-primary mt-3"><i class="fa-solid fa-magnifying-glass me-1"></i>Preview affected rows</button></form></div></section><?php } ?>
+    <?php if($preview){?><section class="card border-<?= $preview['overflow']?'danger':'warning' ?>"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong>Preview result</strong><span class="badge text-bg-<?= $preview['overflow']?'danger':'secondary' ?>"><?= h(number_format(count($preview['rows']))) ?> shown</span></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><?php foreach($preview['fields'] as $field){?><th><?= h($field) ?></th><?php } ?></tr></thead><tbody><?php foreach($preview['rows'] as $row){?><tr><?php foreach($preview['fields'] as $field){?><td><?= render_value($row[$field]??null,240) ?></td><?php } ?></tr><?php }if(!$preview['rows']){?><tr><td colspan="<?= max(1,count($preview['fields'])) ?>" class="text-center text-body-secondary p-4">No rows match this repair.</td></tr><?php } ?></tbody></table></div><div class="card-footer"><?php if($preview['overflow']){?><div class="text-danger fw-semibold"><i class="fa-solid fa-ban me-1"></i>The preview exceeds the safety limit of <?= h((string)$preview['max_rows']) ?> rows. Execution is blocked.</div><?php }elseif($preview['token']!==''){?><form method="post" class="d-flex flex-wrap justify-content-between align-items-center gap-2"><input type="hidden" name="action" value="execute_repair_recipe"><input type="hidden" name="repair_token" value="<?= h($preview['token']) ?>"><?= csrf_field() ?><span class="text-body-secondary">The preview is valid for 10 minutes and can be executed once.</span><button class="btn btn-warning" data-confirm="Apply this repair to <?= h((string)count($preview['rows'])) ?> previewed row(s)? The transaction will roll back if the changed-row limit is exceeded."><i class="fa-solid fa-bolt me-1"></i>Execute repair</button></form><?php } ?></div></section><?php } ?>
+  </div></div><?php
+}
+
 function page_processes(mysqli $db): void {
   $rows=db_all($db,'SHOW FULL PROCESSLIST');title_bar('Server processes',count($rows).' active process(es)','<a class="btn btn-primary" href="?page=processes"><i class="fa-solid fa-rotate me-1"></i>Refresh</a>');
   ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><th>ID</th><th>User</th><th>Host</th><th>DB</th><th>Command</th><th>Time</th><th>State</th><th>Info</th><th></th></tr></thead><tbody><?php foreach($rows as $r){?><tr><td><?= h($r['Id']) ?></td><td><?= h($r['User']) ?></td><td><?= h($r['Host']) ?></td><td><?= h($r['db']) ?></td><td><?= h($r['Command']) ?></td><td><?= h($r['Time']) ?></td><td><?= h($r['State']) ?></td><td><?= render_value($r['Info'],300) ?></td><td><form method="post"><input type="hidden" name="action" value="kill_process"><input type="hidden" name="process_id" value="<?= h($r['Id']) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Kill this database process?">Kill</button></form></td></tr><?php }?></tbody></table></div></div><?php
@@ -11843,7 +12300,7 @@ function page_diagnostics(): void {
     'card_pretty_view' => 'Card view editing and Pretty View transitions preserve values and return to the same query state.'
   ];
   ?><div class="d-flex flex-wrap align-items-start justify-content-between gap-3 mb-3">
-    <div><h1 class="h3 mb-1"><i class="fa-solid fa-stethoscope me-2"></i>Diagnostics</h1><p class="text-body-secondary mb-0">Blocking regression checks for editing, query state, view modes, analysis/export and relationship behavior.</p></div>
+    <div><h1 class="h3 mb-1"><i class="fa-solid fa-stethoscope me-2"></i>Diagnostics</h1><p class="text-body-secondary mb-0">Blocking regression checks for editing, query state, view modes, analysis/export, relationships and saved workflows.</p></div>
     <form method="post"><input type="hidden" name="action" value="run_diagnostics"><?= csrf_field() ?><button class="btn btn-primary" data-confirm="These are regression tests. They do not touch the current DB, but you are not supposed to run them, but you can if you want. Continue?"><i class="fa-solid fa-play me-1"></i>Run diagnostics</button></form>
   </div>
   <div class="alert alert-<?= $gateOpen ? 'success' : 'warning' ?> d-flex flex-wrap align-items-center justify-content-between gap-2">
@@ -11902,6 +12359,8 @@ function page_settings(): void {
   $menuItems = [
     'databases' => ['fa-database', 'Databases'],
     'database' => ['fa-table-list', 'Database'],
+    'global_search' => ['fa-magnifying-glass', 'Global search'],
+    'repair_recipes' => ['fa-screwdriver-wrench', 'Repair recipes'],
     'sql' => ['fa-terminal', 'SQL command'],
     'query_builder' => ['fa-code-branch', 'Query builder'],
     'import' => ['fa-file-import', 'Import'],
@@ -12060,6 +12519,8 @@ try {
   switch ($page) {
     case 'databases': page_databases($db); break;
     case 'database': page_database($db); break;
+    case 'global_search': page_global_search($db); break;
+    case 'repair_recipes': page_repair_recipes($db, isset($repairPreview) && is_array($repairPreview) ? $repairPreview : null); break;
     case 'create_table': page_create_table($db); break;
     case 'structure': page_structure($db); break;
     case 'select': page_select($db); break;
