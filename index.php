@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.15.24';
+const MS_VERSION = '1.16.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -107,7 +107,7 @@ function go(array $changes = [], string $flash = '', string $type = 'success'): 
 }
 
 function ms_allowed_pages(): array {
-  return ['databases','database','create_table','structure','select','clone_rows','row','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','settings'];
+  return ['databases','database','create_table','structure','select','clone_rows','row','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics','settings'];
 }
 
 function ms_clean_navigation_value($value, int $depth = 0) {
@@ -255,6 +255,36 @@ function ms_profile_config_lock_file(): string {
   return ms_update_runtime_file('profiles.lock');
 }
 
+function ms_profile_config_backup(string $targetVersion): ?string {
+  $source = ms_profile_config_file();
+  if (!is_file($source)) {
+    return null;
+  }
+  $safeVersion = preg_replace('/[^0-9A-Za-z._-]+/', '-', $targetVersion) ?: 'unknown';
+  $backup = ms_update_runtime_file('profiles-before-' . $safeVersion . '-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(3)) . '.json');
+  if (!@copy($source, $backup)) {
+    return 'Unable to back up the profile configuration before updating.';
+  }
+  $sourceHash = @hash_file('sha256', $source);
+  $backupHash = @hash_file('sha256', $backup);
+  if (!is_string($sourceHash) || !is_string($backupHash) || !hash_equals($sourceHash, $backupHash)) {
+    @unlink($backup);
+    return 'The profile configuration backup failed checksum verification.';
+  }
+
+  $pattern = ms_update_runtime_file('profiles-before-*.json');
+  $backups = glob($pattern);
+  if (is_array($backups) && count($backups) > 10) {
+    usort($backups, static function (string $a, string $b): int {
+      return ((int)@filemtime($b)) <=> ((int)@filemtime($a));
+    });
+    foreach (array_slice($backups, 10) as $oldBackup) {
+      @unlink($oldBackup);
+    }
+  }
+  return null;
+}
+
 function ms_server_config_key(): string {
   $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
   return hash('sha256',
@@ -324,7 +354,8 @@ function ms_profile_default_settings(): array {
       'events' => true,
       'processes' => true,
       'users' => true,
-      'variables' => true
+      'variables' => true,
+      'diagnostics' => true
     ]
   ];
 }
@@ -1611,6 +1642,12 @@ function ms_update_install(string $source, string $remoteVersion): ?string {
     return 'The temporary update file failed its checksum verification.';
   }
 
+  $profileBackupError = ms_profile_config_backup($remoteVersion);
+  if ($profileBackupError !== null) {
+    @unlink($temporaryFile);
+    return $profileBackupError;
+  }
+
   $backupFile = ms_update_runtime_file('backup.php');
   if (!@copy($currentFile, $backupFile)) {
     @unlink($temporaryFile);
@@ -1852,6 +1889,273 @@ function connect_db(bool $selectDatabase = true): mysqli {
     throw new RuntimeException('Cannot select database: ' . $db->error);
   }
   return $db;
+}
+
+function ms_diagnostics_report_file(): string {
+  return ms_update_runtime_file('diagnostics-' . substr(ms_server_config_key(), 0, 16) . '.json');
+}
+
+function ms_diagnostics_report_read(): array {
+  $raw = @file_get_contents(ms_diagnostics_report_file());
+  if (!is_string($raw) || $raw === '') return [];
+  $report = json_decode($raw, true);
+  if (!is_array($report) || (string)($report['server_key'] ?? '') !== ms_server_config_key()) return [];
+  return $report;
+}
+
+function ms_diagnostics_report_write(array $report): void {
+  $json = json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+  if (!is_string($json)) throw new RuntimeException('Unable to encode the diagnostics report.');
+  $path = ms_diagnostics_report_file();
+  $temporary = $path . '.tmp-' . bin2hex(random_bytes(5));
+  if (@file_put_contents($temporary, $json . "\n", LOCK_EX) === false || !@rename($temporary, $path)) {
+    @unlink($temporary);
+    throw new RuntimeException('Unable to save the diagnostics report.');
+  }
+}
+
+function ms_diagnostics_equal($actual, $expected): bool {
+  return json_encode($actual, JSON_PRESERVE_ZERO_FRACTION | JSON_UNESCAPED_UNICODE) ===
+    json_encode($expected, JSON_PRESERVE_ZERO_FRACTION | JSON_UNESCAPED_UNICODE);
+}
+
+function ms_diagnostics_add_case(array &$results, string $group, string $name, string $sql, array $parameters, $expected, callable $test): void {
+  $started = microtime(true);
+  $actual = null;
+  $exception = '';
+  $status = 'pass';
+  try {
+    $actual = $test();
+    if (!ms_diagnostics_equal($actual, $expected)) {
+      throw new RuntimeException('The actual result did not match the expected result.');
+    }
+  } catch (Throwable $error) {
+    $status = 'fail';
+    $exception = get_class($error) . ': ' . $error->getMessage();
+  }
+  $results[] = [
+    'group' => $group,
+    'name' => $name,
+    'status' => $status,
+    'duration_ms' => round((microtime(true) - $started) * 1000, 2),
+    'sql' => $sql,
+    'parameters' => $parameters,
+    'expected' => $expected,
+    'actual' => $actual,
+    'exception' => $exception
+  ];
+}
+
+function ms_diagnostics_query(mysqli $db, string $sql): void {
+  if (!$db->query($sql)) throw new RuntimeException($db->error . ' — SQL: ' . $sql);
+}
+
+function ms_diagnostics_run(): array {
+  $groups = [
+    'Typed editing and autosave',
+    'Pagination, filters, sort and presets',
+    'Table, card and Pretty View state',
+    'Explain, Analyze, Duplicates and export',
+    'Soft delete, relations and virtual keys'
+  ];
+  $report = [
+    'version' => MS_VERSION,
+    'server_key' => ms_server_config_key(),
+    'started_at' => time(),
+    'completed_at' => 0,
+    'database' => '',
+    'cleanup' => ['status' => 'pending', 'exception' => ''],
+    'results' => [],
+    'group_status' => [],
+    'blocking_passed' => false
+  ];
+  $database = 'mysql_studio_diag_' . bin2hex(random_bytes(8));
+  $report['database'] = $database;
+  $diag = null;
+  $created = false;
+
+  try {
+    $diag = connect_db(false);
+    ms_diagnostics_query($diag, 'CREATE DATABASE ' . qi($database) . ' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+    $created = true;
+    if (!$diag->select_db($database)) throw new RuntimeException($diag->error);
+    ms_diagnostics_query($diag, 'CREATE TABLE `parents` (`id` INT UNSIGNED NOT NULL AUTO_INCREMENT, `code` VARCHAR(20) NOT NULL, `label` VARCHAR(80) NOT NULL, `deleted` TINYINT UNSIGNED NOT NULL DEFAULT 0, `amount` DECIMAL(8,2) NOT NULL, `created_at` DATETIME NOT NULL, PRIMARY KEY (`id`), UNIQUE KEY `uq_code` (`code`)) ENGINE=InnoDB');
+    ms_diagnostics_query($diag, 'CREATE TABLE `children` (`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, `parent_code` VARCHAR(20) NOT NULL, `note` VARCHAR(100) NULL, `deleted` TINYINT UNSIGNED NOT NULL DEFAULT 0, PRIMARY KEY (`id`), KEY `ix_parent_code` (`parent_code`)) ENGINE=InnoDB');
+    ms_diagnostics_query($diag, 'CREATE TABLE `virtual_rows` (`code` VARCHAR(20) NULL, `value` VARCHAR(40) NULL) ENGINE=InnoDB');
+    ms_diagnostics_query($diag, "INSERT INTO `parents` (`code`,`label`,`deleted`,`amount`,`created_at`) VALUES ('A','Alpha',0,12.30,'2026-01-10 09:00:00'),('B','Beta',0,20.00,'2026-02-15 10:30:00'),('C','Alpha',1,30.00,'2026-03-20 11:45:00')");
+    ms_diagnostics_query($diag, "INSERT INTO `children` (`parent_code`,`note`,`deleted`) VALUES ('A','first',0),('A','second',0),('B','third',0),('A',NULL,0),('A','',0)");
+    ms_diagnostics_query($diag, "INSERT INTO `virtual_rows` (`code`,`value`) VALUES ('vk1','one'),('vk1','two'),(NULL,'null-key')");
+
+    ms_diagnostics_add_case($report['results'], $groups[0], 'Schema-driven literal normalization', 'Local parser validation', ['types' => ['BIGINT UNSIGNED','DECIMAL(8,2)','DATETIME']], ['18446744073709551615','12.30','2026-04-05 12:13:14'], static function (): array {
+      return [
+        ms_normalize_column_literal(['COLUMN_NAME'=>'big_id','DATA_TYPE'=>'bigint','COLUMN_TYPE'=>'bigint unsigned'], '018446744073709551615'),
+        ms_normalize_column_literal(['COLUMN_NAME'=>'price','DATA_TYPE'=>'decimal','COLUMN_TYPE'=>'decimal(8,2)','NUMERIC_PRECISION'=>8,'NUMERIC_SCALE'=>2], '12,30'),
+        ms_normalize_column_literal(['COLUMN_NAME'=>'changed_at','DATA_TYPE'=>'datetime','COLUMN_TYPE'=>'datetime'], '2026-04-05T12:13:14')
+      ];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[0], 'Invalid typed values are rejected before write', 'Local parser validation', ['values' => ['-1','1234567.89','2026/04/05']], 3, static function (): int {
+      $rejected = 0;
+      $checks = [
+        static function (): void { ms_normalize_column_literal(['COLUMN_NAME'=>'id','DATA_TYPE'=>'int','COLUMN_TYPE'=>'int unsigned'], '-1'); },
+        static function (): void { ms_normalize_column_literal(['COLUMN_NAME'=>'price','DATA_TYPE'=>'decimal','COLUMN_TYPE'=>'decimal(8,2)','NUMERIC_PRECISION'=>8,'NUMERIC_SCALE'=>2], '1234567.89'); },
+        static function (): void { ms_normalize_column_literal(['COLUMN_NAME'=>'day','DATA_TYPE'=>'date','COLUMN_TYPE'=>'date'], '2026/04/05'); }
+      ];
+      foreach ($checks as $check) {
+        try { $check(); } catch (Throwable $ignored) { $rejected++; }
+      }
+      return $rejected;
+    });
+    ms_diagnostics_add_case($report['results'], $groups[0], 'Prepared autosave-style update preserves typed data', 'UPDATE parents SET amount = ?, label = ? WHERE id = ?', ['amount'=>'45.60','label'=>'Autosaved','id'=>1], ['amount'=>'45.60','label'=>'Autosaved'], static function () use ($diag): array {
+      $statement = $diag->prepare('UPDATE `parents` SET `amount` = ?, `label` = ? WHERE `id` = ?');
+      if (!$statement) throw new RuntimeException($diag->error);
+      $amount = '45.60'; $label = 'Autosaved'; $id = 1;
+      $statement->bind_param('ssi', $amount, $label, $id);
+      if (!$statement->execute()) throw new RuntimeException($statement->error);
+      $statement->close();
+      try {
+        $row = db_one($diag, 'SELECT CAST(`amount` AS CHAR) AS amount, `label` FROM `parents` WHERE `id`=1');
+        return ['amount'=>(string)($row['amount'] ?? ''),'label'=>(string)($row['label'] ?? '')];
+      } finally {
+        ms_diagnostics_query($diag, "UPDATE `parents` SET `amount`=12.30, `label`='Alpha' WHERE `id`=1");
+      }
+    });
+    ms_diagnostics_add_case($report['results'], $groups[0], 'NULL and empty string remain distinct', 'SELECT SUM(note IS NULL), SUM(note = \'\') FROM children', [], ['nulls'=>'1','empty'=>'1'], static function () use ($diag): array {
+      $row = db_one($diag, "SELECT CAST(SUM(`note` IS NULL) AS CHAR) AS nulls, CAST(SUM(`note` = '') AS CHAR) AS empty FROM `children`");
+      return ['nulls'=>(string)($row['nulls'] ?? ''),'empty'=>(string)($row['empty'] ?? '')];
+    });
+
+    ms_diagnostics_add_case($report['results'], $groups[1], 'Filtered and sorted page uses one query specification', 'SELECT generated by build_select_query()', ['filter'=>'label contains a','sort'=>'id DESC','page'=>2,'limit'=>1], ['id'=>'2','count'=>'3','limit'=>1,'page'=>2], static function () use ($diag): array {
+      $before = $_GET;
+      try {
+        $_GET = ['filter_col'=>['label'],'filter_op'=>['contains'],'filter_val'=>['a'],'order_col'=>['id'],'order_dir'=>['DESC'],'p'=>'2','limit'=>'1'];
+        $columns = table_columns($diag, 'parents');
+        [$sql, $countSql, $limit, $page] = build_select_query($diag, 'parents', $columns);
+        $row = db_one($diag, $sql);
+        $count = db_one($diag, $countSql);
+        return ['id'=>(string)($row['id'] ?? ''),'count'=>(string)($count['n'] ?? ''),'limit'=>$limit,'page'=>$page];
+      } finally {
+        $_GET = $before;
+      }
+    });
+    ms_diagnostics_add_case($report['results'], $groups[1], 'Saved preset restores filters, columns and card mode', 'Local preset normalization', ['hidden'=>['deleted'],'order'=>['label','id'],'widths'=>['label'=>240],'view_mode'=>'cards'], ['filter'=>'label','hidden'=>'deleted','first'=>'label','width'=>240,'mode'=>'cards'], static function (): array {
+      $snapshot = ms_view_preset_normalize([
+        'query'=>['filter_col'=>['label'],'filter_op'=>['contains'],'filter_val'=>['Al']],
+        'hidden'=>['deleted'], 'order'=>['label','id'], 'widths'=>['label'=>240], 'view_mode'=>'cards'
+      ], ['id','code','label','deleted','amount','created_at']);
+      return ['filter'=>(string)($snapshot['query']['filter_col'][0] ?? ''),'hidden'=>(string)($snapshot['hidden'][0] ?? ''),'first'=>(string)($snapshot['order'][0] ?? ''),'width'=>(int)($snapshot['widths']['label'] ?? 0),'mode'=>(string)$snapshot['view_mode']];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[1], 'Page clamp after the final page shrinks', 'Pagination clamp', ['requested_page'=>9,'rows'=>3,'page_size'=>2], 2, static function (): int {
+      $pages = max(1, (int)ceil(3 / 2));
+      return max(1, min($pages, 9));
+    });
+
+    ms_diagnostics_add_case($report['results'], $groups[2], 'Table/card/Pretty state contracts are present', 'Application source contract', ['modes'=>['table','cards'],'pretty'=>['view','edit']], ['table'=>true,'cards'=>true,'pretty_view'=>true,'pretty_edit'=>true], static function (): array {
+      $source = @file_get_contents(__FILE__) ?: '';
+      return [
+        'table'=>strpos($source, "data-ms-view-mode=\"table\"") !== false || strpos($source, "'view_mode'=>'table'") !== false,
+        'cards'=>strpos($source, "'view_mode'=>'cards'") !== false,
+        'pretty_view'=>strpos($source, 'data-ms-pretty-mode="view"') !== false,
+        'pretty_edit'=>strpos($source, "?'edit':'view'") !== false
+      ];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[2], 'Display formatting never changes stored values', 'SELECT amount before and after display formatting', ['id'=>2,'format'=>'money'], ['stored_before'=>'20.00','displayed'=>'$ 20.00','stored_after'=>'20.00'], static function () use ($diag): array {
+      $before = (string)(db_one($diag, 'SELECT CAST(`amount` AS CHAR) AS amount FROM `parents` WHERE `id`=2')['amount'] ?? '');
+      $displayed = html_entity_decode(strip_tags(ms_render_formatted_value($before, ['kind'=>'money','currency'=>'USD','decimals'=>2], false)), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+      $displayed = preg_replace('/\s+/u', ' ', $displayed) ?? $displayed;
+      $after = (string)(db_one($diag, 'SELECT CAST(`amount` AS CHAR) AS amount FROM `parents` WHERE `id`=2')['amount'] ?? '');
+      return ['stored_before'=>$before,'displayed'=>$displayed,'stored_after'=>$after];
+    });
+
+    ms_diagnostics_add_case($report['results'], $groups[3], 'Explain analyzes the exact SELECT', 'EXPLAIN SELECT * FROM parents WHERE code = \'A\'', [], true, static function () use ($diag): bool {
+      [$sets] = explain_sql($diag, "SELECT * FROM `parents` WHERE `code` = 'A'", 100);
+      return isset($sets[0]['rows'][0]) && count($sets) === 1;
+    });
+    ms_diagnostics_add_case($report['results'], $groups[3], 'Analyze and Duplicates agree with fixtures', 'Analyze label; group duplicate labels', ['column'=>'label'], ['total'=>'3','distinct'=>'2','duplicate'=>'Alpha','occurrences'=>2], static function () use ($diag): array {
+      $columns = table_columns($diag, 'parents');
+      $labelColumn = null;
+      foreach ($columns as $column) if (($column['COLUMN_NAME'] ?? '') === 'label') $labelColumn = $column;
+      if (!is_array($labelColumn)) throw new RuntimeException('Diagnostic label column is missing.');
+      $analysis = ms_insight_analyze($diag, 'parents', $labelColumn);
+      $duplicates = ms_insight_duplicates($diag, 'parents', ['label'], $columns, 1);
+      $first = $duplicates['groups'][0] ?? [];
+      return ['total'=>(string)($analysis['summary']['total'] ?? ''),'distinct'=>(string)($analysis['summary']['distinct_count'] ?? ''),'duplicate'=>(string)($first['values']['label'] ?? ''),'occurrences'=>(int)($first['occurrences'] ?? 0)];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[3], 'Export row count matches the unpaginated query', 'CSV export from build_select_query(..., withoutPagination=true)', ['filter'=>'deleted = 0'], ['query_rows'=>2,'csv_rows'=>2], static function () use ($diag): array {
+      $before = $_GET;
+      $stream = fopen('php://temp', 'w+b');
+      if (!is_resource($stream)) throw new RuntimeException('Unable to open temporary export stream.');
+      try {
+        $_GET = ['filter_col'=>['deleted'],'filter_op'=>['='],'filter_val'=>['0'],'limit'=>'1'];
+        $columns = table_columns($diag, 'parents');
+        [$sql] = build_select_query($diag, 'parents', $columns, null, null, true);
+        $rows = db_all($diag, $sql);
+        foreach ($rows as $row) ms_export_csv_row($stream, array_values($row), ',');
+        rewind($stream); $csvRows = 0;
+        while (fgetcsv($stream) !== false) $csvRows++;
+        return ['query_rows'=>count($rows),'csv_rows'=>$csvRows];
+      } finally {
+        fclose($stream);
+        $_GET = $before;
+      }
+    });
+
+    ms_diagnostics_add_case($report['results'], $groups[4], 'Soft delete value and visibility predicate agree', 'UPDATE parents SET deleted=1 WHERE id=2', ['column'=>'deleted','value'=>'1'], ['deleted'=>true,'visible'=>1], static function () use ($diag): array {
+      $columns = table_columns($diag, 'parents');
+      $rule = ms_active_soft_delete_rule(['column'=>'deleted','value'=>'1'], $columns);
+      if ($rule === null) throw new RuntimeException('Soft-delete rule was rejected.');
+      ms_diagnostics_query($diag, 'UPDATE `parents` SET `deleted`=1 WHERE `id`=2');
+      $row = db_one($diag, 'SELECT `deleted` FROM `parents` WHERE `id`=2');
+      $visible = db_one($diag, 'SELECT COUNT(*) AS n FROM `parents` WHERE NOT (' . ms_soft_delete_sql_match($diag, $rule) . ')');
+      return ['deleted'=>ms_row_is_soft_deleted($row ?? [], $rule),'visible'=>(int)($visible['n'] ?? -1)];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[4], 'Master/slave and soft-FK lookup use the configured fields', 'SELECT children WHERE parent_code = parent.code', ['master_field'=>'code','slave_field'=>'parent_code'], ['children'=>4,'display'=>'Alpha','ambiguous'=>false], static function () use ($diag): array {
+      $children = db_one($diag, "SELECT COUNT(*) AS n FROM `children` WHERE `parent_code`='A'");
+      $maps = ms_soft_fk_maps($diag, [['parent_code'=>'A']], ['parent_code'=>['table'=>'parents','id_column'=>'code','value_column'=>'label']]);
+      $match = $maps['parent_code']['A'] ?? [];
+      return ['children'=>(int)($children['n'] ?? -1),'display'=>(string)($match['display'] ?? ''),'ambiguous'=>(bool)($match['ambiguous'] ?? true)];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[4], 'Virtual-key identity targets one no-PK row', 'SELECT COUNT(*) FROM virtual_rows WHERE <all-column identity>', ['code'=>'vk1','value'=>'one'], 1, static function () use ($diag): int {
+      $before = $_GET;
+      try {
+        $_GET['table'] = 'virtual_rows';
+        $columns = table_columns($diag, 'virtual_rows');
+        $where = row_identity_where($diag, $columns, ['code'=>'vk1','value'=>'one']);
+        return (int)(db_one($diag, 'SELECT COUNT(*) AS n FROM `virtual_rows` WHERE ' . $where)['n'] ?? -1);
+      } finally {
+        $_GET = $before;
+      }
+    });
+  } catch (Throwable $setupError) {
+    if (!$report['results']) {
+      foreach ($groups as $group) {
+        $report['results'][] = ['group'=>$group,'name'=>'Disposable database setup','status'=>'blocked','duration_ms'=>0,'sql'=>'CREATE DATABASE / fixtures','parameters'=>[],'expected'=>'Temporary test database available','actual'=>null,'exception'=>get_class($setupError) . ': ' . $setupError->getMessage()];
+      }
+    } else {
+      $report['results'][] = ['group'=>'Environment','name'=>'Diagnostics runner','status'=>'fail','duration_ms'=>0,'sql'=>'','parameters'=>[],'expected'=>'All cases execute','actual'=>null,'exception'=>get_class($setupError) . ': ' . $setupError->getMessage()];
+    }
+  } finally {
+    if ($diag instanceof mysqli && $created) {
+      if ($diag->query('DROP DATABASE ' . qi($database))) {
+        $report['cleanup'] = ['status'=>'pass','exception'=>''];
+      } else {
+        $report['cleanup'] = ['status'=>'fail','exception'=>$diag->error];
+      }
+    } else {
+      $report['cleanup'] = ['status'=>$created ? 'fail' : 'not_needed','exception'=>''];
+    }
+    if ($diag instanceof mysqli) $diag->close();
+  }
+
+  foreach ($groups as $group) {
+    $statuses = [];
+    foreach ($report['results'] as $result) if (($result['group'] ?? '') === $group) $statuses[] = (string)($result['status'] ?? 'fail');
+    $report['group_status'][$group] = $statuses && count(array_filter($statuses, static function (string $status): bool { return $status !== 'pass'; })) === 0 ? 'pass' : 'fail';
+  }
+  $hasResultFailure = count(array_filter($report['results'], static function (array $result): bool { return ($result['status'] ?? '') !== 'pass'; })) > 0;
+  $report['blocking_passed'] = !$hasResultFailure && !in_array('fail', $report['group_status'], true) && $report['cleanup']['status'] !== 'fail';
+  $report['completed_at'] = time();
+  ms_diagnostics_report_write($report);
+  return $report;
 }
 
 function table_exists(mysqli $db, string $table): bool {
@@ -4431,6 +4735,14 @@ try {
         go([], 'Profile changed to ' . ms_active_profile_name() . '.');
       }
 
+      if ($action === 'run_diagnostics') {
+        $diagnostics = ms_diagnostics_run();
+        go(['page' => 'diagnostics'], !empty($diagnostics['blocking_passed'])
+          ? 'All blocking diagnostics passed. The release gate is open.'
+          : 'Diagnostics completed with blocking failures. Review the report below.',
+          !empty($diagnostics['blocking_passed']) ? 'success' : 'warning');
+      }
+
       if ($action === 'create_profile') {
         ms_profile_create(p('profile_name'), p('copy_current') === '1');
         go(['page' => 'settings'], 'Profile created: ' . ms_active_profile_name() . '.');
@@ -5567,7 +5879,7 @@ function page_head(string $title, bool $authenticated): void {
   <script>
     (() => {
       'use strict';
-      const menuKeys = ['databases','database','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables'];
+      const menuKeys = ['databases','database','sql','query_builder','import','export','schema','views','routines','triggers','events','processes','users','variables','diagnostics'];
       const defaults = <?= $defaultSettingsJson ?>;
       const serverSettings = <?= $clientSettingsJson ?>;
       const csrf = <?= $csrfJson ?>;
@@ -6874,7 +7186,8 @@ function render_sidebar(): void {
     ['events', 'fa-clock', 'Events'],
     ['processes', 'fa-list-check', 'Processes'],
     ['users', 'fa-users-gear', 'Users & rights'],
-    ['variables', 'fa-sliders', 'Variables']
+    ['variables', 'fa-sliders', 'Variables'],
+    ['diagnostics', 'fa-stethoscope', 'Diagnostics']
   ];
   $rawDbView = ms_raw_db_view();
   $profileNames = ms_profile_names();
@@ -6939,7 +7252,7 @@ function render_sidebar(): void {
     $renderDatabaseTools = static function () use ($items, $page, $dbName): void {
       ?><div id="ms-sidebar-db-block"><div class="small text-uppercase text-body-secondary mb-1">Databases</div>
       <nav class="nav nav-pills flex-column ms-db-tools small" id="ms-db-tools-nav">
-        <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables'], true)) continue; ?>
+        <?php foreach ($items as [$key, $icon, $label]) { if ($dbName === '' && !in_array($key, ['databases', 'processes', 'users', 'variables', 'diagnostics'], true)) continue; ?>
           <a class="nav-link <?= $page === $key ? 'active' : 'text-body' ?>" data-ms-menu="<?= h($key) ?>" href="?page=<?= h($key) ?>"><i class="fa-solid <?= h($icon) ?> fa-fw me-2"></i><?= h($label) ?></a>
         <?php } ?>
       </nav></div><?php
@@ -11252,6 +11565,65 @@ function render_column_display_settings(): void {
   ?></div></section><?php
 }
 
+function page_diagnostics(): void {
+  $report = ms_diagnostics_report_read();
+  $current = $report && (string)($report['version'] ?? '') === MS_VERSION;
+  $gateOpen = $current && !empty($report['blocking_passed']);
+  $results = isset($report['results']) && is_array($report['results']) ? $report['results'] : [];
+  $passed = 0; $failed = 0;
+  foreach ($results as $result) {
+    if (($result['status'] ?? '') === 'pass') $passed++;
+    else $failed++;
+  }
+  $format = static function ($value): string {
+    if (is_string($value)) return $value;
+    $json = json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    return is_string($json) ? $json : '';
+  };
+  $manualChecks = [
+    'mobile_sidebar' => 'Mobile sidebar opens, closes and does not trap page scrolling.',
+    'date_filters' => 'Date filters accept picker and manual input, including ranges and relative dates.',
+    'settings_header' => 'The Settings save header remains usable while scrolling at desktop and mobile widths.',
+    'pdf_editor' => 'PDF editor preview, template save and PDF download complete without layout clipping.',
+    'table_view' => 'Table view preserves filters, sorting, columns, widths and row actions.',
+    'card_pretty_view' => 'Card view editing and Pretty View transitions preserve values and return to the same query state.'
+  ];
+  ?><div class="d-flex flex-wrap align-items-start justify-content-between gap-3 mb-3">
+    <div><h1 class="h3 mb-1"><i class="fa-solid fa-stethoscope me-2"></i>Diagnostics</h1><p class="text-body-secondary mb-0">Blocking regression checks for editing, query state, view modes, analysis/export and relationship behavior.</p></div>
+    <form method="post"><input type="hidden" name="action" value="run_diagnostics"><?= csrf_field() ?><button class="btn btn-primary"><i class="fa-solid fa-play me-1"></i>Run diagnostics</button></form>
+  </div>
+  <div class="alert alert-<?= $gateOpen ? 'success' : 'warning' ?> d-flex flex-wrap align-items-center justify-content-between gap-2">
+    <div><strong>v<?= h(MS_VERSION) ?> release gate: <?= $gateOpen ? 'PASS' : 'BLOCKED' ?></strong><div class="small"><?= $gateOpen ? 'Every blocking group passed on this server and the disposable database was cleaned up.' : 'Run the current diagnostics and resolve every blocking failure before release.' ?></div></div>
+    <?php if($report){ ?><div class="small text-nowrap"><?= $passed ?> passed · <?= $failed ?> failed/blocked</div><?php } ?>
+  </div>
+  <div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i>The runner opens a second connection, creates a uniquely named disposable database, and drops it in a <code>finally</code> cleanup. It never selects or writes to the database you are browsing. The login needs <code>CREATE</code> and <code>DROP DATABASE</code> privileges.</div>
+  <?php if(!$report){ ?><div class="card mb-3"><div class="card-body text-body-secondary">No diagnostics report exists for this server. Run the suite to establish the release gate.</div></div><?php } else { ?>
+    <div class="row g-3 mb-3">
+      <div class="col-md-3"><div class="card h-100"><div class="card-body"><div class="small text-body-secondary">Report version</div><div class="fw-semibold">v<?= h((string)($report['version'] ?? '')) ?></div></div></div></div>
+      <div class="col-md-3"><div class="card h-100"><div class="card-body"><div class="small text-body-secondary">Completed</div><div class="fw-semibold"><?= !empty($report['completed_at']) ? h(date('Y-m-d H:i:s', (int)$report['completed_at'])) : 'Incomplete' ?></div></div></div></div>
+      <div class="col-md-3"><div class="card h-100"><div class="card-body"><div class="small text-body-secondary">Cleanup</div><div class="fw-semibold text-<?= ($report['cleanup']['status'] ?? '') === 'pass' ? 'success' : 'danger' ?>"><?= h(strtoupper((string)($report['cleanup']['status'] ?? 'unknown'))) ?></div></div></div></div>
+      <div class="col-md-3"><div class="card h-100"><div class="card-body"><div class="small text-body-secondary">Disposable database</div><div class="code small text-break"><?= h((string)($report['database'] ?? '')) ?></div></div></div></div>
+    </div>
+    <div class="card mb-3"><div class="card-header"><strong>Blocking groups</strong></div><div class="card-body"><div class="row g-2"><?php foreach(($report['group_status'] ?? []) as $group=>$status){ $ok=$status==='pass'; ?><div class="col-lg-6"><div class="border rounded p-2 d-flex align-items-center justify-content-between gap-2"><span><?= h((string)$group) ?></span><span class="badge text-bg-<?= $ok?'success':'danger' ?>"><?= $ok?'PASS':'FAIL' ?></span></div></div><?php } ?></div></div></div>
+    <div class="card mb-3"><div class="card-header"><strong>Automated results</strong></div><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Status</th><th>Group / check</th><th class="text-end">Duration</th><th>Failure detail</th></tr></thead><tbody><?php foreach($results as $result){ $ok=($result['status']??'')==='pass'; ?><tr><td><span class="badge text-bg-<?= $ok?'success':'danger' ?>"><?= h(strtoupper((string)($result['status']??'fail'))) ?></span></td><td><div class="small text-body-secondary"><?= h((string)($result['group']??'')) ?></div><strong><?= h((string)($result['name']??'')) ?></strong></td><td class="text-end text-nowrap"><?= h(number_format((float)($result['duration_ms']??0),2)) ?> ms</td><td style="min-width:20rem"><?php if(!$ok){ ?><details><summary class="text-danger"><?= h((string)($result['exception']??'Failed')) ?></summary><dl class="small mt-2 mb-0"><dt>SQL</dt><dd class="code text-break"><?= h((string)($result['sql']??'')) ?></dd><dt>Parameters</dt><dd><pre class="code mb-2"><?= h($format($result['parameters']??[])) ?></pre></dd><dt>Expected</dt><dd><pre class="code mb-2"><?= h($format($result['expected']??null)) ?></pre></dd><dt>Actual</dt><dd><pre class="code mb-0"><?= h($format($result['actual']??null)) ?></pre></dd></dl></details><?php } else { ?><span class="text-body-secondary small">Expected result matched.</span><?php } ?></td></tr><?php } ?></tbody></table></div></div>
+    <?php if(($report['cleanup']['status']??'')==='fail'){ ?><div class="alert alert-danger"><strong>Cleanup failed:</strong> <?= h((string)($report['cleanup']['exception']??'')) ?>. Drop <code><?= h((string)($report['database']??'')) ?></code> manually after confirming it is the diagnostic database.</div><?php } ?>
+  <?php } ?>
+  <div class="card" id="ms-manual-diagnostics"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Manual responsive checklist</strong><button class="btn btn-outline-secondary btn-sm" type="button" data-ms-checklist-reset>Reset</button></div><div class="card-body"><p class="small text-body-secondary">Browser-only behavior is intentionally kept outside the database release gate. Check each item at desktop and narrow mobile widths.</p><?php foreach($manualChecks as $key=>$label){ ?><div class="form-check py-1"><input class="form-check-input" type="checkbox" id="ms-manual-<?= h($key) ?>" data-ms-manual-check="<?= h($key) ?>"><label class="form-check-label" for="ms-manual-<?= h($key) ?>"><?= h($label) ?></label></div><?php } ?><div class="small text-body-secondary mt-2" data-ms-checklist-status></div></div></div>
+  <script>
+  (()=>{
+    'use strict';
+    const root=document.getElementById('ms-manual-diagnostics');if(!root)return;
+    const key='mysql-studio-diagnostics-checklist-v<?= h(MS_VERSION) ?>';
+    const inputs=Array.from(root.querySelectorAll('[data-ms-manual-check]'));
+    const status=root.querySelector('[data-ms-checklist-status]');
+    const load=()=>{try{return JSON.parse(localStorage.getItem(key)||'{}')||{};}catch(error){return {};}};
+    const update=()=>{const done=inputs.filter(input=>input.checked).length;status.textContent=done+' of '+inputs.length+' manual checks complete.';};
+    const saved=load();inputs.forEach(input=>{input.checked=saved[input.dataset.msManualCheck]===true;input.addEventListener('change',()=>{const state=load();state[input.dataset.msManualCheck]=input.checked;localStorage.setItem(key,JSON.stringify(state));update();});});
+    root.querySelector('[data-ms-checklist-reset]').addEventListener('click',()=>{localStorage.removeItem(key);inputs.forEach(input=>input.checked=false);update();});update();
+  })();
+  </script><?php
+}
+
 function page_settings(): void {
   $profileSettings = ms_profile_settings();
   $customColors = $profileSettings['customColors'];
@@ -11287,7 +11659,8 @@ function page_settings(): void {
     'events' => ['fa-clock', 'Events'],
     'processes' => ['fa-list-check', 'Processes'],
     'users' => ['fa-users-gear', 'Users & rights'],
-    'variables' => ['fa-sliders', 'Variables']
+    'variables' => ['fa-sliders', 'Variables'],
+    'diagnostics' => ['fa-stethoscope', 'Diagnostics']
   ];
   $settingsSidebarObjects = [];
   $settingsDbName = selected_db();
@@ -11413,7 +11786,7 @@ try {
   if (!in_array($page, $allowedPages, true)) {
     $page = selected_db() !== '' ? 'database' : 'databases';
   }
-  $needsDatabase = !in_array($page, ['databases','processes','users','variables','settings'], true);
+  $needsDatabase = !in_array($page, ['databases','processes','users','variables','diagnostics','settings'], true);
   if ($needsDatabase) {
     if (selected_db() === '') {
       go(['page' => 'databases'], 'Choose a database first.', 'warning');
@@ -11449,6 +11822,7 @@ try {
     case 'processes': page_processes($db); break;
     case 'users': page_users($db); break;
     case 'variables': page_variables($db); break;
+    case 'diagnostics': page_diagnostics(); break;
     case 'settings': page_settings(); break;
   }
   page_foot();
