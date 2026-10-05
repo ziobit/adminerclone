@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.16.0';
+const MS_VERSION = '1.16.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -11590,7 +11590,7 @@ function page_diagnostics(): void {
   ];
   ?><div class="d-flex flex-wrap align-items-start justify-content-between gap-3 mb-3">
     <div><h1 class="h3 mb-1"><i class="fa-solid fa-stethoscope me-2"></i>Diagnostics</h1><p class="text-body-secondary mb-0">Blocking regression checks for editing, query state, view modes, analysis/export and relationship behavior.</p></div>
-    <form method="post"><input type="hidden" name="action" value="run_diagnostics"><?= csrf_field() ?><button class="btn btn-primary"><i class="fa-solid fa-play me-1"></i>Run diagnostics</button></form>
+    <form method="post"><input type="hidden" name="action" value="run_diagnostics"><?= csrf_field() ?><button class="btn btn-primary" data-confirm="These are regression tests. They do not touch the current DB, but you are not supposed to run them, but you can if you want. Continue?"><i class="fa-solid fa-play me-1"></i>Run diagnostics</button></form>
   </div>
   <div class="alert alert-<?= $gateOpen ? 'success' : 'warning' ?> d-flex flex-wrap align-items-center justify-content-between gap-2">
     <div><strong>v<?= h(MS_VERSION) ?> release gate: <?= $gateOpen ? 'PASS' : 'BLOCKED' ?></strong><div class="small"><?= $gateOpen ? 'Every blocking group passed on this server and the disposable database was cleaned up.' : 'Run the current diagnostics and resolve every blocking failure before release.' ?></div></div>
