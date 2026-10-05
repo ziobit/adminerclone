@@ -11,10 +11,12 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.16.1';
+const MS_VERSION = '1.17.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
+const MS_PRESENCE_TTL = 120;
+const MS_PRESENCE_REVOKED_TTL = 604800;
 
 // Automatic self-update from the public GitHub repository.
 const MS_UPDATE_URL = 'https://raw.githubusercontent.com/ziobit/adminerclone/main/index.php';
@@ -222,6 +224,191 @@ function ms_update_runtime_file(string $suffix): string {
   }
   $directory = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR);
   return $directory . DIRECTORY_SEPARATOR . 'mysql-studio-' . sha1($identity) . '-' . $suffix;
+}
+
+/**
+ * Advisory presence tracking for this copy of MySQL Studio.
+ *
+ * The registry contains hashed random IDs and connection labels only. It never
+ * contains passwords, PHP session IDs or database data. A separate lock file
+ * serializes atomic registry replacements across PHP workers.
+ */
+function ms_presence_file(): string {
+  return ms_update_runtime_file('presence.json');
+}
+
+function ms_presence_lock_file(): string {
+  return ms_update_runtime_file('presence.lock');
+}
+
+function ms_presence_server_key(): string {
+  $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
+  return hash('sha256',
+    (string)($login['host'] ?? '') . "\0" .
+    (string)($login['port'] ?? '') . "\0" .
+    (string)($login['socket'] ?? '')
+  );
+}
+
+function ms_presence_normalize_registry($value, int $now): array {
+  $source = is_array($value) && isset($value['sessions']) && is_array($value['sessions']) ? $value['sessions'] : [];
+  $sessions = [];
+  foreach ($source as $key => $entry) {
+    if (!is_string($key) || preg_match('/\A[a-f0-9]{64}\z/', $key) !== 1 || !is_array($entry)) continue;
+    $revoked = !empty($entry['revoked']);
+    $lastSeen = max(0, (int)($entry['last_seen'] ?? 0));
+    $revokedAt = max(0, (int)($entry['revoked_at'] ?? 0));
+    if ($revoked) {
+      if ($revokedAt === 0 || $revokedAt < $now - MS_PRESENCE_REVOKED_TTL) continue;
+    } elseif ($lastSeen === 0 || $lastSeen < $now - MS_PRESENCE_TTL) {
+      continue;
+    }
+    $sessions[$key] = [
+      'server_key' => (string)($entry['server_key'] ?? ''),
+      'user' => substr((string)($entry['user'] ?? ''), 0, 128),
+      'database' => substr((string)($entry['database'] ?? ''), 0, 256),
+      'login_at' => max(0, (int)($entry['login_at'] ?? $lastSeen)),
+      'last_seen' => $lastSeen,
+      'revoked' => $revoked,
+      'revoked_at' => $revokedAt,
+      'revoked_by' => substr((string)($entry['revoked_by'] ?? ''), 0, 128)
+    ];
+  }
+  return ['version' => 1, 'sessions' => $sessions];
+}
+
+function ms_presence_registry_update(callable $mutator): array {
+  $lock = @fopen(ms_presence_lock_file(), 'c');
+  if (!is_resource($lock)) throw new RuntimeException('Unable to open the session-presence lock.');
+  @chmod(ms_presence_lock_file(), 0600);
+  try {
+    if (!flock($lock, LOCK_EX)) throw new RuntimeException('Unable to lock the session-presence registry.');
+    $raw = @file_get_contents(ms_presence_file());
+    $decoded = is_string($raw) && $raw !== '' ? json_decode($raw, true) : [];
+    $registry = ms_presence_normalize_registry(is_array($decoded) ? $decoded : [], time());
+    $result = $mutator($registry);
+    if (!is_array($result)) $result = [];
+    $json = json_encode($registry, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($json)) throw new RuntimeException('Unable to encode the session-presence registry.');
+    $path = ms_presence_file();
+    $temporary = $path . '.tmp-' . bin2hex(random_bytes(5));
+    if (@file_put_contents($temporary, $json . "\n", LOCK_EX) === false) {
+      @unlink($temporary);
+      throw new RuntimeException('Unable to write the session-presence registry.');
+    }
+    @chmod($temporary, 0600);
+    if (!@rename($temporary, $path)) {
+      @unlink($temporary);
+      throw new RuntimeException('Unable to replace the session-presence registry.');
+    }
+    return $result;
+  } finally {
+    @flock($lock, LOCK_UN);
+    fclose($lock);
+  }
+}
+
+function ms_presence_bootstrap(): array {
+  $empty = ['revoked' => false, 'others' => [], 'error' => ''];
+  if (empty($_SESSION['ms_login']) || !is_array($_SESSION['ms_login'])) return $empty;
+  if (empty($_SESSION['ms_presence_id']) || !is_string($_SESSION['ms_presence_id'])) {
+    $_SESSION['ms_presence_id'] = bin2hex(random_bytes(32));
+    $_SESSION['ms_presence_login_at'] = time();
+  }
+  $token = (string)$_SESSION['ms_presence_id'];
+  $ownKey = hash('sha256', $token);
+  $serverKey = ms_presence_server_key();
+  $login = $_SESSION['ms_login'];
+  $user = (string)($login['user'] ?? '');
+  $database = selected_db();
+  $loginAt = max(1, (int)($_SESSION['ms_presence_login_at'] ?? time()));
+  $now = time();
+  try {
+    $state = ms_presence_registry_update(static function (array &$registry) use ($ownKey, $serverKey, $user, $database, $loginAt, $now): array {
+      $existing = $registry['sessions'][$ownKey] ?? null;
+      if (is_array($existing) && !empty($existing['revoked'])) {
+        return ['revoked' => true, 'others' => [], 'error' => ''];
+      }
+      $registry['sessions'][$ownKey] = [
+        'server_key' => $serverKey,
+        'user' => $user,
+        'database' => $database,
+        'login_at' => is_array($existing) ? max(1, (int)($existing['login_at'] ?? $loginAt)) : $loginAt,
+        'last_seen' => $now,
+        'revoked' => false,
+        'revoked_at' => 0,
+        'revoked_by' => ''
+      ];
+      $others = [];
+      foreach ($registry['sessions'] as $key => $entry) {
+        if ($key === $ownKey || !is_array($entry) || !empty($entry['revoked']) || (string)($entry['server_key'] ?? '') !== $serverKey) continue;
+        $entry['key'] = $key;
+        $others[] = $entry;
+      }
+      usort($others, static function (array $a, array $b): int {
+        return ((int)($b['last_seen'] ?? 0)) <=> ((int)($a['last_seen'] ?? 0));
+      });
+      return ['revoked' => false, 'others' => $others, 'error' => ''];
+    });
+  } catch (Throwable $error) {
+    error_log('MySQL Studio presence tracking unavailable: ' . $error->getMessage());
+    $state = ['revoked' => false, 'others' => [], 'error' => 'Active-session detection is temporarily unavailable. Database access is unaffected.'];
+  }
+  $GLOBALS['ms_presence_state'] = $state;
+  return $state;
+}
+
+function ms_presence_forget_current(): void {
+  if (empty($_SESSION['ms_presence_id']) || !is_string($_SESSION['ms_presence_id'])) return;
+  $ownKey = hash('sha256', (string)$_SESSION['ms_presence_id']);
+  try {
+    ms_presence_registry_update(static function (array &$registry) use ($ownKey): array {
+      unset($registry['sessions'][$ownKey]);
+      return [];
+    });
+  } catch (Throwable $error) {
+    error_log('MySQL Studio could not remove its presence entry: ' . $error->getMessage());
+  }
+}
+
+function ms_presence_kick(string $targetKey): string {
+  if (preg_match('/\A[a-f0-9]{64}\z/', $targetKey) !== 1) throw new RuntimeException('Invalid active-session identifier.');
+  if (empty($_SESSION['ms_presence_id']) || !is_string($_SESSION['ms_presence_id'])) throw new RuntimeException('The current active session is unavailable.');
+  $ownKey = hash('sha256', (string)$_SESSION['ms_presence_id']);
+  if (hash_equals($ownKey, $targetKey)) throw new RuntimeException('The current session cannot end itself from the active-session warning.');
+  $serverKey = ms_presence_server_key();
+  $currentUser = (string)(($_SESSION['ms_login']['user'] ?? ''));
+  $result = ms_presence_registry_update(static function (array &$registry) use ($targetKey, $serverKey, $currentUser): array {
+    $target = $registry['sessions'][$targetKey] ?? null;
+    if (!is_array($target) || !empty($target['revoked']) || (string)($target['server_key'] ?? '') !== $serverKey) {
+      throw new RuntimeException('That active session is no longer available.');
+    }
+    $registry['sessions'][$targetKey]['revoked'] = true;
+    $registry['sessions'][$targetKey]['revoked_at'] = time();
+    $registry['sessions'][$targetKey]['revoked_by'] = $currentUser;
+    return ['label' => (string)($target['user'] ?? 'another user')];
+  });
+  return (string)($result['label'] ?? 'another user');
+}
+
+function ms_presence_warning_html(): string {
+  $state = isset($GLOBALS['ms_presence_state']) && is_array($GLOBALS['ms_presence_state']) ? $GLOBALS['ms_presence_state'] : ['others'=>[], 'error'=>''];
+  $error = (string)($state['error'] ?? '');
+  if ($error !== '') {
+    return '<div class="alert alert-secondary py-2 small"><i class="fa-solid fa-satellite-dish me-2"></i>' . h($error) . '</div>';
+  }
+  $others = isset($state['others']) && is_array($state['others']) ? $state['others'] : [];
+  if (!$others) return '';
+  $count = count($others);
+  $html = '<div class="alert alert-warning"><div class="d-flex flex-wrap justify-content-between align-items-start gap-2"><div><strong><i class="fa-solid fa-user-lock me-2"></i>' . h((string)$count) . ' other active ' . ($count === 1 ? 'session' : 'sessions') . ' on this server</strong><div class="small mt-1">This is an advisory warning from this MySQL Studio file; it does not lock the database or detect external tools.</div></div></div><div class="mt-2 d-flex flex-column gap-2">';
+  foreach ($others as $entry) {
+    $key = (string)($entry['key'] ?? '');
+    if (preg_match('/\A[a-f0-9]{64}\z/', $key) !== 1) continue;
+    $database = (string)($entry['database'] ?? '');
+    $lastSeen = max(0, time() - (int)($entry['last_seen'] ?? 0));
+    $html .= '<div class="border border-warning-subtle rounded p-2 d-flex flex-wrap justify-content-between align-items-center gap-2"><div><strong>' . h((string)($entry['user'] ?? 'unknown user')) . '</strong><span class="text-body-secondary"> · ' . h($database !== '' ? $database : 'no database selected') . ' · seen ' . h((string)$lastSeen) . 's ago</span></div><form method="post" class="m-0"><input type="hidden" name="action" value="kick_presence_session"><input type="hidden" name="presence_key" value="' . h($key) . '">' . csrf_field() . '<button class="btn btn-outline-danger btn-sm" data-confirm="End this MySQL Studio session? Any unsaved browser changes in that session may be lost."><i class="fa-solid fa-user-xmark me-1"></i>End session</button></form></div>';
+  }
+  return $html . '</div></div>';
 }
 
 function ms_update_cache_read(): array {
@@ -1954,7 +2141,7 @@ function ms_diagnostics_run(): array {
   $groups = [
     'Typed editing and autosave',
     'Pagination, filters, sort and presets',
-    'Table, card and Pretty View state',
+    'Table, card, Pretty View and session state',
     'Explain, Analyze, Duplicates and export',
     'Soft delete, relations and virtual keys'
   ];
@@ -2064,6 +2251,19 @@ function ms_diagnostics_run(): array {
       $displayed = preg_replace('/\s+/u', ' ', $displayed) ?? $displayed;
       $after = (string)(db_one($diag, 'SELECT CAST(`amount` AS CHAR) AS amount FROM `parents` WHERE `id`=2')['amount'] ?? '');
       return ['stored_before'=>$before,'displayed'=>$displayed,'stored_after'=>$after];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[2], 'Active-session registry expires stale entries and keeps revocations', 'Local presence-registry normalization', ['active_ttl'=>MS_PRESENCE_TTL,'revoked_ttl'=>MS_PRESENCE_REVOKED_TTL], ['active'=>true,'stale'=>false,'revoked'=>true,'expired_revocation'=>false], static function (): array {
+      $now = 2000000000;
+      $keys = [hash('sha256','active'),hash('sha256','stale'),hash('sha256','revoked'),hash('sha256','expired')];
+      $entry = ['server_key'=>'server','user'=>'tester','database'=>'fixture','login_at'=>$now-300,'last_seen'=>$now-10,'revoked'=>false,'revoked_at'=>0,'revoked_by'=>''];
+      $registry = ['sessions'=>[
+        $keys[0]=>$entry,
+        $keys[1]=>array_merge($entry,['last_seen'=>$now-MS_PRESENCE_TTL-1]),
+        $keys[2]=>array_merge($entry,['revoked'=>true,'revoked_at'=>$now-60]),
+        $keys[3]=>array_merge($entry,['revoked'=>true,'revoked_at'=>$now-MS_PRESENCE_REVOKED_TTL-1])
+      ]];
+      $normalized = ms_presence_normalize_registry($registry, $now);
+      return ['active'=>isset($normalized['sessions'][$keys[0]]),'stale'=>isset($normalized['sessions'][$keys[1]]),'revoked'=>isset($normalized['sessions'][$keys[2]]),'expired_revocation'=>isset($normalized['sessions'][$keys[3]])];
     });
 
     ms_diagnostics_add_case($report['results'], $groups[3], 'Explain analyzes the exact SELECT', 'EXPLAIN SELECT * FROM parents WHERE code = \'A\'', [], true, static function () use ($diag): bool {
@@ -4275,6 +4475,8 @@ try {
     $returnQuery = ms_decode_navigation(p('return_to'));
     session_regenerate_id(true);
     $_SESSION['ms_login'] = compact('host', 'port', 'user', 'password', 'socket');
+    $_SESSION['ms_presence_id'] = bin2hex(random_bytes(32));
+    $_SESSION['ms_presence_login_at'] = time();
     $_SESSION['ms_attempts'] = 0;
     $_SESSION['ms_csrf'] = bin2hex(random_bytes(32));
     if ($returnQuery) {
@@ -4290,6 +4492,7 @@ try {
 
   if (p('action') === 'logout') {
     require_csrf();
+    ms_presence_forget_current();
     $_SESSION = [];
     if (ini_get('session.use_cookies')) {
       $params = session_get_cookie_params();
@@ -4301,6 +4504,25 @@ try {
   }
 
   if (!empty($_SESSION['ms_login'])) {
+    $presenceState = ms_presence_bootstrap();
+    if (!empty($presenceState['revoked'])) {
+      unset($_SESSION['ms_login'], $_SESSION['ms_db'], $_SESSION['ms_presence_id'], $_SESSION['ms_presence_login_at']);
+      $_SESSION['ms_flash'] = ['warning', 'This MySQL Studio session was ended by another active session.'];
+      header('Location: ?');
+      exit;
+    }
+    if (g('ajax') === 'presence') {
+      header('Content-Type: application/json; charset=UTF-8');
+      header('Cache-Control: no-store');
+      try {
+        require_csrf();
+        echo json_encode(['ok'=>true, 'other_count'=>count($presenceState['others'] ?? []), 'html'=>ms_presence_warning_html()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      } catch (Throwable $presenceError) {
+        http_response_code(400);
+        echo json_encode(['ok'=>false, 'error'=>$presenceError->getMessage()], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+      }
+      exit;
+    }
     ms_profile_config_ensure();
     $db = connect_db(false);
 
@@ -4733,6 +4955,11 @@ try {
       if ($action === 'switch_profile') {
         ms_set_active_profile(p('profile'));
         go([], 'Profile changed to ' . ms_active_profile_name() . '.');
+      }
+
+      if ($action === 'kick_presence_session') {
+        $endedUser = ms_presence_kick(p('presence_key'));
+        go([], 'The MySQL Studio session for ' . $endedUser . ' will be ended on its next heartbeat or request.');
       }
 
       if ($action === 'run_diagnostics') {
@@ -5883,6 +6110,8 @@ function page_head(string $title, bool $authenticated): void {
       const defaults = <?= $defaultSettingsJson ?>;
       const serverSettings = <?= $clientSettingsJson ?>;
       const csrf = <?= $csrfJson ?>;
+      window.msPresenceEnabled = <?= $authenticated ? 'true' : 'false' ?>;
+      window.msCsrf = csrf;
       window.msSettingsMeta = {menuKeys,defaults};
       window.msLoadSettings = () => JSON.parse(JSON.stringify(serverSettings));
       window.msConfigPost = async (action, data = {}) => {
@@ -6175,6 +6404,30 @@ function page_foot(): void {
 <script>
 (() => {
   'use strict';
+  if (!window.msPresenceEnabled) return;
+  let running=false;
+  const heartbeat=async()=>{
+    if(running)return;
+    running=true;
+    try{
+      const body=new URLSearchParams({csrf:window.msCsrf||''});
+      const response=await fetch('?ajax=presence',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','Accept':'application/json'},body:body.toString()});
+      if(response.redirected){window.location.href=response.url;return;}
+      const type=response.headers.get('Content-Type')||'';
+      if(!type.includes('application/json')){window.location.reload();return;}
+      const payload=await response.json();
+      if(!response.ok||!payload.ok)return;
+      const slot=document.getElementById('ms-presence-slot');
+      if(slot&&typeof payload.html==='string')slot.innerHTML=payload.html;
+    }catch(error){}finally{running=false;}
+  };
+  window.setInterval(heartbeat,30000);
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')heartbeat();});
+})();
+</script>
+<script>
+(() => {
+  'use strict';
   const sidebar=document.getElementById('ms-sidebar');
   const toggle=document.getElementById('ms-mobile-sidebar-toggle');
   const closeButton=sidebar?sidebar.querySelector('[data-ms-mobile-sidebar-close]'):null;
@@ -6387,9 +6640,10 @@ function page_foot(): void {
 <script>
 (() => {
   'use strict';
-  document.querySelectorAll('[data-confirm]').forEach(el => el.addEventListener('click', e => {
-    if (!confirm(el.dataset.confirm || 'Are you sure?')) e.preventDefault();
-  }));
+  document.addEventListener('click', e => {
+    const el=e.target instanceof Element?e.target.closest('[data-confirm]'):null;
+    if(el&&!confirm(el.dataset.confirm||'Are you sure?'))e.preventDefault();
+  });
   document.addEventListener('click', async event => {
     const target = event.target instanceof Element ? event.target.closest('[data-ms-delete-single]') : null;
     if (!target) return;
@@ -7344,7 +7598,7 @@ function page_login(string $error): void {
   }
   $returnToken = ms_encode_navigation($returnQuery);
   page_head('Connect', false);
-  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
+  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= flash() ?><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
   <?php if ($error !== '') { ?><div class="alert alert-danger"><?= h($error) ?></div><?php } ?>
   <div class="card shadow-sm"><div class="card-body p-4"><form method="post" autocomplete="off"><input type="hidden" name="action" value="login"><?php if ($returnToken !== '') { ?><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?php } ?><?= csrf_field() ?>
     <div class="row g-3"><div class="col-8"><label class="form-label">Server</label><input class="form-control" name="host" value="<?= h(p('host','localhost')) ?>" required autofocus></div><div class="col-4"><label class="form-label">Port</label><input class="form-control" type="number" name="port" value="<?= h(p('port','3306')) ?>" min="1" max="65535" required></div>
@@ -11799,6 +12053,7 @@ try {
   $layoutStarted = true;
   echo flash();
   echo ms_update_notice();
+  echo '<div id="ms-presence-slot">' . ms_presence_warning_html() . '</div>';
   if ($error !== '') {
     echo '<div class="alert alert-danger">' . h($error) . '</div>';
   }
