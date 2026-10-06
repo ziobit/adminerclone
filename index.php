@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.18.0';
+const MS_VERSION = '1.18.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -1382,6 +1382,9 @@ function ms_repair_recipe_normalize(array $source): array {
   if ($repair === '' || strlen($repair) > 65536 || count($repairStatements) !== 1 || preg_match('/\A\s*UPDATE\s+(?:`(?:``|[^`])+`|[A-Za-z0-9_$]+)\s+SET\b/is', $repairStatements[0]) !== 1) {
     throw new RuntimeException('Repair SQL must be one simple single-table UPDATE … SET statement. JOIN updates and multiple statements are not allowed.');
   }
+  $previewShape = ms_repair_statement($previewStatements[0], 'SELECT');
+  $repairShape = ms_repair_statement($repairStatements[0], 'UPDATE');
+  if ($previewShape['table'] !== $repairShape['table']) throw new RuntimeException('Preview and repair must refer to the same table in the selected database.');
   $maxRows = max(1, min(1000, (int)($source['max_rows'] ?? 25)));
   return ['name'=>$name,'preview_sql'=>$previewStatements[0],'repair_sql'=>$repairStatements[0],'max_rows'=>$maxRows];
 }
@@ -1451,11 +1454,167 @@ function ms_repair_parameters_from_post(array $expected): array {
   return $parameters;
 }
 
-function ms_repair_update_table(string $sql): string {
-  if (preg_match('/\A\s*UPDATE\s+(?:`((?:``|[^`])+)`|([A-Za-z0-9_$]+))\s+SET\b/is', $sql, $match) !== 1) {
-    throw new RuntimeException('Only simple single-table UPDATE … SET repair statements are allowed.');
+// Recipes deliberately accept a small SQL grammar: direct preview columns, one
+// local table, SET assignments and optional WHERE / ORDER BY / LIMIT n clauses.
+// Tokenize literals and identifiers before inspecting clauses; executable comments
+// and subqueries must never be interpreted differently by PHP and the SQL server.
+function ms_repair_sql_tokens(string $sql): array {
+  $tokens = [];
+  $length = strlen($sql);
+  for ($i = 0; $i < $length;) {
+    $char = $sql[$i];
+    if (strpos(" \t\r\n", $char) !== false) { $i++; continue; }
+    if ($char === '#' || substr($sql, $i, 2) === '--' && ($i + 2 === $length || ctype_space($sql[$i + 2]))) {
+      $end = strpos($sql, "\n", $i);
+      $i = $end === false ? $length : $end + 1;
+      continue;
+    }
+    if (substr($sql, $i, 2) === '/*') {
+      if (preg_match('/\A\/\*(?:!|M!)/i', substr($sql, $i, 5))) throw new RuntimeException('Executable SQL comments are not allowed in repair recipes.');
+      $end = strpos($sql, '*/', $i + 2);
+      if ($end === false) throw new RuntimeException('Unclosed SQL comment in repair recipe.');
+      $i = $end + 2;
+      continue;
+    }
+    if (in_array($char, ["'", '"', '`'], true)) {
+      $start = $i++;
+      $closed = false;
+      while ($i < $length) {
+        if ($sql[$i] === '\\') {
+          if ($char === '`') throw new RuntimeException('Use doubled backticks to quote repair identifiers.');
+          $i += 2;
+        } elseif ($sql[$i] === $char) {
+          if ($i + 1 < $length && $sql[$i + 1] === $char) $i += 2;
+          else { $i++; $closed = true; break; }
+        } else $i++;
+      }
+      if (!$closed) throw new RuntimeException('Unclosed quoted value in repair recipe.');
+      $raw = substr($sql, $start, $i - $start);
+      $tokens[] = ['kind'=>$char === '`' ? 'identifier' : 'string','value'=>$char === '`' ? str_replace('``', '`', substr($raw, 1, -1)) : $raw,'sql'=>$raw,'offset'=>$start,'end'=>$i];
+      continue;
+    }
+    if (preg_match('/\G(:[A-Za-z_][A-Za-z0-9_]*|0[xX][0-9A-Fa-f]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|[A-Za-z_$][A-Za-z0-9_$]*|<=>|<=|>=|<>|!=|<<|>>|&&|\|\||->>|->|[(),.*+\-\/%=<>!~^|&])/A', $sql, $match, 0, $i) !== 1) {
+      throw new RuntimeException('Unsupported SQL syntax in repair recipe. Use simple statements without subqueries or user variables.');
+    }
+    $raw = $match[1];
+    $kind = $raw[0] === ':' ? 'parameter' : (preg_match('/\A[A-Za-z_$]/', $raw) ? 'word' : (preg_match('/\A(?:[0-9]|\.[0-9])/', $raw) ? 'number' : 'symbol'));
+    $tokens[] = ['kind'=>$kind,'value'=>$raw,'sql'=>$raw,'offset'=>$i,'end'=>$i + strlen($raw)];
+    $i += strlen($raw);
   }
-  return isset($match[1]) && $match[1] !== '' ? str_replace('``', '`', $match[1]) : (string)$match[2];
+  return $tokens;
+}
+
+function ms_repair_sql_text(array $tokens): string {
+  $text = '';
+  $end = null;
+  foreach ($tokens as $token) {
+    $text .= ($end !== null && $end !== $token['offset'] ? ' ' : '') . $token['sql'];
+    $end = $token['end'];
+  }
+  return $text;
+}
+
+function ms_repair_sql_parts(array $tokens): array {
+  $parts = [[]];
+  $depth = 0;
+  foreach ($tokens as $token) {
+    if ($token['sql'] === '(') $depth++;
+    if ($token['sql'] === ')') $depth--;
+    if ($depth < 0) throw new RuntimeException('Unbalanced parentheses in repair recipe.');
+    if ($token['sql'] === ',' && $depth === 0) $parts[] = [];
+    else $parts[count($parts) - 1][] = $token;
+  }
+  if ($depth !== 0) throw new RuntimeException('Unbalanced parentheses in repair recipe.');
+  return $parts;
+}
+
+function ms_repair_statement(string $sql, string $type): array {
+  $tokens = ms_repair_sql_tokens($sql);
+  $word = static function (array $token, string $value): bool { return $token['kind'] === 'word' && strtoupper($token['value']) === $value; };
+  $identifier = static function (array $token): bool { return in_array($token['kind'], ['word','identifier'], true); };
+  $invalid = static function (): void { throw new RuntimeException('Repair recipes require direct preview columns from one table and a simple UPDATE, with optional WHERE, ORDER BY and LIMIT n. Joins, subqueries and aggregates are not supported.'); };
+  if (!$tokens || !$word($tokens[0], $type)) $invalid();
+  foreach ($tokens as $index => $token) {
+    if ($token['kind'] === 'word' && in_array(strtoupper($token['value']), ['UNION','JOIN','GROUP','HAVING','INTO','FOR','LOCK','PROCEDURE','RETURNING','DELIMITER','DISTINCT'], true)) $invalid();
+    if ($index > 0 && $token['kind'] === 'word' && in_array(strtoupper($token['value']), ['SELECT','UPDATE','INSERT','DELETE','REPLACE'], true)) $invalid();
+  }
+  $projection = [];
+  if ($type === 'SELECT') {
+    $from = null;
+    foreach ($tokens as $index => $token) if ($word($token, 'FROM')) { $from = $index; break; }
+    if ($from === null || $from < 2) $invalid();
+    $projection = array_slice($tokens, 1, $from - 1);
+    $cursor = $from + 1;
+  } else $cursor = 1;
+  if (!isset($tokens[$cursor]) || !$identifier($tokens[$cursor])) $invalid();
+  $table = $tokens[$cursor++]['value'];
+  $alias = $table;
+  if ($type === 'UPDATE') {
+    if (!isset($tokens[$cursor]) || !$word($tokens[$cursor++], 'SET')) $invalid();
+  } elseif (isset($tokens[$cursor]) && $word($tokens[$cursor], 'AS')) {
+    $cursor++;
+    if (!isset($tokens[$cursor]) || !$identifier($tokens[$cursor])) $invalid();
+    $alias = $tokens[$cursor++]['value'];
+  } elseif (isset($tokens[$cursor]) && $identifier($tokens[$cursor]) && !in_array(strtoupper($tokens[$cursor]['value']), ['WHERE','ORDER','LIMIT'], true)) {
+    $alias = $tokens[$cursor++]['value'];
+  }
+  $clauses = ['body'=>[],'where'=>[],'order'=>[],'limit'=>[]];
+  $section = 'body';
+  $seen = [];
+  $rank = 0;
+  $depth = 0;
+  for (; $cursor < count($tokens); $cursor++) {
+    $token = $tokens[$cursor];
+    if ($depth === 0 && $token['kind'] === 'word' && in_array(strtoupper($token['value']), ['WHERE','ORDER','LIMIT'], true)) {
+      $section = strtolower($token['value']);
+      $nextRank = ['where'=>1,'order'=>2,'limit'=>3][$section];
+      if ($nextRank <= $rank) $invalid();
+      $rank = $nextRank;
+      $seen[] = $section;
+      if ($section === 'order' && (!isset($tokens[++$cursor]) || !$word($tokens[$cursor], 'BY'))) $invalid();
+      if (!isset($tokens[$cursor + 1])) $invalid();
+      continue;
+    }
+    if ($token['sql'] === '(') $depth++;
+    if ($token['sql'] === ')') $depth--;
+    if ($depth < 0) $invalid();
+    $clauses[$section][] = $token;
+  }
+  if ($depth !== 0 || ($type === 'SELECT' && $clauses['body']) || ($type === 'UPDATE' && !$clauses['body'])) $invalid();
+  foreach ($seen as $clause) if (!$clauses[$clause]) $invalid();
+  $limit = null;
+  if ($clauses['limit']) {
+    if (count($clauses['limit']) !== 1 || !($clauses['limit'][0]['kind'] === 'parameter' || preg_match('/\A\d{1,10}\z/', $clauses['limit'][0]['sql']))) $invalid();
+    $limit = $clauses['limit'][0]['sql'];
+  }
+  $columns = [];
+  $assigned = [];
+  $bodyParts = [];
+  foreach (ms_repair_sql_parts($type === 'SELECT' ? $projection : $clauses['body']) as $part) {
+    if (!$part) $invalid();
+    $offset = 0;
+    if (isset($part[1]) && $part[1]['sql'] === '.') {
+      if (!$identifier($part[0]) || $part[0]['value'] !== $alias) $invalid();
+      $offset = 2;
+    }
+    if (!isset($part[$offset]) || !($identifier($part[$offset]) || $type === 'SELECT' && $part[$offset]['sql'] === '*')) $invalid();
+    $column = $part[$offset++]['value'];
+    if ($type === 'SELECT') {
+      if ($column === '*' && $offset === 1) $part[0]['sql'] = qi($alias) . '.*';
+      if (isset($part[$offset]) && $word($part[$offset], 'AS') && isset($part[$offset + 1]) && $identifier($part[$offset + 1])) $offset += 2;
+      if ($offset !== count($part)) $invalid();
+      $columns[] = $column;
+    } else {
+      if (!isset($part[$offset + 1]) || $part[$offset]['sql'] !== '=') $invalid();
+      $assigned[] = strtolower($column);
+    }
+    $bodyParts[] = ms_repair_sql_text($part);
+  }
+  return ['table'=>$table,'alias'=>$alias,'body'=>implode(', ', $bodyParts),'columns'=>$columns,'assigned'=>$assigned,'where'=>ms_repair_sql_text($clauses['where']),'order'=>ms_repair_sql_text($clauses['order']),'limit'=>$limit];
+}
+
+function ms_repair_update_table(string $sql): string {
+  return ms_repair_statement($sql, 'UPDATE')['table'];
 }
 
 function ms_repair_assert_transactional_table(mysqli $db, string $sql): void {
@@ -1466,29 +1625,138 @@ function ms_repair_assert_transactional_table(mysqli $db, string $sql): void {
   if (strtoupper((string)($support['TRANSACTIONS'] ?? 'NO')) !== 'YES') throw new RuntimeException('Repair recipes require a transactional table engine; ' . ($engine !== '' ? $engine : $table) . ' cannot guarantee rollback.');
 }
 
+function ms_repair_key(mysqli $db, array $preview, array $repair): array {
+  $columns = [];
+  foreach (table_columns($db, $repair['table']) as $column) $columns[(string)$column['COLUMN_NAME']] = $column;
+  $indexes = [];
+  foreach (db_all($db, 'SHOW INDEX FROM ' . qi($repair['table'])) as $part) {
+    if ((int)$part['Non_unique'] === 0) $indexes[(string)$part['Key_name']][(int)$part['Seq_in_index']] = $part;
+  }
+  uksort($indexes, static function (string $a, string $b): int { return $a === 'PRIMARY' ? -1 : ($b === 'PRIMARY' ? 1 : strcmp($a, $b)); });
+  foreach ($indexes as $name => $parts) {
+    ksort($parts, SORT_NUMERIC);
+    $names = [];
+    $definition = [];
+    foreach ($parts as $part) {
+      $columnName = (string)($part['Column_name'] ?? '');
+      $column = $columns[$columnName] ?? null;
+      // Only types with lossless, stable binary text representations can bind
+      // a key this way (FLOAT rounding and TIMESTAMP time-zone folds cannot).
+      if (!$column || ($part['Sub_part'] ?? null) !== null || ($column['IS_NULLABLE'] ?? '') !== 'NO' || stripos((string)($column['EXTRA'] ?? ''), 'GENERATED') !== false ||
+          !in_array(strtolower((string)$column['DATA_TYPE']), ['tinyint','smallint','mediumint','int','bigint','decimal','numeric','char','varchar','binary','varbinary','date','datetime','time','year'], true) ||
+          in_array(strtolower($columnName), $repair['assigned'], true) || (!in_array('*', $preview['columns'], true) && !in_array(strtolower($columnName), array_map('strtolower', $preview['columns']), true))) continue 2;
+      $names[] = $columnName;
+      $definition[] = [$columnName,(string)$column['COLUMN_TYPE'],(string)($column['COLLATION_NAME'] ?? '')];
+    }
+    if ($names) return ['index'=>$name,'columns'=>$names,'definition'=>hash('sha256', serialize($definition))];
+  }
+  throw new RuntimeException('Execution is blocked: the preview must include every column of an unchanged PRIMARY or full UNIQUE NOT NULL key with supported stored types (integer, decimal, string, binary, DATE, DATETIME, TIME or YEAR). No reliable row key is available.');
+}
+
+function ms_repair_selection_sql(array $shape, string $projection, int $cap, bool $lock): string {
+  $limit = $shape['limit'] === null ? $cap : min($cap, (int)$shape['limit']);
+  return 'SELECT ' . $projection . ' FROM ' . qi($shape['table']) . ($shape['alias'] !== $shape['table'] ? ' AS ' . qi($shape['alias']) : '') .
+    ($shape['where'] !== '' ? ' WHERE ' . $shape['where'] : '') . ($shape['order'] !== '' ? ' ORDER BY ' . $shape['order'] : '') . ' LIMIT ' . $limit . ($lock ? ' FOR UPDATE' : '');
+}
+
+function ms_repair_key_projection(array $shape, array $key): array {
+  $projection = [];
+  foreach ($key['columns'] as $column) $projection[] = 'HEX(CAST(' . qi($shape['alias']) . '.' . qi($column) . ' AS BINARY))';
+  return $projection;
+}
+
+function ms_repair_row_set(array $rows): array {
+  $set = [];
+  foreach ($rows as $row) {
+    if (!is_array($row) || !$row) throw new RuntimeException('Missing repair row key. Preview the recipe again.');
+    foreach ($row as $value) if (!is_string($value) || preg_match('/\A(?:[0-9A-F]{2})*\z/', $value) !== 1) throw new RuntimeException('Invalid or NULL repair row key. Preview the recipe again.');
+    $set[] = serialize($row);
+  }
+  if (count(array_unique($set)) !== count($set)) throw new RuntimeException('Duplicate row identities in repair preview.');
+  sort($set, SORT_STRING);
+  return $set;
+}
+
+function ms_repair_binding(mysqli $db, string $previewSql, string $repairSql, int $limit, bool $lock = false): array {
+  $mode = db_one($db, 'SELECT @@SESSION.sql_mode AS mode, DATABASE() AS db');
+  if (preg_match('/(?:^|,)(?:ANSI_QUOTES|NO_BACKSLASH_ESCAPES)(?:,|$)/i', (string)($mode['mode'] ?? ''))) throw new RuntimeException('Repair recipes do not support ANSI_QUOTES or NO_BACKSLASH_ESCAPES SQL modes.');
+  $preview = ms_repair_statement($previewSql, 'SELECT');
+  $repair = ms_repair_statement($repairSql, 'UPDATE');
+  if ($preview['table'] !== $repair['table']) throw new RuntimeException('Preview and repair must refer to the same table in the selected database.');
+  ms_repair_assert_transactional_table($db, $repairSql);
+  $key = ms_repair_key($db, $preview, $repair);
+  $keyProjection = ms_repair_key_projection($preview, $key);
+  foreach ($keyProjection as $index => &$expression) $expression .= ' AS ' . qi('__ms_repair_key_' . $index);
+  unset($expression);
+  $result = $db->query(ms_repair_selection_sql($preview, $preview['body'] . ', ' . implode(', ', $keyProjection), $limit + 1, $lock));
+  if (!$result instanceof mysqli_result) throw new RuntimeException('Repair preview failed: ' . $db->error);
+  try {
+    $metadata = array_slice($result->fetch_fields(), 0, $result->field_count - count($key['columns']));
+    $fields = array_map(static function ($field): string { return (string)$field->name; }, $metadata);
+    if (count(array_unique($fields)) !== count($fields)) throw new RuntimeException('Preview column names must be distinct.');
+    foreach ($key['columns'] as $column) {
+      $visible = false;
+      foreach ($metadata as $field) if ($field->orgname === $column && $field->orgtable === $repair['table'] && $field->db === (string)$mode['db']) $visible = true;
+      if (!$visible) throw new RuntimeException('The preview must display each row key directly from the repair table.');
+    }
+    $rows = [];
+    $keys = [];
+    while ($row = $result->fetch_row()) {
+      $rows[] = array_combine($fields, array_slice($row, 0, count($fields)));
+      $keys[] = array_slice($row, count($fields));
+    }
+  } finally { $result->free(); }
+  $overflow = count($rows) > $limit;
+  if ($overflow) return ['fields'=>$fields,'rows'=>array_slice($rows,0,$limit),'overflow'=>true,'key'=>$key,'key_rows'=>array_slice($keys,0,$limit),'repair'=>$repair];
+  // Direct locking reads keep row and metadata locks until the transaction ends.
+  $result = $db->query(ms_repair_selection_sql($repair, implode(', ', ms_repair_key_projection($repair, $key)), $limit + 1, $lock));
+  if (!$result instanceof mysqli_result) throw new RuntimeException('Unable to check repair target rows: ' . $db->error);
+  $targets = [];
+  while ($row = $result->fetch_row()) $targets[] = $row;
+  $result->free();
+  if (ms_repair_row_set($keys) !== ms_repair_row_set($targets)) throw new RuntimeException('The UPDATE targets different rows from the preview. Execution is blocked; preview the matching rows again.');
+  // Recheck after the reads acquire metadata locks, closing concurrent DDL races.
+  ms_repair_assert_transactional_table($db, $repairSql);
+  if ($key !== ms_repair_key($db, $preview, $repair)) throw new RuntimeException('The repair row key changed. Preview the recipe again.');
+  return ['fields'=>$fields,'rows'=>$rows,'overflow'=>false,'key'=>$key,'key_rows'=>$keys,'repair'=>$repair];
+}
+
+function ms_repair_scoped_sql(array $repair, array $key, array $rows): string {
+  if (!$rows) throw new RuntimeException('An empty preview cannot authorize a repair.');
+  ms_repair_row_set($rows);
+  $identities = [];
+  foreach ($rows as $row) {
+    if (count($row) !== count($key['columns'])) throw new RuntimeException('Incomplete repair row identity.');
+    $parts = [];
+    foreach ($key['columns'] as $index => $column) {
+      // Server-side binary representations avoid collation, BIGINT rounding and
+      // binary/temporal protocol conversions when binding the approved keys.
+      $literal = 'X\'' . $row[$index] . '\'';
+      $parts[] = qi($column) . ' = ' . $literal . ' AND CAST(' . qi($column) . ' AS BINARY) = ' . $literal;
+    }
+    $identities[] = '(' . implode(' AND ', $parts) . ')';
+  }
+  return 'UPDATE ' . qi($repair['table']) . ' SET ' . $repair['body'] . ' WHERE (' . implode(' OR ', $identities) . ')' .
+    ($repair['order'] !== '' ? ' ORDER BY ' . $repair['order'] : '') . ($repair['limit'] !== null ? ' LIMIT ' . $repair['limit'] : '');
+}
+
 function ms_repair_preview(mysqli $db, string $id, array $recipe, array $parameters): array {
+  $recipe = ms_repair_recipe_normalize($recipe);
+  foreach ($parameters as $parameter) if (!is_array($parameter) || !in_array((string)($parameter['type'] ?? 'text'), ['text','number','null'], true)) throw new RuntimeException('Repair parameters must be Text, Number or NULL.');
   $previewSql = ms_expand_sql_parameters($db, $recipe['preview_sql'], $parameters);
   $repairSql = ms_expand_sql_parameters($db, $recipe['repair_sql'], $parameters);
-  ms_repair_assert_transactional_table($db, $repairSql);
   $limit = (int)$recipe['max_rows'];
-  $result = $db->query('SELECT * FROM (' . $previewSql . ') AS `ms_repair_preview` LIMIT ' . ($limit + 1));
-  if (!$result instanceof mysqli_result) throw new RuntimeException('Repair preview failed: ' . $db->error);
-  $rows = [];
-  while ($row = $result->fetch_assoc()) $rows[] = $row;
-  $fields = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
-  $result->free();
-  $overflow = count($rows) > $limit;
-  if ($overflow) $rows = array_slice($rows, 0, $limit);
+  $binding = ms_repair_binding($db, $previewSql, $repairSql, $limit);
   $token = '';
-  if (!$overflow && $rows) {
+  if (!$binding['overflow'] && $binding['rows']) {
     $token = bin2hex(random_bytes(24));
     $previews = isset($_SESSION['ms_repair_previews']) && is_array($_SESSION['ms_repair_previews']) ? $_SESSION['ms_repair_previews'] : [];
-    foreach ($previews as $key => $entry) if (!is_array($entry) || (int)($entry['created_at'] ?? 0) < time() - 600) unset($previews[$key]);
+    foreach ($previews as $entryToken => $entry) if (!is_array($entry) || (int)($entry['created_at'] ?? 0) < time() - 600) unset($previews[$entryToken]);
     while (count($previews) >= 5) array_shift($previews);
-    $previews[$token] = ['database'=>selected_db(),'recipe_id'=>$id,'recipe_hash'=>hash('sha256', json_encode($recipe) ?: ''),'repair_sql'=>$repairSql,'max_rows'=>$limit,'preview_rows'=>count($rows),'created_at'=>time()];
+    $previews[$token] = ['database'=>selected_db(),'recipe_id'=>$id,'recipe_hash'=>hash('sha256', json_encode($recipe) ?: ''),'preview_sql'=>$previewSql,'repair_sql'=>$repairSql,'table'=>$binding['repair']['table'],'key'=>$binding['key'],'key_rows'=>$binding['key_rows'],'max_rows'=>$limit,'preview_rows'=>count($binding['rows']),'created_at'=>time()];
     $_SESSION['ms_repair_previews'] = $previews;
   }
-  return ['fields'=>$fields,'rows'=>$rows,'overflow'=>$overflow,'token'=>$token,'max_rows'=>$limit];
+  return ['fields'=>$binding['fields'],'rows'=>$binding['rows'],'overflow'=>$binding['overflow'],'token'=>$token,'max_rows'=>$limit];
 }
 
 function ms_repair_execute(mysqli $db, string $token): int {
@@ -1498,18 +1766,35 @@ function ms_repair_execute(mysqli $db, string $token): int {
   $recipes = ms_profile_repair_recipes(selected_db());
   $recipe = $recipes[(string)($entry['recipe_id'] ?? '')] ?? null;
   if (!is_array($recipe) || !hash_equals((string)($entry['recipe_hash'] ?? ''), hash('sha256', json_encode($recipe) ?: ''))) throw new RuntimeException('The recipe changed after preview. Preview it again.');
+  $affected = ms_repair_execute_bound($db, $entry);
+  unset($_SESSION['ms_repair_previews'][$token]);
+  return $affected;
+}
+
+// Shared with the disposable-database diagnostics; the action above always
+// verifies the session token, database, expiry and saved recipe first.
+function ms_repair_execute_bound(mysqli $db, array $entry): int {
   $sql = (string)($entry['repair_sql'] ?? '');
-  $maxRows = max(1, (int)($entry['max_rows'] ?? 1));
-  $previewRows = max(0, (int)($entry['preview_rows'] ?? 0));
-  ms_repair_assert_transactional_table($db, $sql);
+  $maxRows = (int)($entry['max_rows'] ?? 0);
+  $previewRows = (int)($entry['preview_rows'] ?? 0);
+  $keys = $entry['key_rows'] ?? null;
+  if ($maxRows < 1 || $maxRows > 1000 || $previewRows < 1 || $previewRows > $maxRows || !is_array($keys) || count($keys) !== $previewRows || !is_array($entry['key'] ?? null) || !is_string($entry['preview_sql'] ?? null)) {
+    throw new RuntimeException('This preview has no reliable row identities. Preview the recipe again.');
+  }
+  $approved = ms_repair_row_set($keys);
   if (!$db->begin_transaction()) throw new RuntimeException('Unable to start the repair transaction: ' . $db->error);
   try {
-    if (!$db->query($sql)) throw new RuntimeException('Repair failed: ' . $db->error);
+    $binding = ms_repair_binding($db, $entry['preview_sql'], $sql, $maxRows, true);
+    if ($binding['overflow'] || $binding['repair']['table'] !== ($entry['table'] ?? null) || $binding['key'] !== $entry['key'] || ms_repair_row_set($binding['key_rows']) !== $approved) {
+      throw new RuntimeException('The previewed row identities or their key changed. The transaction was rolled back; preview the recipe again.');
+    }
+    // Freeze the write to the approved keys, even if a predicate is volatile or
+    // new matching rows appear after the locking reads at READ COMMITTED.
+    if (!$db->query(ms_repair_scoped_sql($binding['repair'], $binding['key'], $keys))) throw new RuntimeException('Repair failed: ' . $db->error);
     $affected = max(0, (int)$db->affected_rows);
     if ($affected > $maxRows) throw new RuntimeException('Repair matched ' . $affected . ' changed rows, above the safety limit of ' . $maxRows . '. The transaction was rolled back.');
     if ($affected > $previewRows) throw new RuntimeException('Repair changed more rows than the preview returned (' . $affected . ' instead of at most ' . $previewRows . '). The transaction was rolled back.');
     if (!$db->commit()) throw new RuntimeException('Unable to commit the repair: ' . $db->error);
-    unset($_SESSION['ms_repair_previews'][$token]);
     return $affected;
   } catch (Throwable $error) {
     $db->rollback();
@@ -2451,6 +2736,137 @@ function ms_diagnostics_query(mysqli $db, string $sql): void {
   if (!$db->query($sql)) throw new RuntimeException($db->error . ' — SQL: ' . $sql);
 }
 
+function ms_diagnostics_repair_cases(mysqli $db, array &$results, string $group): void {
+  ms_diagnostics_query($db, "CREATE TABLE repair_rows (id INT NOT NULL, flag TINYINT NOT NULL, value VARCHAR(20) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB");
+  ms_diagnostics_query($db, "INSERT INTO repair_rows VALUES (1,1,'old'),(2,0,'old'),(3,0,'old')");
+  ms_diagnostics_query($db, "CREATE TABLE repair_unique (tenant BIGINT UNSIGNED NOT NULL, code VARBINARY(12) NOT NULL, value VARCHAR(20) NOT NULL, UNIQUE KEY uq (tenant,code)) ENGINE=InnoDB");
+  ms_diagnostics_query($db, "INSERT INTO repair_unique VALUES (18446744073709551614,0x00FF,'old'),(18446744073709551615,0x00FF,'old'),(18446744073709551615,0x0027FF5C,'old')");
+  ms_diagnostics_query($db, 'CREATE TABLE repair_composite_pk LIKE repair_unique');
+  ms_diagnostics_query($db, 'ALTER TABLE repair_composite_pk DROP INDEX uq, ADD PRIMARY KEY (tenant,code)');
+  ms_diagnostics_query($db, 'INSERT INTO repair_composite_pk SELECT * FROM repair_unique');
+  ms_diagnostics_query($db, 'CREATE TABLE repair_nullable (code VARCHAR(20) NULL, value VARCHAR(20) NOT NULL, UNIQUE KEY uq (code)) ENGINE=InnoDB');
+  ms_diagnostics_query($db, "INSERT INTO repair_nullable VALUES (NULL,'old'),(NULL,'old')");
+  ms_diagnostics_query($db, 'CREATE TABLE repair_prefix (code VARCHAR(20) NOT NULL, value VARCHAR(20) NOT NULL, UNIQUE KEY uq (code(3))) ENGINE=InnoDB');
+  ms_diagnostics_query($db, "INSERT INTO repair_prefix VALUES ('abc1','old'),('def1','old')");
+  $recipe = static function (string $preview, string $repair, int $limit = 3): array {
+    return ms_repair_recipe_normalize(['name'=>'Diagnostic repair','preview_sql'=>$preview,'repair_sql'=>$repair,'max_rows'=>$limit]);
+  };
+  $entryFor = static function (array $recipe, array $parameters = []) use ($db): array {
+    $session = $_SESSION;
+    try {
+      $preview = ms_repair_preview($db, str_repeat('d', 16), $recipe, $parameters);
+      if ($preview['token'] === '') throw new RuntimeException('Expected an executable diagnostic preview.');
+      return $_SESSION['ms_repair_previews'][$preview['token']];
+    } finally { $_SESSION = $session; }
+  };
+  $rejected = static function (callable $action, string $message): bool {
+    try { $action(); } catch (RuntimeException $error) { return strpos($error->getMessage(), $message) !== false; }
+    return false;
+  };
+  ms_diagnostics_add_case($results, $group, 'Cross-table repair preview is rejected', 'Preview repair_rows; UPDATE parents', [], true, static function () use ($recipe,$rejected): bool {
+    return $rejected(static function () use ($recipe): void { $recipe('SELECT id FROM repair_rows WHERE id=1', "UPDATE parents SET label='bad' WHERE id=1"); }, 'same table');
+  });
+  foreach ([
+    ['Same count, different row is rejected','SELECT id,value FROM repair_rows WHERE id=1',"UPDATE repair_rows SET value='bad' WHERE id=2"],
+    ['Extra matched rows are rejected even when none would change','SELECT id,value FROM repair_rows WHERE id=1',"UPDATE repair_rows SET value='old' WHERE id>=1"]
+  ] as [$name,$preview,$repair]) {
+    ms_diagnostics_add_case($results, $group, $name, $repair, ['preview'=>$preview], ['rejected'=>true,'unchanged'=>true], static function () use ($db,$recipe,$entryFor,$rejected,$preview,$repair): array {
+      $before = db_all($db, 'SELECT * FROM repair_rows ORDER BY id');
+      $blocked = $rejected(static function () use ($recipe,$entryFor,$preview,$repair): void { $entryFor($recipe($preview,$repair)); }, 'different rows');
+      return ['rejected'=>$blocked,'unchanged'=>$before === db_all($db, 'SELECT * FROM repair_rows ORDER BY id')];
+    });
+  }
+  foreach ([
+    ['No real row key is rejected','SELECT * FROM virtual_rows',"UPDATE virtual_rows SET value='bad'"],
+    ['Nullable unique key is rejected','SELECT * FROM repair_nullable',"UPDATE repair_nullable SET value='bad'"],
+    ['Prefix unique key is rejected','SELECT * FROM repair_prefix',"UPDATE repair_prefix SET value='bad'"],
+    ['Preview omitting the row key is rejected','SELECT value FROM repair_rows WHERE id=1',"UPDATE repair_rows SET value='bad' WHERE id=1"],
+    ['Incomplete composite key is rejected','SELECT tenant,value FROM repair_unique WHERE code=0x00FF',"UPDATE repair_unique SET value='bad' WHERE code=0x00FF"],
+    ['Repair changing its only row key is rejected','SELECT id FROM repair_rows WHERE id=1','UPDATE repair_rows SET id=2 WHERE id=1']
+  ] as [$name,$preview,$repair]) {
+    ms_diagnostics_add_case($results, $group, $name, $repair, ['preview'=>$preview], true, static function () use ($recipe,$entryFor,$rejected,$preview,$repair): bool {
+      return $rejected(static function () use ($recipe,$entryFor,$preview,$repair): void { $entryFor($recipe($preview,$repair)); }, 'No reliable row key');
+    });
+  }
+  ms_diagnostics_add_case($results, $group, 'Forged key projections and executable comments are rejected', 'Local repair SQL grammar', [], 5, static function () use ($recipe): int {
+    $blocked = 0;
+    foreach (['SELECT 2 AS id FROM repair_rows WHERE id=1','SELECT id FROM repair_rows UNION SELECT id FROM parents','SELECT id FROM repair_rows WHERE id IN (SELECT id FROM parents)','SELECT id FROM repair_rows /*!50000 WHERE id=2 */','SELECT id FROM repair_rows /*M! WHERE id=2 */'] as $preview) {
+      try { $recipe($preview,"UPDATE repair_rows SET value='bad' WHERE id=1"); } catch (RuntimeException $error) { $blocked++; }
+    }
+    return $blocked;
+  });
+  ms_diagnostics_add_case($results, $group, 'Aligned preview executes only its primary-key row', "UPDATE repair_rows SET value='fixed' WHERE id=1", [], ['affected'=>1,'values'=>['fixed','old','old']], static function () use ($db,$recipe,$entryFor): array {
+    try {
+      $entry = $entryFor($recipe('SELECT r.id AS row_id,r.value FROM repair_rows AS r WHERE r.id=1',"UPDATE repair_rows SET value='fixed' WHERE id=1"));
+      $affected = ms_repair_execute_bound($db, $entry);
+      return ['affected'=>$affected,'values'=>array_column(db_all($db,'SELECT value FROM repair_rows ORDER BY id'),'value')];
+    } finally { ms_diagnostics_query($db, "UPDATE repair_rows SET value='old'"); }
+  });
+  ms_diagnostics_add_case($results, $group, 'Aligned no-op repair is valid', "UPDATE repair_rows SET value='old' WHERE id=1", [], 0, static function () use ($recipe,$entryFor,$db): int {
+    return ms_repair_execute_bound($db, $entryFor($recipe('SELECT * FROM repair_rows WHERE id=1',"UPDATE repair_rows SET value='old' WHERE id=1")));
+  });
+  ms_diagnostics_add_case($results, $group, 'Parameters, functions, ordering and LIMIT retain their meaning', 'UPDATE repair_rows SET value=UPPER(TRIM(:value)) WHERE id=:id ORDER BY id DESC LIMIT :limit', ['id'=>'1','limit'=>'1','value'=>" x';--hi "], ['affected'=>1,'value'=>"X';--HI"], static function () use ($db,$recipe,$entryFor): array {
+    try {
+      $entry = $entryFor($recipe('SELECT * FROM repair_rows WHERE id=:id ORDER BY id DESC LIMIT :limit','UPDATE repair_rows SET value=UPPER(TRIM(:value)) WHERE id=:id ORDER BY id DESC LIMIT :limit'), ['id'=>['type'=>'number','value'=>'1'],'limit'=>['type'=>'number','value'=>'1'],'value'=>['type'=>'text','value'=>" x';--hi "]]);
+      return ['affected'=>ms_repair_execute_bound($db,$entry),'value'=>(string)(db_one($db,'SELECT value FROM repair_rows WHERE id=1')['value'] ?? '')];
+    } finally { ms_diagnostics_query($db,"UPDATE repair_rows SET value='old'"); }
+  });
+  ms_diagnostics_add_case($results, $group, 'Frozen-key write excludes newly matching rows', "INSERT a matching row between validation and the scoped UPDATE", [], ['affected'=>1,'outside'=>'outside'], static function () use ($db,$recipe): array {
+    $definition = $recipe('SELECT * FROM repair_rows WHERE flag=1',"UPDATE repair_rows SET value='fixed' WHERE flag=1");
+    if (!$db->begin_transaction()) throw new RuntimeException($db->error);
+    try {
+      $binding = ms_repair_binding($db,$definition['preview_sql'],$definition['repair_sql'],3,true);
+      ms_diagnostics_query($db,"INSERT INTO repair_rows VALUES (4,1,'outside')");
+      ms_diagnostics_query($db,ms_repair_scoped_sql($binding['repair'],$binding['key'],$binding['key_rows']));
+      $affected = (int)$db->affected_rows;
+      return ['affected'=>$affected,'outside'=>(string)(db_one($db,'SELECT value FROM repair_rows WHERE id=4')['value'] ?? '')];
+    } finally { $db->rollback(); }
+  });
+  foreach (['repair_unique','repair_composite_pk'] as $table) {
+    ms_diagnostics_add_case($results, $group, 'Composite ' . ($table === 'repair_unique' ? 'UNIQUE' : 'PRIMARY') . ' key binds binary and large-integer values', 'UPDATE ' . $table . " SET value='fixed' WHERE code=0x00FF", [], ['affected'=>2,'values'=>['fixed','old','fixed']], static function () use ($db,$recipe,$entryFor,$table): array {
+      try {
+        $entry = $entryFor($recipe('SELECT tenant,code,value FROM ' . $table . ' WHERE code=0x00FF ORDER BY tenant DESC',"UPDATE " . $table . " SET value='fixed' WHERE code=0x00FF"));
+        $affected = ms_repair_execute_bound($db, $entry);
+        return ['affected'=>$affected,'values'=>array_column(db_all($db,'SELECT value FROM ' . $table . ' ORDER BY tenant,code'),'value')];
+      } finally { ms_diagnostics_query($db, 'UPDATE ' . $table . " SET value='old'"); }
+    });
+  }
+  foreach ([true,false] as $previewFollowsFlag) {
+    ms_diagnostics_add_case($results, $group, $previewFollowsFlag ? 'Same-size row set changing after preview is rejected' : 'UPDATE target drifting after preview is rejected', "UPDATE repair_rows SET value='bad' WHERE flag=1", [], ['rejected'=>true,'values'=>['old','old','old']], static function () use ($db,$recipe,$entryFor,$rejected,$previewFollowsFlag): array {
+      try {
+        $entry = $entryFor($recipe('SELECT id,value FROM repair_rows WHERE ' . ($previewFollowsFlag ? 'flag=1' : 'id=1'),"UPDATE repair_rows SET value='bad' WHERE flag=1"));
+        ms_diagnostics_query($db, 'UPDATE repair_rows SET flag=IF(id=2,1,0)');
+        $blocked = $rejected(static function () use ($db,$entry): void { ms_repair_execute_bound($db,$entry); }, $previewFollowsFlag ? 'identities or their key changed' : 'different rows');
+        return ['rejected'=>$blocked,'values'=>array_column(db_all($db,'SELECT value FROM repair_rows ORDER BY id'),'value')];
+      } finally { ms_diagnostics_query($db, 'UPDATE repair_rows SET flag=IF(id=1,1,0)'); }
+    });
+  }
+  ms_diagnostics_add_case($results, $group, 'Removed unique key invalidates an existing preview', "ALTER TABLE repair_unique DROP INDEX uq", [], true, static function () use ($db,$recipe,$entryFor,$rejected): bool {
+    $entry = $entryFor($recipe('SELECT * FROM repair_unique WHERE code=0x00FF',"UPDATE repair_unique SET value='bad' WHERE code=0x00FF"));
+    try {
+      ms_diagnostics_query($db, 'ALTER TABLE repair_unique DROP INDEX uq');
+      return $rejected(static function () use ($db,$entry): void { ms_repair_execute_bound($db,$entry); }, 'No reliable row key');
+    } finally { ms_diagnostics_query($db, 'ALTER TABLE repair_unique ADD UNIQUE KEY uq (tenant,code)'); }
+  });
+  ms_diagnostics_add_case($results, $group, 'Over-limit and empty previews cannot authorize execution', 'Bounded preview SELECT', [], ['overflow'=>true,'overflow_token'=>'','empty_token'=>''], static function () use ($db,$recipe): array {
+    $session = $_SESSION;
+    try {
+      $overflow = ms_repair_preview($db,str_repeat('d',16),$recipe('SELECT * FROM repair_rows',"UPDATE repair_rows SET value='bad'",1),[]);
+      $empty = ms_repair_preview($db,str_repeat('d',16),$recipe('SELECT * FROM repair_rows WHERE id=99',"UPDATE repair_rows SET value='bad' WHERE id=99"),[]);
+      return ['overflow'=>$overflow['overflow'],'overflow_token'=>$overflow['token'],'empty_token'=>$empty['token']];
+    } finally { $_SESSION = $session; }
+  });
+  ms_diagnostics_add_case($results, $group, 'Legacy count-only previews are rejected', 'Repair token without row keys', [], true, static function () use ($db,$recipe,$entryFor,$rejected): bool {
+    $entry = $entryFor($recipe('SELECT * FROM repair_rows WHERE id=1',"UPDATE repair_rows SET value='bad' WHERE id=1"));
+    unset($entry['key'],$entry['key_rows']);
+    return $rejected(static function () use ($db,$entry): void { ms_repair_execute_bound($db,$entry); }, 'no reliable row identities');
+  });
+  ms_diagnostics_add_case($results, $group, 'Repair SQL failure rolls back the transaction', "UPDATE repair_rows SET value=ms_nonexistent_repair_function(value) WHERE id=1", [], ['rejected'=>true,'value'=>'old'], static function () use ($db,$recipe,$entryFor,$rejected): array {
+    $entry = $entryFor($recipe('SELECT * FROM repair_rows WHERE id=1','UPDATE repair_rows SET value=ms_nonexistent_repair_function(value) WHERE id=1'));
+    return ['rejected'=>$rejected(static function () use ($db,$entry): void { ms_repair_execute_bound($db,$entry); }, 'Repair failed:'),'value'=>(string)(db_one($db,'SELECT value FROM repair_rows WHERE id=1')['value'] ?? '')];
+  });
+}
+
 function ms_diagnostics_run(): array {
   $groups = [
     'Typed editing and autosave',
@@ -2618,10 +3034,12 @@ function ms_diagnostics_run(): array {
       $columns = table_columns($diag, 'parents');
       $rule = ms_active_soft_delete_rule(['column'=>'deleted','value'=>'1'], $columns);
       if ($rule === null) throw new RuntimeException('Soft-delete rule was rejected.');
-      ms_diagnostics_query($diag, 'UPDATE `parents` SET `deleted`=1 WHERE `id`=2');
-      $row = db_one($diag, 'SELECT `deleted` FROM `parents` WHERE `id`=2');
-      $visible = db_one($diag, 'SELECT COUNT(*) AS n FROM `parents` WHERE NOT (' . ms_soft_delete_sql_match($diag, $rule) . ')');
-      return ['deleted'=>ms_row_is_soft_deleted($row ?? [], $rule),'visible'=>(int)($visible['n'] ?? -1)];
+      try {
+        ms_diagnostics_query($diag, 'UPDATE `parents` SET `deleted`=1 WHERE `id`=2');
+        $row = db_one($diag, 'SELECT `deleted` FROM `parents` WHERE `id`=2');
+        $visible = db_one($diag, 'SELECT COUNT(*) AS n FROM `parents` WHERE NOT (' . ms_soft_delete_sql_match($diag, $rule) . ')');
+        return ['deleted'=>ms_row_is_soft_deleted($row ?? [], $rule),'visible'=>(int)($visible['n'] ?? -1)];
+      } finally { ms_diagnostics_query($diag, 'UPDATE `parents` SET `deleted`=0 WHERE `id`=2'); }
     });
     ms_diagnostics_add_case($report['results'], $groups[4], 'Master/slave and soft-FK lookup use the configured fields', 'SELECT children WHERE parent_code = parent.code', ['master_field'=>'code','slave_field'=>'parent_code'], ['children'=>4,'display'=>'Alpha','ambiguous'=>false], static function () use ($diag): array {
       $children = db_one($diag, "SELECT COUNT(*) AS n FROM `children` WHERE `parent_code`='A'");
@@ -2654,6 +3072,7 @@ function ms_diagnostics_run(): array {
       $recipe = ms_repair_recipe_normalize(['name'=>'Rename parent','preview_sql'=>'SELECT id,label FROM parents WHERE id = :id;','repair_sql'=>'UPDATE parents SET label = :new_label WHERE id = :id;','max_rows'=>2]);
       return ['table'=>ms_repair_update_table($recipe['repair_sql']),'parameters'=>ms_sql_parameter_names($recipe['preview_sql'],$recipe['repair_sql']),'max_rows'=>$recipe['max_rows']];
     });
+    ms_diagnostics_repair_cases($diag, $report['results'], $groups[5]);
   } catch (Throwable $setupError) {
     if (!$report['results']) {
       foreach ($groups as $group) {
@@ -12211,11 +12630,11 @@ function page_repair_recipes(mysqli $db, ?array $preview = null): void {
   $postedValues = isset($_POST['repair_value']) && is_array($_POST['repair_value']) ? $_POST['repair_value'] : [];
   $postedTypes = isset($_POST['repair_type']) && is_array($_POST['repair_type']) ? $_POST['repair_type'] : [];
   title_bar('Safe repair recipes', $database, '<a class="btn btn-secondary" href="?page=database"><i class="fa-solid fa-arrow-left me-1"></i>Database home</a> <a class="btn btn-primary" href="?page=repair_recipes&amp;new=1"><i class="fa-solid fa-plus me-1"></i>New recipe</a>');
-  ?><div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i>Each recipe is limited to one simple <code>UPDATE</code> on a transactional table. You must preview it first; updates above the configured row limit are rolled back automatically.</div>
+  ?><div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i>Each recipe updates one transactional table. The preview must show the same rows and every column of a PRIMARY or UNIQUE NOT NULL key. Execution rechecks and locks those identities; changes to the row set or row key block the repair.</div>
   <div class="row g-3"><div class="col-xl-4"><section class="card"><div class="card-header"><strong>Saved recipes</strong></div><div class="list-group list-group-flush"><?php if(!$recipes){?><div class="p-3 text-body-secondary">No repair recipes saved for this database.</div><?php }foreach($recipes as $recipeId=>$entry){?><a class="list-group-item list-group-item-action<?= $recipeId===$id?' active':'' ?>" href="?page=repair_recipes&amp;recipe=<?= h($recipeId) ?>"><i class="fa-solid fa-screwdriver-wrench me-2"></i><?= h($entry['name']) ?><span class="badge text-bg-secondary float-end"><?= h((string)$entry['max_rows']) ?> max</span></a><?php } ?></div></section></div><div class="col-xl-8">
-    <section class="card mb-3"><div class="card-header"><strong><?= $isNew?'Create recipe':'Edit recipe' ?></strong></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_repair_recipe"><input type="hidden" name="recipe_id" value="<?= h($isNew?'':$id) ?>"><?= csrf_field() ?><div class="row g-3"><div class="col-md-8"><label class="form-label">Name</label><input class="form-control" name="recipe_name" value="<?= h($edit['name']) ?>" maxlength="100" required></div><div class="col-md-4"><label class="form-label">Maximum changed rows</label><input class="form-control" type="number" name="max_rows" min="1" max="1000" value="<?= h((string)$edit['max_rows']) ?>" required></div><div class="col-12"><label class="form-label">Preview SELECT</label><textarea class="form-control sql-editor" name="preview_sql" rows="6" required><?= h($edit['preview_sql']) ?></textarea><div class="form-text">It should return exactly the rows the UPDATE is expected to change.</div></div><div class="col-12"><label class="form-label">Repair UPDATE</label><textarea class="form-control sql-editor" name="repair_sql" rows="6" required><?= h($edit['repair_sql']) ?></textarea><div class="form-text">Use named parameters such as <code>:id</code>, <code>:code</code> or <code>:new_value</code>. Only Text, Number and NULL values are accepted.</div></div><div class="col-12 d-flex justify-content-between"><button class="btn btn-primary"><i class="fa-solid fa-floppy-disk me-1"></i>Save recipe</button><?php if(!$isNew){?><button class="btn btn-outline-danger" type="submit" name="action" value="delete_repair_recipe" data-confirm="Delete repair recipe <?= h($edit['name']) ?>?"><i class="fa-solid fa-trash me-1"></i>Delete</button><?php } ?></div></div></form></div></section>
+    <section class="card mb-3"><div class="card-header"><strong><?= $isNew?'Create recipe':'Edit recipe' ?></strong></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_repair_recipe"><input type="hidden" name="recipe_id" value="<?= h($isNew?'':$id) ?>"><?= csrf_field() ?><div class="row g-3"><div class="col-md-8"><label class="form-label">Name</label><input class="form-control" name="recipe_name" value="<?= h($edit['name']) ?>" maxlength="100" required></div><div class="col-md-4"><label class="form-label">Maximum changed rows</label><input class="form-control" type="number" name="max_rows" min="1" max="1000" value="<?= h((string)$edit['max_rows']) ?>" required></div><div class="col-12"><label class="form-label">Preview SELECT</label><textarea class="form-control sql-editor" name="preview_sql" rows="6" required><?= h($edit['preview_sql']) ?></textarea><div class="form-text">Select direct columns from the same table as the UPDATE, including a complete row key. WHERE, ORDER BY and LIMIT n are supported; joins, subqueries and aggregates are blocked.</div></div><div class="col-12"><label class="form-label">Repair UPDATE</label><textarea class="form-control sql-editor" name="repair_sql" rows="6" required><?= h($edit['repair_sql']) ?></textarea><div class="form-text">Use named parameters such as <code>:id</code>, <code>:code</code> or <code>:new_value</code>. Only Text, Number and NULL values are accepted.</div></div><div class="col-12 d-flex justify-content-between"><button class="btn btn-primary"><i class="fa-solid fa-floppy-disk me-1"></i>Save recipe</button><?php if(!$isNew){?><button class="btn btn-outline-danger" type="submit" name="action" value="delete_repair_recipe" data-confirm="Delete repair recipe <?= h($edit['name']) ?>?"><i class="fa-solid fa-trash me-1"></i>Delete</button><?php } ?></div></div></form></div></section>
     <?php if($recipe){?><section class="card mb-3"><div class="card-header"><strong><i class="fa-solid fa-eye me-2"></i>Preview <?= h($recipe['name']) ?></strong></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="preview_repair_recipe"><input type="hidden" name="recipe_id" value="<?= h($id) ?>"><?= csrf_field() ?><?php if(!$parameterNames){?><p class="text-body-secondary">This recipe has no parameters.</p><?php }else{?><div class="row g-3"><?php foreach($parameterNames as $name){$type=(string)($postedTypes[$name]??'text');?><div class="col-md-6"><label class="form-label"><code>:<?= h($name) ?></code></label><div class="input-group"><select class="form-select" name="repair_type[<?= h($name) ?>]" style="max-width:8rem"><option value="text"<?= $type==='text'?' selected':'' ?>>Text</option><option value="number"<?= $type==='number'?' selected':'' ?>>Number</option><option value="null"<?= $type==='null'?' selected':'' ?>>NULL</option></select><input class="form-control code" name="repair_value[<?= h($name) ?>]" value="<?= h((string)($postedValues[$name]??'')) ?>"></div></div><?php } ?></div><?php } ?><button class="btn btn-primary mt-3"><i class="fa-solid fa-magnifying-glass me-1"></i>Preview affected rows</button></form></div></section><?php } ?>
-    <?php if($preview){?><section class="card border-<?= $preview['overflow']?'danger':'warning' ?>"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong>Preview result</strong><span class="badge text-bg-<?= $preview['overflow']?'danger':'secondary' ?>"><?= h(number_format(count($preview['rows']))) ?> shown</span></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><?php foreach($preview['fields'] as $field){?><th><?= h($field) ?></th><?php } ?></tr></thead><tbody><?php foreach($preview['rows'] as $row){?><tr><?php foreach($preview['fields'] as $field){?><td><?= render_value($row[$field]??null,240) ?></td><?php } ?></tr><?php }if(!$preview['rows']){?><tr><td colspan="<?= max(1,count($preview['fields'])) ?>" class="text-center text-body-secondary p-4">No rows match this repair.</td></tr><?php } ?></tbody></table></div><div class="card-footer"><?php if($preview['overflow']){?><div class="text-danger fw-semibold"><i class="fa-solid fa-ban me-1"></i>The preview exceeds the safety limit of <?= h((string)$preview['max_rows']) ?> rows. Execution is blocked.</div><?php }elseif($preview['token']!==''){?><form method="post" class="d-flex flex-wrap justify-content-between align-items-center gap-2"><input type="hidden" name="action" value="execute_repair_recipe"><input type="hidden" name="repair_token" value="<?= h($preview['token']) ?>"><?= csrf_field() ?><span class="text-body-secondary">The preview is valid for 10 minutes and can be executed once.</span><button class="btn btn-warning" data-confirm="Apply this repair to <?= h((string)count($preview['rows'])) ?> previewed row(s)? The transaction will roll back if the changed-row limit is exceeded."><i class="fa-solid fa-bolt me-1"></i>Execute repair</button></form><?php } ?></div></section><?php } ?>
+    <?php if($preview){?><section class="card border-<?= $preview['overflow']?'danger':'warning' ?>"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><strong>Preview result</strong><span class="badge text-bg-<?= $preview['overflow']?'danger':'secondary' ?>"><?= h(number_format(count($preview['rows']))) ?> shown</span></div><div class="table-responsive"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><?php foreach($preview['fields'] as $field){?><th><?= h($field) ?></th><?php } ?></tr></thead><tbody><?php foreach($preview['rows'] as $row){?><tr><?php foreach($preview['fields'] as $field){?><td><?= render_value($row[$field]??null,240) ?></td><?php } ?></tr><?php }if(!$preview['rows']){?><tr><td colspan="<?= max(1,count($preview['fields'])) ?>" class="text-center text-body-secondary p-4">No rows match this repair.</td></tr><?php } ?></tbody></table></div><div class="card-footer"><?php if($preview['overflow']){?><div class="text-danger fw-semibold"><i class="fa-solid fa-ban me-1"></i>The preview exceeds the safety limit of <?= h((string)$preview['max_rows']) ?> rows. Execution is blocked.</div><?php }elseif($preview['token']!==''){?><form method="post" class="d-flex flex-wrap justify-content-between align-items-center gap-2"><input type="hidden" name="action" value="execute_repair_recipe"><input type="hidden" name="repair_token" value="<?= h($preview['token']) ?>"><?= csrf_field() ?><span class="text-body-secondary">The preview is valid for 10 minutes and can be executed once. Its row identities are rechecked before any update.</span><button class="btn btn-warning" data-confirm="Apply this repair to <?= h((string)count($preview['rows'])) ?> previewed row(s)? Execution is blocked if the row identities changed, and the transaction rolls back if the changed-row limit is exceeded."><i class="fa-solid fa-bolt me-1"></i>Execute repair</button></form><?php } ?></div></section><?php } ?>
   </div></div><?php
 }
 
