@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.18.1';
+const MS_VERSION = '1.19.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -3047,6 +3047,15 @@ function ms_diagnostics_run(): array {
       $match = $maps['parent_code']['A'] ?? [];
       return ['children'=>(int)($children['n'] ?? -1),'display'=>(string)($match['display'] ?? ''),'ambiguous'=>(bool)($match['ambiguous'] ?? true)];
     });
+    ms_diagnostics_add_case($report['results'], $groups[4], 'Virtual FK formats multiple fields and keeps row identity', 'Lookup parents by code with a display template', ['format'=>'%1 (%2/%3)'], ['display'=>'Alpha (A/1)','identity'=>'1','five'=>'Alpha|A|1||0','literal'=>'%2 (A)','legacy'=>'Alpha'], static function () use ($diag): array {
+      $rule = ['table'=>'parents','id_column'=>'code','value_columns'=>['label','code','id'],'display_format'=>'%1 (%2/%3)'];
+      $maps = ms_soft_fk_maps($diag, [['parent_code'=>'A']], ['parent_code'=>$rule]);
+      $match = $maps['parent_code']['A'] ?? [];
+      return ['display'=>ms_soft_fk_display('A', $match),'identity'=>(string)($match['identity']['id'] ?? ''),
+        'five'=>ms_soft_fk_format(['value_columns'=>['label','code','id','missing','zero'],'display_format'=>'%1|%2|%3|%4|%5'], ['label'=>'Alpha','code'=>'A','id'=>1,'zero'=>0]),
+        'literal'=>ms_soft_fk_format(['value_columns'=>['label','code'],'display_format'=>'%1 (%2)'], ['label'=>'%2','code'=>'A']),
+        'legacy'=>ms_soft_fk_format(['value_column'=>'label'], ['label'=>'Alpha'])];
+    });
     ms_diagnostics_add_case($report['results'], $groups[4], 'Virtual-key identity targets one no-PK row', 'SELECT COUNT(*) FROM virtual_rows WHERE <all-column identity>', ['code'=>'vk1','value'=>'one'], 1, static function () use ($diag): int {
       $before = $_GET;
       try {
@@ -3227,6 +3236,45 @@ function ms_insight_duplicates(mysqli $db, string $table, array $names, array $c
 }
 
 
+function ms_soft_fk_value_columns(array $rule): array {
+  $columns = $rule['value_columns'] ?? [$rule['value_column'] ?? ''];
+  return is_array($columns) ? array_slice(array_values($columns), 0, 5) : [];
+}
+
+function ms_soft_fk_format(array $rule, array $row): string {
+  $replace = array_fill_keys(['%1', '%2', '%3', '%4', '%5'], '');
+  foreach (ms_soft_fk_value_columns($rule) as $index => $column) {
+    $replace['%' . ($index + 1)] = (string)($row[$column] ?? '');
+  }
+  $format = (string)($rule['display_format'] ?? '%1');
+  return strtr($format === '' ? '%1' : $format, $replace);
+}
+
+function ms_soft_fk_post_rule(mysqli $db): array {
+  $table = p('soft_fk_table');
+  $id = p('soft_fk_id_column');
+  if ($table === '' || !table_exists($db, $table)) {
+    throw new RuntimeException('Choose a valid target table or view.');
+  }
+  $available = array_column(table_columns($db, $table), 'COLUMN_NAME');
+  $columns = [p('soft_fk_value_column')];
+  $ended = false;
+  for ($i = 2; $i <= 5; $i++) {
+    $column = p('soft_fk_value_column_' . $i);
+    if ($column === '') { $ended = true; continue; }
+    if ($ended) throw new RuntimeException('Choose display fields in order, without gaps.');
+    $columns[] = $column;
+  }
+  if (!in_array($id, $available, true)) throw new RuntimeException('Choose a valid ID column.');
+  foreach ($columns as $column) {
+    if ($column === '' || !in_array($column, $available, true)) throw new RuntimeException('Choose valid display fields.');
+  }
+  $format = p('soft_fk_display_format', '%1');
+  if ($format === '') $format = '%1';
+  if (strlen($format) > 2000) throw new RuntimeException('Display format must be at most 2000 bytes.');
+  return ['table' => $table, 'id_column' => $id, 'value_column' => $columns[0], 'value_columns' => $columns, 'display_format' => $format];
+}
+
 function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
   $maps = [];
   if (!$rows || !$rules) {
@@ -3238,12 +3286,12 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     }
     $targetTable = (string)($rule['table'] ?? '');
     $idColumn = (string)($rule['id_column'] ?? '');
-    $valueColumn = (string)($rule['value_column'] ?? '');
-    if ($targetTable === '' || $idColumn === '' || $valueColumn === '' || !table_exists($db, $targetTable)) {
+    $valueColumns = ms_soft_fk_value_columns($rule);
+    if ($targetTable === '' || $idColumn === '' || !$valueColumns || $valueColumns[0] === '' || !table_exists($db, $targetTable)) {
       continue;
     }
     $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
-    if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
+    if (!in_array($idColumn, $targetColumns, true) || array_diff($valueColumns, $targetColumns)) {
       continue;
     }
     $primary = primary_columns($db, $targetTable);
@@ -3262,16 +3310,17 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     foreach ($values as $value) {
       $quoted[] = qs($db, $value);
     }
-    $selectedColumns = array_values(array_unique(array_merge([$idColumn, $valueColumn], $identityColumns)));
+    $selectedColumns = array_values(array_unique(array_merge([$idColumn], $valueColumns, $identityColumns)));
     $lookup = db_all($db, 'SELECT ' . implode(', ', array_map('qi', $selectedColumns)) . ' FROM ' . qi($targetTable) .
       ' WHERE ' . qi($idColumn) . ' IN (' . implode(', ', $quoted) . ')');
     $map = [];
     foreach ($lookup as $targetRow) {
+      $display = ms_soft_fk_format($rule, $targetRow);
       $key = (string)($targetRow[$idColumn] ?? '');
       if (array_key_exists($key, $map)) {
         // A non-unique lookup value does not identify a specific target row.
-        if (trim((string)($map[$key]['display'] ?? '')) === '' && trim((string)($targetRow[$valueColumn] ?? '')) !== '') {
-          $map[$key]['display'] = $targetRow[$valueColumn];
+        if (trim((string)($map[$key]['display'] ?? '')) === '' && trim($display) !== '') {
+          $map[$key]['display'] = $display;
         }
         $map[$key]['identity'] = null;
         $map[$key]['ambiguous'] = true;
@@ -3279,7 +3328,7 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
       }
       $identity = [];
       foreach ($identityColumns as $identityColumn) $identity[$identityColumn] = $targetRow[$identityColumn] ?? null;
-      $map[$key] = ['display' => $targetRow[$valueColumn] ?? null, 'identity' => $identity, 'ambiguous' => false];
+      $map[$key] = ['display' => $display, 'identity' => $identity, 'ambiguous' => false];
     }
     $maps[$sourceColumn] = $map;
   }
@@ -5912,21 +5961,7 @@ try {
           ms_column_view_set_image($database, $configTable, $configColumn, null);
           go([], 'Image display removed from ' . $configTable . '.' . $configColumn . '.');
         } elseif ($action === 'column_view_soft_fk_save') {
-          $targetTable = p('soft_fk_table');
-          $idColumn = p('soft_fk_id_column');
-          $valueColumn = p('soft_fk_value_column');
-          if ($targetTable === '' || !table_exists($db, $targetTable)) {
-            throw new RuntimeException('Choose a valid target table or view.');
-          }
-          $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
-          if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
-            throw new RuntimeException('Choose valid ID and display-value columns.');
-          }
-          ms_column_view_set_soft_fk($database, $configTable, $configColumn, [
-            'table' => $targetTable,
-            'id_column' => $idColumn,
-            'value_column' => $valueColumn
-          ]);
+          ms_column_view_set_soft_fk($database, $configTable, $configColumn, ms_soft_fk_post_rule($db));
           go([], 'Soft foreign key configured for ' . $configTable . '.' . $configColumn . '.');
         } elseif ($action === 'column_view_soft_fk_remove') {
           ms_column_view_set_soft_fk($database, $configTable, $configColumn, null);
@@ -6043,17 +6078,7 @@ try {
             $saveSoftDeleteRule();
             go([], $configTable . '.' . $configColumn . ' image display saved' . ($hideColumn ? ' and column hidden.' : '.'));
           } elseif ($style === 'soft_fk') {
-            $targetTable = p('soft_fk_table');
-            $idColumn = p('soft_fk_id_column');
-            $valueColumn = p('soft_fk_value_column');
-            if ($targetTable === '' || !table_exists($db, $targetTable)) {
-              throw new RuntimeException('Choose a valid target table or view.');
-            }
-            $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
-            if (!in_array($idColumn, $targetColumns, true) || !in_array($valueColumn, $targetColumns, true)) {
-              throw new RuntimeException('Choose valid ID and display-value columns.');
-            }
-            ms_column_view_set_soft_fk($database, $configTable, $configColumn, ['table' => $targetTable, 'id_column' => $idColumn, 'value_column' => $valueColumn]);
+            ms_column_view_set_soft_fk($database, $configTable, $configColumn, ms_soft_fk_post_rule($db));
             ms_column_view_hide($database, $configTable, $configColumn, $hideColumn);
             $saveSoftDeleteRule();
             go([], 'Virtual foreign key saved for ' . $configTable . '.' . $configColumn . ($hideColumn ? ' and column hidden.' : '.'));
@@ -10461,7 +10486,7 @@ function page_select(mysqli $db): void {
       $enumJson=json_encode($enumValues,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);if(!is_string($enumJson))$enumJson='[]';
       $isSoftDeleteColumn=$softDeleteRule!==null&&$softDeleteRule['column']===$header;
       $headerSort=$header===$primaryOrderColumn?$primaryOrderDirection:'none';
-      ?><th<?php if(!$aggregated){ ?> tabindex="0" aria-sort="<?= $headerSort ?>" title="<?= h($prettyEdit?'Column settings: '.$visibleHeader:'Sort '.$visibleHeader.' '.($headerSort==='ascending'?'descending':'ascending')) ?>" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span><?php if($headerSort!=='none'){ ?><span class="ms-col-header-sort" aria-hidden="true"><i class="fa-solid fa-arrow-<?= $headerSort==='ascending'?'up':'down' ?>"></i></span><?php } ?></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
+      ?><th<?php if(!$aggregated){ ?> tabindex="0" aria-sort="<?= $headerSort ?>" title="<?= h($prettyEdit?'Column settings: '.$visibleHeader:'Sort '.$visibleHeader.' '.($headerSort==='ascending'?'descending':'ascending')) ?>" data-ms-column="<?= h($header) ?>" data-ms-hidden="<?= !empty($storedHiddenColumns[$header]) ? '1' : '0' ?>" data-ms-display-label="<?= h($storedDisplayLabel) ?>" data-ms-display-kind="<?= h((string)($storedFormatRule['kind']??'')) ?>" data-ms-display-format="<?= h((string)($storedFormatRule['format']??'')) ?>" data-ms-format-rule="<?= h(base64_encode($storedFormatJson)) ?>" data-ms-money-currency="<?= h((string)($storedFormatRule['currency']??'')) ?>" data-ms-money-decimals="<?= h((string)($storedFormatRule['decimals']??2)) ?>" data-ms-image-base="<?= h((string)($storedImageRule['base_url']??'')) ?>" data-ms-image-width="<?= h((string)($storedImageRule['width']??96)) ?>" data-ms-soft-table="<?= h((string)($storedSoftRule['table']??'')) ?>" data-ms-soft-id="<?= h((string)($storedSoftRule['id_column']??'')) ?>" data-ms-soft-value="<?= h((string)($storedSoftRule['value_column']??'')) ?>" data-ms-soft-values="<?= h((string)json_encode(ms_soft_fk_value_columns($storedSoftRule))) ?>" data-ms-soft-format="<?= h((string)($storedSoftRule['display_format']??'%1')) ?>" data-ms-alignment="<?= h($storedAlignment) ?>" data-ms-header-alignment="<?= h($storedHeaderAlignment) ?>" data-ms-fixed-font="<?= !empty($storedFixedFontRules[$header])?'1':'0' ?>" data-ms-soft-delete-enabled="<?= $isSoftDeleteColumn?'1':'0' ?>" data-ms-soft-delete-value="<?= $isSoftDeleteColumn?h($softDeleteRule['value']):'' ?>" data-ms-enum-values="<?= h($enumJson) ?>"<?php } ?><?= (!$aggregated&&$headerClasses)?' class="'.h(implode(' ',$headerClasses)).'"':'' ?>><?php if(!$aggregated){ ?><span class="ms-col-header-main"><span class="ms-col-drag-handle" draggable="<?= $prettyEdit?'true':'false' ?>" data-ms-column-drag-handle<?php if($prettyEdit){ ?> title="Drag to move column" aria-label="Drag <?= h($header) ?> to move column"<?php } ?>><i class="fa-solid fa-grip-vertical" aria-hidden="true"></i></span><span class="ms-col-header-name" data-ms-column-view<?php if($prettyEdit){ ?> tabindex="0" role="button" title="Database field: <?= h($header) ?> · Click for column settings" aria-label="Column settings for <?= h($header) ?>"<?php } ?>><?= h($visibleHeader) ?></span><?php if($headerSort!=='none'){ ?><span class="ms-col-header-sort" aria-hidden="true"><i class="fa-solid fa-arrow-<?= $headerSort==='ascending'?'up':'down' ?>"></i></span><?php } ?></span><span class="ms-col-resizer" data-ms-col-resizer title="Drag to resize"></span><?php } else { ?><?= h($header) ?><?php } ?></th><?php
     }
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
@@ -11051,7 +11076,13 @@ function page_select(mysqli $db): void {
         <div class="border rounded p-3 mt-3" data-ms-display-section="soft_fk" hidden>
           <p class="text-body-secondary small mb-3">Display this field through another table without creating a real MySQL constraint. The displayed value remains clickable and opens the matching target row.</p>
           <label class="form-label" for="ms-soft-fk-table">Target table / view</label><select class="form-select" id="ms-soft-fk-table" name="soft_fk_table"><option value="">Choose…</option><?php foreach($softTargetTables as $targetTable){?><option value="<?= h($targetTable) ?>"><?= h($targetTable) ?></option><?php }?></select>
-          <div class="row g-3 mt-1"><div class="col-md-6"><label class="form-label" for="ms-soft-fk-id">Target ID column</label><select class="form-select" id="ms-soft-fk-id" name="soft_fk_id_column" disabled><option value="">Choose table first…</option></select></div><div class="col-md-6"><label class="form-label" for="ms-soft-fk-value">Field to display</label><select class="form-select" id="ms-soft-fk-value" name="soft_fk_value_column" disabled><option value="">Choose table first…</option></select></div></div>
+          <div class="row g-3 mt-1"><div class="col-md-6"><label class="form-label" for="ms-soft-fk-id">Target ID column</label><select class="form-select" id="ms-soft-fk-id" name="soft_fk_id_column" disabled><option value="">Choose table first…</option></select></div></div>
+          <div class="row g-3 mt-1">
+            <?php for ($n=1;$n<=5;$n++){ $suffix=$n===1?'':'-'.$n; ?>
+            <div class="col-md-6" data-ms-soft-field hidden><label class="form-label" for="ms-soft-fk-value<?= $suffix ?>">Field to display <code>%<?= $n ?></code></label><select class="form-select" id="ms-soft-fk-value<?= $suffix ?>" name="soft_fk_value_column<?= $n===1?'':'_'.$n ?>" disabled><option value="">Choose…</option></select></div>
+            <?php } ?>
+          </div>
+          <div class="mt-3"><label class="form-label" for="ms-soft-fk-format">Display format</label><input class="form-control font-monospace" id="ms-soft-fk-format" name="soft_fk_display_format" value="%1" maxlength="2000"><div class="form-text">Default: <code>%1</code>. Example: <code>%1 (%2/%3)</code> displays the first field followed by the second and third in parentheses, e.g. <code>John (London/UK)</code>. Unselected fields are empty.</div></div>
           <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>This is display-only. MySQL referential integrity is not changed.</div>
         </div>
 
@@ -11088,7 +11119,19 @@ function page_select(mysqli $db): void {
     const downloadBase=document.getElementById('ms-download-base-url');
     const softTable=document.getElementById('ms-soft-fk-table');
     const softId=document.getElementById('ms-soft-fk-id');
-    const softValue=document.getElementById('ms-soft-fk-value');
+    const softValues=Array.from(viewModal.querySelectorAll('[data-ms-soft-field] select'));
+    const softFormat=document.getElementById('ms-soft-fk-format');
+    let softRequest=0;
+    const updateSoftFields=()=>{
+      let visible=!!softTable.value&&!softId.disabled;
+      softValues.forEach(select=>{
+        select.closest('[data-ms-soft-field]').hidden=!visible;
+        select.disabled=!visible;
+        if(!visible)select.value='';
+        visible=visible&&select.value!=='';
+      });
+    };
+    softValues.forEach(select=>select.addEventListener('change',updateSoftFields));
     const softDeleteEnabled=document.getElementById('ms-soft-delete-enabled');
     const softDeleteOptions=viewModal.querySelector('[data-ms-soft-delete-options]');
     const softDeleteEnumWrap=viewModal.querySelector('[data-ms-soft-delete-enum-wrap]');
@@ -11103,17 +11146,24 @@ function page_select(mysqli $db): void {
     const decodeFormatRule=header=>{try{const encoded=header.dataset.msFormatRule||'';if(!encoded)return{};const bytes=Uint8Array.from(atob(encoded),char=>char.charCodeAt(0));const parsed=JSON.parse(new TextDecoder().decode(bytes));return parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:{};}catch(error){return{};}};
     const setField=(name,value)=>{const field=viewForm.elements.namedItem(name);if(!field)return;if(field.type==='checkbox')field.checked=!!value;else if(value!==undefined&&value!==null)field.value=String(value);};
     const fillColumnSelect=(select,columns,selected)=>{select.innerHTML='<option value="">Choose…</option>';columns.forEach(column=>{const option=document.createElement('option');option.value=column;option.textContent=column;if(column===selected)option.selected=true;select.appendChild(option);});select.disabled=false;};
-    const loadSoftColumns=async(table,idSelected='',valueSelected='')=>{
-      softId.disabled=true;softValue.disabled=true;
-      if(!table){softId.innerHTML='<option value="">Choose table first…</option>';softValue.innerHTML='<option value="">Choose table first…</option>';return;}
-      softId.innerHTML='<option>Loading…</option>';softValue.innerHTML='<option>Loading…</option>';
+    const loadSoftColumns=async(table,idSelected='',values=[])=>{
+      const request=++softRequest;
+      softId.disabled=true;
+      softId.innerHTML='<option value="">Choose table first…</option>';
+      softValues.forEach(select=>{select.innerHTML='<option value="">Choose…</option>';select.disabled=true;select.closest('[data-ms-soft-field]').hidden=true;});
+      if(!table)return;
+      softId.innerHTML='<option value="">Loading…</option>';
       try{
         const response=await fetch(`?ajax=soft_fk_columns&table=${encodeURIComponent(table)}`,{credentials:'same-origin',headers:{'Accept':'application/json'}});
-        const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'Unable to load columns.');
+        const data=await response.json();
+        if(request!==softRequest)return;
+        if(!response.ok||!data.ok)throw new Error(data.error||'Unable to load columns.');
         const columns=data.columns||[];
         const defaultId=idSelected!==''?idSelected:(columns.includes('id')?'id':'');
-        fillColumnSelect(softId,columns,defaultId);fillColumnSelect(softValue,columns,valueSelected);
-      }catch(error){softId.innerHTML='<option value="">Unable to load</option>';softValue.innerHTML='<option value="">Unable to load</option>';softId.disabled=true;softValue.disabled=true;alert(error.message||'Unable to load target columns.');}
+        fillColumnSelect(softId,columns,defaultId);
+        softValues.forEach((select,index)=>fillColumnSelect(select,columns,values[index]||''));
+        updateSoftFields();
+      }catch(error){if(request!==softRequest)return;softId.innerHTML='<option value="">Unable to load</option>';softId.disabled=true;updateSoftFields();alert(error.message||'Unable to load target columns.');}
     };
     const updateSections=()=>{
       const style=displayStyle.value;
@@ -11178,12 +11228,15 @@ function page_select(mysqli $db): void {
       setField('unit_prefix',rule.prefix||'');setField('unit_suffix',rule.suffix||'');setField('unit_decimals',rule.decimals!==undefined?rule.decimals:2);setField('unit_group',rule.group!==undefined?rule.group:true);
       setField('ip_lookup',rule.lookup);setField('null_label',rule.null_label||'NULL');setField('empty_label',rule.empty_label||'EMPTY');setField('masked_keep_last',rule.keep_last!==undefined?rule.keep_last:4);
       imageBase.value=header.dataset.msImageBase||'';imageWidth.value=header.dataset.msImageWidth||'96';
-      const target=header.dataset.msSoftTable||'',id=header.dataset.msSoftId||'',value=header.dataset.msSoftValue||'';
-      softTable.value=target;softId.dataset.selected=id;softValue.dataset.selected=value;
-      if(style!=='soft_fk'){softId.innerHTML='<option value="">Choose table first…</option>';softValue.innerHTML='<option value="">Choose table first…</option>';softId.disabled=true;softValue.disabled=true;}
+      const target=header.dataset.msSoftTable||'',id=header.dataset.msSoftId||'';
+      let values=[];try{values=JSON.parse(header.dataset.msSoftValues||'[]');}catch(error){}
+      if(!Array.isArray(values)||!values.length)values=[header.dataset.msSoftValue||''];
+      softTable.value=target;softFormat.value=header.dataset.msSoftFormat||'%1';
+      ++softRequest;
+      softId.disabled=true;updateSoftFields();
       updateSections();
       bootstrap.Modal.getOrCreateInstance(viewModal).show();
-      if(style==='soft_fk')await loadSoftColumns(target,id,value);
+      await loadSoftColumns(target,id,values);
       setTimeout(()=>displayStyle.focus(),150);
     };
     document.querySelectorAll('[data-ms-column-view]').forEach(trigger=>{
@@ -11194,8 +11247,8 @@ function page_select(mysqli $db): void {
     hideColumn.addEventListener('change',updateHideLabel);
     softDeleteEnabled.addEventListener('change',updateSoftDeleteFields);
     softDeleteEmpty.addEventListener('change',updateSoftDeleteFields);
-    displayStyle.addEventListener('change',()=>{updateSections();if(displayStyle.value==='soft_fk')loadSoftColumns(softTable.value,softId.dataset.selected||'',softValue.dataset.selected||'');});
-    softTable.addEventListener('change',()=>{softId.dataset.selected='';softValue.dataset.selected='';loadSoftColumns(softTable.value);});
+    displayStyle.addEventListener('change',updateSections);
+    softTable.addEventListener('change',()=>loadSoftColumns(softTable.value));
   });
   </script>
   <?php ms_render_json_viewer_modal(); ?>
@@ -12690,7 +12743,7 @@ function render_column_display_settings(): void {
     <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-tag me-2"></i>Custom field names</strong></div><div class="card-body p-0"><?php if(!$labels){?><div class="p-3 text-body-secondary">No custom field names.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Database field</th><th>Displayed name</th></tr></thead><tbody><?php foreach($labels as [$table,$column,$label]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h($label) ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-align-left me-2"></i>Alignment / fixed font</strong></div><div class="card-body p-0"><?php if(!$presentations){?><div class="p-3 text-body-secondary">All column names and cells use left alignment and the normal interface font.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>Cell alignment</th><th>Column name alignment</th><th>Fixed font</th></tr></thead><tbody><?php foreach($presentations as [$table,$column,$alignment,$headerAlignment,$fixedFont]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td><?= h(ucfirst($alignment)) ?></td><td><?= h(ucfirst($headerAlignment)) ?></td><td><?= $fixedFont?'Yes':'No' ?></td></tr><?php }?></tbody></table></div><?php }?></div></div>
     <div class="card mb-3" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-image me-2"></i>Image columns</strong></div><div class="card-body p-0"><?php if(!$images){?><div class="p-3 text-body-secondary">No image display rules.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Table</th><th>Column</th><th>URL prefix</th><th>Width</th><th></th></tr></thead><tbody><?php foreach($images as [$table,$column,$rule]){?><tr><td><?= h($table) ?></td><td class="code"><?= h($column) ?></td><td class="code text-break"><?= h((string)($rule['base_url']??'')) ?></td><td><?= h((string)($rule['width']??96)) ?> px</td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_image_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove image display for this column?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div>
-    <div class="card" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h((string)($rule['value_column']??'')) ?></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
+    <div class="card" data-ms-settings-collapsible><div class="card-header"><strong><i class="fa-solid fa-link me-2"></i>Soft foreign keys</strong></div><div class="card-body p-0"><?php if(!$softFks){?><div class="p-3 text-body-secondary">No soft foreign keys.</div><?php }else{?><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Source</th><th>Target table</th><th>ID column</th><th>Display column</th><th></th></tr></thead><tbody><?php foreach($softFks as [$table,$column,$rule]){?><tr><td><span class="code"><?= h($table.'.'.$column) ?></span></td><td><?= h((string)($rule['table']??'')) ?></td><td class="code"><?= h((string)($rule['id_column']??'')) ?></td><td class="code"><?= h(implode(', ', ms_soft_fk_value_columns($rule))) ?><div class="small text-body-secondary"><?= h((string)($rule['display_format']??'%1')) ?></div></td><td class="text-end"><form method="post" class="d-inline"><input type="hidden" name="action" value="column_view_soft_fk_remove"><input type="hidden" name="config_table" value="<?= h($table) ?>"><input type="hidden" name="config_column" value="<?= h($column) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Remove this soft foreign key?"><i class="fa-solid fa-xmark me-1"></i>Remove</button></form></td></tr><?php }?></tbody></table></div><?php }?></div></div><?php
   }
   ?></div></section><?php
 }
