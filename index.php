@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.19.1';
+const MS_VERSION = '1.19.2';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -11795,12 +11795,29 @@ function page_row(mysqli $db): void {
     return;
   }
 
+  // Successful saves redirect. A save POST reaching this form failed: use the
+  // submitted strings and toggles, not database values or insert defaults.
+  $retrySave = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && p('action') === 'save_row';
+  $postedValues = $retrySave && is_array($_POST['value'] ?? null) ? $_POST['value'] : [];
+  $postedNulls = $retrySave && is_array($_POST['is_null'] ?? null) ? $_POST['is_null'] : [];
+  $postedExpressions = $retrySave && is_array($_POST['expression'] ?? null) ? $_POST['expression'] : [];
+  $postedKeepBlobs = $retrySave && is_array($_POST['keep_blob'] ?? null) ? $_POST['keep_blob'] : [];
+  $existingValues = $values;
+  if ($retrySave) {
+    foreach ($columns as $column) {
+      $name = (string)$column['COLUMN_NAME'];
+      if (strpos((string)$column['EXTRA'], 'GENERATED') === false && isset($postedValues[$name]) && is_scalar($postedValues[$name])) {
+        $values[$name] = (string)$postedValues[$name];
+      }
+    }
+  }
+
   $titleVerb = $mode === 'edit' ? 'Edit' : ($mode === 'clone' ? 'Clone' : 'Insert');
   $subtitle = $mode === 'clone'
     ? 'Review the copied values before creating the new row. Auto-increment fields are cleared.'
     : 'Literal values are validated according to their MySQL type. Enable SQL expression to enter raw SQL.';
   title_bar($titleVerb . ' row: ' . $table, $subtitle);
-  ?><form method="post" enctype="multipart/form-data" data-ms-row-form>
+  ?><form method="post" enctype="multipart/form-data" data-ms-row-form data-ms-retry-save="<?= $retrySave ? '1' : '0' ?>">
     <input type="hidden" name="action" value="save_row">
     <input type="hidden" name="identity" value="<?= h($identity === null ? '' : encode_identity($identity)) ?>">
     <?php if ($mode === 'clone' && is_array($sourceIdentity)) { ?><input type="hidden" name="clone_source" value="<?= h(encode_identity($sourceIdentity)) ?>"><?php } ?>
@@ -11812,14 +11829,16 @@ function page_row(mysqli $db): void {
       $generated = strpos((string)$column['EXTRA'], 'GENERATED') !== false;
       $binary = preg_match('/blob|binary/i', (string)$column['DATA_TYPE']) === 1;
       $spec = ms_column_edit_spec($column);
-      $currentIsNull = in_array($mode, ['edit','clone'], true) && array_key_exists($name, $values) && $values[$name] === null;
+      $currentIsNull = $retrySave ? isset($postedNulls[$name]) : (in_array($mode, ['edit','clone'], true) && array_key_exists($name, $values) && $values[$name] === null);
+      $uploadedOnRetry = $retrySave && isset($_FILES['upload']['error'][$name]) && (int)$_FILES['upload']['error'][$name] !== UPLOAD_ERR_NO_FILE;
       ?><tr data-ms-field-row><td><strong><?= h($name) ?></strong><?php if ($column['COLUMN_KEY']) { ?><span class="badge text-bg-primary ms-1"><?= h($column['COLUMN_KEY']) ?></span><?php } ?></td><td class="code small"><?= h($column['COLUMN_TYPE']) ?></td><td>
       <?php if ($generated) { ?>
         <span class="text-body-secondary">Generated automatically</span>
       <?php } elseif ($binary) { ?>
-        <?php if (in_array($mode, ['edit','clone'], true) && array_key_exists($name, $values) && $values[$name] !== null) { ?><div class="small mb-1"><?= h(strlen((string)$values[$name])) ?> existing bytes</div><?php } ?>
+        <?php if (in_array($mode, ['edit','clone'], true) && array_key_exists($name, $existingValues) && $existingValues[$name] !== null) { ?><div class="small mb-1"><?= h(strlen((string)$existingValues[$name])) ?> existing bytes</div><?php } ?>
         <input class="form-control mb-1" type="file" name="upload[<?= h($name) ?>]">
-        <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="2" placeholder="Or enter textual bytes"></textarea>
+        <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="2" placeholder="Or enter textual bytes"><?= h($retrySave && isset($postedValues[$name]) && is_scalar($postedValues[$name]) ? (string)$postedValues[$name] : '') ?></textarea>
+        <?php if ($uploadedOnRetry) { ?><div class="form-text text-warning">Please select the upload again before saving; browsers cannot restore file inputs.</div><?php } ?>
       <?php } elseif (in_array($column['DATA_TYPE'], ['text','mediumtext','longtext'], true)) { ?>
         <textarea class="form-control code" name="value[<?= h($name) ?>]" rows="4"><?= h($values[$name] ?? '') ?></textarea>
       <?php } elseif ($column['DATA_TYPE'] === 'json') { ?>
@@ -11840,8 +11859,8 @@ function page_row(mysqli $db): void {
         <?php if ($spec['help'] !== '') { ?><div class="form-text"><?= h($spec['help']) ?><?= in_array($spec['kind'], ['date','datetime'], true) ? ' · switch between typing and the native picker' : '' ?></div><?php } ?>
       <?php } ?></td><td><?php if (!$generated) { ?>
         <label class="d-block"><input class="form-check-input" type="checkbox" name="is_null[<?= h($name) ?>]" data-ms-null<?= $currentIsNull ? ' checked' : '' ?>> NULL</label>
-        <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]" data-ms-expression> SQL expression</label>
-        <?php if ($binary && in_array($mode, ['edit','clone'], true)) { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]" checked> <?= $mode === 'clone' ? 'Copy existing BLOB' : 'Keep existing' ?></label><?php } ?>
+        <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]" data-ms-expression<?= $retrySave && !empty($postedExpressions[$name]) ? ' checked' : '' ?>> SQL expression</label>
+        <?php if ($binary && in_array($mode, ['edit','clone'], true)) { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]"<?= (!$retrySave || isset($postedKeepBlobs[$name]) && !$uploadedOnRetry) ? ' checked' : '' ?>> <?= $mode === 'clone' ? 'Copy existing BLOB' : 'Keep existing' ?></label><?php } ?>
       <?php } ?></td></tr>
     <?php } ?>
     </tbody></table></div></div>
@@ -12137,7 +12156,7 @@ function page_row(mysqli $db): void {
       setPickerMode(row, false);
     });
 
-    const syncField = row => {
+    const syncField = (row, preserveValue = false) => {
       const input = row.querySelector('[data-ms-smart-input]');
       if (!input) return;
       const nullToggle = row.querySelector('[data-ms-null]');
@@ -12155,7 +12174,7 @@ function page_row(mysqli $db): void {
       }
       input.classList.toggle('border-warning', isExpression && !isNull);
       input.classList.toggle('font-monospace', isExpression);
-      if (!isExpression && !isNull) {
+      if (!preserveValue && !isExpression && !isNull) {
         const next = sanitize(input);
         if (next !== input.value) input.value = next;
       }
@@ -12187,7 +12206,7 @@ function page_row(mysqli $db): void {
       const expressionToggle = row.querySelector('[data-ms-expression]');
       if (nullToggle) nullToggle.addEventListener('change', () => syncField(row));
       if (expressionToggle) expressionToggle.addEventListener('change', () => syncField(row));
-      syncField(row);
+      syncField(row, form.dataset.msRetrySave === '1');
     });
 
     form.addEventListener('submit', event => {
