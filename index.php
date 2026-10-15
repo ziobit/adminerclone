@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.19.0';
+const MS_VERSION = '1.19.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -10640,6 +10640,7 @@ function page_select(mysqli $db): void {
     $insightColumnsJson=json_encode($insightColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';
   ?>
     <div id="ms-insight-context-menu" class="dropdown-menu ms-insight-menu no-print" role="menu" hidden>
+      <button class="dropdown-item" type="button" role="menuitem" data-ms-column-like-search><i class="fa-solid fa-magnifying-glass me-2" aria-hidden="true"></i>Search LIKE %%</button>
       <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="analyze"><i class="fa-solid fa-chart-simple me-2" aria-hidden="true"></i>Analyze column</button>
       <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="duplicates"><i class="fa-solid fa-clone me-2" aria-hidden="true"></i>Find duplicates</button>
     </div>
@@ -10711,6 +10712,40 @@ function page_select(mysqli $db): void {
     document.addEventListener('keydown',event=>{if(event.key==='Escape')closeMenu();});
     window.addEventListener('scroll',closeMenu,true);
     window.addEventListener('resize',closeMenu);
+    menu.querySelector('[data-ms-column-like-search]').addEventListener('click',async()=>{
+      const searchColumn=column;
+      closeMenu();
+      const form=document.getElementById('ms-query-builder-form');
+      if(!form||!window.Swal)return;
+      const existingColumns=Array.from(form.querySelectorAll('[name="filter_col[]"]'));
+      const existingIndex=existingColumns.findIndex(input=>input.value===searchColumn);
+      const existingOperators=form.querySelectorAll('[name="filter_op[]"]');
+      const existingValues=form.querySelectorAll('[name="filter_val[]"]');
+      const initial=existingIndex>=0&&existingOperators[existingIndex]?.value==='contains'?existingValues[existingIndex]?.value||'':'';
+      const answer=await window.Swal.fire({
+        titleText:'Search LIKE %%',
+        text:'Search column “'+searchColumn+'” for text anywhere in its value. This replaces the current search filters.',
+        input:'text',
+        inputLabel:'Text to search for',
+        inputValue:initial,
+        inputPlaceholder:'Enter your search text',
+        inputAutoTrim:false,
+        showCancelButton:true,
+        confirmButtonText:'Search',
+        cancelButtonText:'Cancel',
+        inputValidator:value=>value.length===0?'Enter text to search for.':undefined
+      });
+      if(!answer.isConfirmed)return;
+      const params=new URLSearchParams(new FormData(form));
+      Array.from(params.keys()).forEach(key=>{
+        if(/^filter_(col|op|val|val_to|unit)(\[.*\])?$/.test(key)||['global_search','duplicate_group','aggregate','aggregate_column','group_column','show_all','p'].includes(key))params.delete(key);
+      });
+      params.set('page','select');params.set('table',table.dataset.msTable||'');
+      params.append('filter_col[]',searchColumn);
+      params.append('filter_op[]','contains');
+      params.append('filter_val[]',String(answer.value));
+      window.location.assign('?'+params.toString());
+    });
     const showStatus=(message,error=false)=>{status.className=error?'alert alert-danger':'small text-body-secondary mb-2';status.textContent=message;};
     const statCard=(label,value,detail,token)=>{
       const card=element('div','col-sm-6 col-lg-3');
