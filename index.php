@@ -1,7 +1,7 @@
 <?php
 /**
- * MySQL Studio - single-file MySQL/MariaDB administration application.
- * PHP 7.4+, mysqli, no framework. Independent implementation based on the
+ * MySQL Studio - single-file MySQL/MariaDB and SQLite administration application.
+ * PHP 7.4+, mysqli (MySQL) or PDO_SQLite (SQLite), no framework. Independent implementation based on the
  * public Adminer feature list; this file contains no Adminer source code.
  *
  * IMPORTANT: expose this file only through HTTPS and restrict it by IP or
@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.19.2';
+const MS_VERSION = '1.20.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -46,14 +46,12 @@ function h($value): string {
 }
 
 function qi(string $identifier): string {
-  return '`' . str_replace('`', '``', $identifier) . '`';
+  $quote = ms_engine() === 'sqlite' ? '"' : '`';
+  return $quote . str_replace($quote, $quote . $quote, $identifier) . $quote;
 }
 
-function qs(mysqli $db, $value): string {
-  if ($value === null) {
-    return 'NULL';
-  }
-  return "'" . $db->real_escape_string((string)$value) . "'";
+function qs(MSDatabase $db, $value): string {
+  return $db->quote($value);
 }
 
 function g(string $key, string $default = ''): string {
@@ -243,6 +241,7 @@ function ms_presence_lock_file(): string {
 
 function ms_presence_server_key(): string {
   $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
+  if (($login['engine'] ?? 'mysql') === 'sqlite') return hash('sha256', 'sqlite' . "\0" . (string)($login['path'] ?? ''));
   return hash('sha256',
     (string)($login['host'] ?? '') . "\0" .
     (string)($login['port'] ?? '') . "\0" .
@@ -474,6 +473,7 @@ function ms_profile_config_backup(string $targetVersion): ?string {
 
 function ms_server_config_key(): string {
   $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
+  if (($login['engine'] ?? 'mysql') === 'sqlite') return hash('sha256', 'sqlite' . "\0" . (string)($login['path'] ?? ''));
   return hash('sha256',
     (string)($login['host'] ?? '') . "\0" .
     (string)($login['port'] ?? '') . "\0" .
@@ -1270,8 +1270,8 @@ function ms_named_tool_id(string $id): string {
   return $id;
 }
 
-function ms_global_search_schema(mysqli $db): array {
-  $rows = db_all($db, "SELECT TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND DATA_TYPE NOT IN ('tinyblob','blob','mediumblob','longblob','binary','varbinary','geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection') ORDER BY TABLE_NAME,ORDINAL_POSITION");
+function ms_global_search_schema(MSDatabase $db): array {
+  $rows = $db->engine === 'sqlite' ? array_values(array_filter(ms_all_columns($db), static function (array $c): bool { return $c['DATA_TYPE'] !== 'blob'; })) : db_all($db, "SELECT TABLE_NAME,COLUMN_NAME,DATA_TYPE,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND DATA_TYPE NOT IN ('tinyblob','blob','mediumblob','longblob','binary','varbinary','geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection') ORDER BY TABLE_NAME,ORDINAL_POSITION");
   $schema = [];
   foreach ($rows as $row) {
     $table = (string)$row['TABLE_NAME'];
@@ -1345,7 +1345,7 @@ function ms_profile_delete_global_search(string $database, string $id): void {
   });
 }
 
-function ms_global_search_run(mysqli $db, array $definition): array {
+function ms_global_search_run(MSDatabase $db, array $definition): array {
   $term = (string)($definition['term'] ?? '');
   $mode = (string)($definition['mode'] ?? 'contains');
   $results = [];
@@ -1357,6 +1357,7 @@ function ms_global_search_run(mysqli $db, array $definition): array {
     foreach ($columns as $column) {
       $value = 'CAST(' . qi((string)$column) . ' AS CHAR)';
       if ($mode === 'exact') $clauses[] = $value . ' = ' . $needle;
+      elseif ($db->engine === 'sqlite') $clauses[] = $mode === 'starts' ? 'substr(' . $value . ',1,length(' . $needle . ')) = ' . $needle : 'instr(' . $value . ',' . $needle . ') > 0';
       elseif ($mode === 'starts') $clauses[] = 'LEFT(' . $value . ',CHAR_LENGTH(' . $needle . ')) = ' . $needle;
       else $clauses[] = 'LOCATE(' . $needle . ',' . $value . ') > 0';
     }
@@ -1617,7 +1618,7 @@ function ms_repair_update_table(string $sql): string {
   return ms_repair_statement($sql, 'UPDATE')['table'];
 }
 
-function ms_repair_assert_transactional_table(mysqli $db, string $sql): void {
+function ms_repair_assert_transactional_table(MSDatabase $db, string $sql): void {
   $table = ms_repair_update_table($sql);
   $row = db_one($db, 'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table) . ' AND TABLE_TYPE=\'BASE TABLE\'');
   $engine = (string)($row['ENGINE'] ?? '');
@@ -1625,7 +1626,7 @@ function ms_repair_assert_transactional_table(mysqli $db, string $sql): void {
   if (strtoupper((string)($support['TRANSACTIONS'] ?? 'NO')) !== 'YES') throw new RuntimeException('Repair recipes require a transactional table engine; ' . ($engine !== '' ? $engine : $table) . ' cannot guarantee rollback.');
 }
 
-function ms_repair_key(mysqli $db, array $preview, array $repair): array {
+function ms_repair_key(MSDatabase $db, array $preview, array $repair): array {
   $columns = [];
   foreach (table_columns($db, $repair['table']) as $column) $columns[(string)$column['COLUMN_NAME']] = $column;
   $indexes = [];
@@ -1677,7 +1678,7 @@ function ms_repair_row_set(array $rows): array {
   return $set;
 }
 
-function ms_repair_binding(mysqli $db, string $previewSql, string $repairSql, int $limit, bool $lock = false): array {
+function ms_repair_binding(MSDatabase $db, string $previewSql, string $repairSql, int $limit, bool $lock = false): array {
   $mode = db_one($db, 'SELECT @@SESSION.sql_mode AS mode, DATABASE() AS db');
   if (preg_match('/(?:^|,)(?:ANSI_QUOTES|NO_BACKSLASH_ESCAPES)(?:,|$)/i', (string)($mode['mode'] ?? ''))) throw new RuntimeException('Repair recipes do not support ANSI_QUOTES or NO_BACKSLASH_ESCAPES SQL modes.');
   $preview = ms_repair_statement($previewSql, 'SELECT');
@@ -1689,7 +1690,7 @@ function ms_repair_binding(mysqli $db, string $previewSql, string $repairSql, in
   foreach ($keyProjection as $index => &$expression) $expression .= ' AS ' . qi('__ms_repair_key_' . $index);
   unset($expression);
   $result = $db->query(ms_repair_selection_sql($preview, $preview['body'] . ', ' . implode(', ', $keyProjection), $limit + 1, $lock));
-  if (!$result instanceof mysqli_result) throw new RuntimeException('Repair preview failed: ' . $db->error);
+  if (!ms_is_result($result)) throw new RuntimeException('Repair preview failed: ' . $db->error);
   try {
     $metadata = array_slice($result->fetch_fields(), 0, $result->field_count - count($key['columns']));
     $fields = array_map(static function ($field): string { return (string)$field->name; }, $metadata);
@@ -1710,7 +1711,7 @@ function ms_repair_binding(mysqli $db, string $previewSql, string $repairSql, in
   if ($overflow) return ['fields'=>$fields,'rows'=>array_slice($rows,0,$limit),'overflow'=>true,'key'=>$key,'key_rows'=>array_slice($keys,0,$limit),'repair'=>$repair];
   // Direct locking reads keep row and metadata locks until the transaction ends.
   $result = $db->query(ms_repair_selection_sql($repair, implode(', ', ms_repair_key_projection($repair, $key)), $limit + 1, $lock));
-  if (!$result instanceof mysqli_result) throw new RuntimeException('Unable to check repair target rows: ' . $db->error);
+  if (!ms_is_result($result)) throw new RuntimeException('Unable to check repair target rows: ' . $db->error);
   $targets = [];
   while ($row = $result->fetch_row()) $targets[] = $row;
   $result->free();
@@ -1731,8 +1732,10 @@ function ms_repair_scoped_sql(array $repair, array $key, array $rows): string {
     foreach ($key['columns'] as $index => $column) {
       // Server-side binary representations avoid collation, BIGINT rounding and
       // binary/temporal protocol conversions when binding the approved keys.
+      // Comparing a numeric column directly to X'...' has different coercion
+      // semantics on MySQL 8; the binary representation is the identity.
       $literal = 'X\'' . $row[$index] . '\'';
-      $parts[] = qi($column) . ' = ' . $literal . ' AND CAST(' . qi($column) . ' AS BINARY) = ' . $literal;
+      $parts[] = 'CAST(' . qi($column) . ' AS BINARY) = ' . $literal;
     }
     $identities[] = '(' . implode(' AND ', $parts) . ')';
   }
@@ -1740,7 +1743,7 @@ function ms_repair_scoped_sql(array $repair, array $key, array $rows): string {
     ($repair['order'] !== '' ? ' ORDER BY ' . $repair['order'] : '') . ($repair['limit'] !== null ? ' LIMIT ' . $repair['limit'] : '');
 }
 
-function ms_repair_preview(mysqli $db, string $id, array $recipe, array $parameters): array {
+function ms_repair_preview(MSDatabase $db, string $id, array $recipe, array $parameters): array {
   $recipe = ms_repair_recipe_normalize($recipe);
   foreach ($parameters as $parameter) if (!is_array($parameter) || !in_array((string)($parameter['type'] ?? 'text'), ['text','number','null'], true)) throw new RuntimeException('Repair parameters must be Text, Number or NULL.');
   $previewSql = ms_expand_sql_parameters($db, $recipe['preview_sql'], $parameters);
@@ -1759,7 +1762,7 @@ function ms_repair_preview(mysqli $db, string $id, array $recipe, array $paramet
   return ['fields'=>$binding['fields'],'rows'=>$binding['rows'],'overflow'=>$binding['overflow'],'token'=>$token,'max_rows'=>$limit];
 }
 
-function ms_repair_execute(mysqli $db, string $token): int {
+function ms_repair_execute(MSDatabase $db, string $token): int {
   if (preg_match('/\A[0-9a-f]{48}\z/', $token) !== 1) throw new RuntimeException('Invalid or expired repair preview.');
   $entry = $_SESSION['ms_repair_previews'][$token] ?? null;
   if (!is_array($entry) || (string)($entry['database'] ?? '') !== selected_db() || (int)($entry['created_at'] ?? 0) < time() - 600) throw new RuntimeException('The repair preview expired. Preview the recipe again.');
@@ -1773,7 +1776,7 @@ function ms_repair_execute(mysqli $db, string $token): int {
 
 // Shared with the disposable-database diagnostics; the action above always
 // verifies the session token, database, expiry and saved recipe first.
-function ms_repair_execute_bound(mysqli $db, array $entry): int {
+function ms_repair_execute_bound(MSDatabase $db, array $entry): int {
   $sql = (string)($entry['repair_sql'] ?? '');
   $maxRows = (int)($entry['max_rows'] ?? 0);
   $previewRows = (int)($entry['preview_rows'] ?? 0);
@@ -1803,6 +1806,7 @@ function ms_repair_execute_bound(mysqli $db, array $entry): int {
 }
 
 function ms_view_preset_server_key(): string {
+  if (ms_engine() === 'sqlite') return ms_server_config_key();
   $login = isset($_SESSION['ms_login']) && is_array($_SESSION['ms_login']) ? $_SESSION['ms_login'] : [];
   return hash('sha256', (string)($login['host'] ?? '') . "\0" . (string)($login['port'] ?? '') . "\0" . (string)($login['socket'] ?? ''));
 }
@@ -1936,7 +1940,7 @@ function ms_problem_queue_list(string $database): array {
   return $result;
 }
 
-function ms_problem_queue_count(mysqli $db, array $queue): array {
+function ms_problem_queue_count(MSDatabase $db, array $queue): array {
   $table = (string)($queue['table'] ?? '');
   if ($table === '' || !table_exists($db, $table)) return ['count'=>0,'error'=>'Table not found'];
   $columns = table_columns($db, $table);
@@ -2069,7 +2073,7 @@ function ms_row_is_soft_deleted(array $row, ?array $rule): bool {
   return implode('', $digits) === $rule['value'];
 }
 
-function ms_soft_delete_sql_match(mysqli $db, array $rule): string {
+function ms_soft_delete_sql_match(MSDatabase $db, array $rule): string {
   $column = qi($rule['column']);
   $value = qs($db, $rule['value']);
   return ($rule['data_type'] ?? '') === 'bit'
@@ -2127,9 +2131,20 @@ function ms_column_view_show_all(string $database): void {
   });
 }
 
-function ms_column_view_hide_primary_keys(mysqli $db, string $database): array {
+function ms_column_view_hide_primary_keys(MSDatabase $db, string $database): array {
   // Read the complete set before changing the profile, so a metadata error
   // cannot leave some tables configured and others untouched.
+  $primaryColumns = []; $columnCount = 0;
+  if ($db->engine === 'sqlite') {
+    foreach (ms_table_list($db) as $table) {
+      if ($table['TABLE_TYPE'] !== 'BASE TABLE') continue;
+      foreach (table_columns($db, $table['TABLE_NAME']) as $column) {
+        if ($column['SQLITE_PK_POSITION'] < 1) continue;
+        $primaryColumns[$table['TABLE_NAME']][] = $column['COLUMN_NAME'];
+        $columnCount++;
+      }
+    }
+  } else {
   $result = $db->query("SELECT k.TABLE_NAME, k.COLUMN_NAME
     FROM information_schema.KEY_COLUMN_USAGE k
     INNER JOIN information_schema.TABLES t
@@ -2138,7 +2153,7 @@ function ms_column_view_hide_primary_keys(mysqli $db, string $database): array {
       AND k.CONSTRAINT_NAME = 'PRIMARY'
       AND t.TABLE_TYPE = 'BASE TABLE'
     ORDER BY k.TABLE_NAME, k.ORDINAL_POSITION");
-  if (!$result instanceof mysqli_result) {
+  if (!ms_is_result($result)) {
     throw new RuntimeException('Unable to read primary-key metadata: ' . $db->error);
   }
   $primaryColumns = [];
@@ -2148,6 +2163,7 @@ function ms_column_view_hide_primary_keys(mysqli $db, string $database): array {
     $columnCount++;
   }
   $result->free();
+  }
   if (!$primaryColumns) return [0, 0];
 
   ms_profile_update_database($database, static function (array $databaseConfig) use ($primaryColumns): array {
@@ -2620,13 +2636,604 @@ function ms_auto_update(): void {
   }
 }
 
+function ms_sqlite_identity_alias(array $columns, int $position, string $kind): string {
+  $names = array_map('strtolower', array_column($columns, 'COLUMN_NAME'));
+  $alias = '__ms_sqlite_key_' . $position . '_' . $kind;
+  while (in_array(strtolower($alias), $names, true)) $alias .= '_';
+  return $alias;
+}
+
+function ms_sqlite_identity_extras(array $columns, array $keys): array {
+  $parts = [];
+  foreach ($keys as $i => $key) {
+    $field = qi($key);
+    $parts[] = 'typeof(' . $field . ') AS ' . qi(ms_sqlite_identity_alias($columns, $i, 'type'));
+    $parts[] = "CASE typeof(" . $field . ") WHEN 'real' THEN printf('%!.26g'," . $field . ') ELSE hex(CAST(' . $field . ' AS BLOB)) END AS ' . qi(ms_sqlite_identity_alias($columns, $i, 'value'));
+  }
+  return $parts;
+}
+
+function ms_sqlite_row_identity(array $columns, array $keys, array $row): array {
+  $identity = [];
+  foreach ($keys as $i => $key) {
+    $identity[$key] = $row[$key] ?? null;
+    $typeAlias = ms_sqlite_identity_alias($columns, $i, 'type');
+    $valueAlias = ms_sqlite_identity_alias($columns, $i, 'value');
+    if (isset($row[$typeAlias], $row[$valueAlias])) $identity["\0sqlite"][$key] = ['type'=>$row[$typeAlias], 'value'=>$row[$valueAlias]];
+  }
+  return $identity;
+}
+
+/** Strict identities: never turn a missing key into IS NULL or an all-row write. */
+function ms_sqlite_where(MSDatabase $db, string $table, array $identity): array {
+  $keys = primary_columns($db, $table);
+  if (!$keys || (ms_table_meta($db, $table)['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('This object has no safe writable row identity.');
+  $parts = []; $values = []; $blobs = [];
+  $columns = array_column(table_columns($db, $table), null, 'COLUMN_NAME');
+  foreach ($keys as $key) {
+    if (!array_key_exists($key, $identity) || is_array($identity[$key]) || is_object($identity[$key]) || $identity[$key] === null) throw new RuntimeException('Missing or invalid row identity. Reload the table.');
+    $typed = $identity["\0sqlite"][$key] ?? null;
+    if (is_array($typed)) {
+      $type = (string)($typed['type'] ?? '');
+      $encoded = (string)($typed['value'] ?? '');
+      if (!in_array($type, ['text','integer','real','blob'], true)) throw new RuntimeException('Invalid SQLite key storage type.');
+      if ($type === 'real') {
+        if (!is_numeric($encoded)) throw new RuntimeException('Invalid SQLite REAL key.');
+        $value = $encoded;
+        $expression = 'CAST(? AS REAL)';
+      } else {
+        if (preg_match('/\A(?:[0-9A-F]{2})*\z/', $encoded) !== 1) throw new RuntimeException('Invalid SQLite key bytes.');
+        $value = hex2bin($encoded);
+        if ($type === 'integer') {
+          if (preg_match('/\A-?(?:0|[1-9][0-9]*)\z/', $value) !== 1 || (string)(int)$value !== $value) throw new RuntimeException('SQLite integer key exceeds the PHP integer range.');
+          $value = (int)$value;
+        }
+        $expression = '?';
+      }
+      $parts[] = '(' . qi($key) . ' = ' . $expression . ' AND typeof(' . qi($key) . ') = ?)';
+      if ($type === 'blob') $blobs[count($values)] = true;
+      $values[] = $value; $values[] = $type;
+    } else {
+      $parts[] = qi($key) . ' = ?';
+      if (($columns[$key]['DATA_TYPE'] ?? '') === 'blob') $blobs[count($values)] = true;
+      $values[] = $identity[$key];
+    }
+  }
+  return [implode(' AND ', $parts), $values, $blobs];
+}
+
+function ms_sqlite_save_row(MSDatabase $db, string $table, array $post, array $files = []): bool {
+  $meta = ms_table_meta($db, $table);
+  if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('Only base tables can be edited.');
+  $identity = decode_identity((string)($post['identity'] ?? ''));
+  $clone = decode_identity((string)($post['clone_source'] ?? ''));
+  $existing = null;
+  if ($identity !== null) {
+    [$where, $params, $blobs] = ms_sqlite_where($db, $table, $identity);
+    $existing = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . $where, $params, $blobs);
+    if ($existing === null) throw new RuntimeException('The row no longer exists. Reload the table.');
+  }
+  $source = null;
+  if (!$identity && $clone) {
+    [$where, $params, $blobs] = ms_sqlite_where($db, $table, $clone);
+    $source = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . $where, $params, $blobs);
+    if ($source === null) throw new RuntimeException('Clone source no longer exists.');
+  }
+  $names = []; $expressions = []; $params = []; $blobs = [];
+  foreach (table_columns($db, $table) as $column) {
+    $name = $column['COLUMN_NAME'];
+    if (strpos($column['EXTRA'], 'GENERATED') !== false) continue;
+    $hasUpload = !empty($files['tmp_name'][$name]);
+    $value = $post['value'][$name] ?? '';
+    if (!is_scalar($value) && $value !== null) throw new RuntimeException('Invalid field value.');
+    if ($identity && !empty($post['keep_blob'][$name]) && !$hasUpload) continue;
+    if (!$identity && !empty($post['use_default'][$name])) continue;
+    if (!$identity && $column['SQLITE_ROWID_ALIAS'] && $value === '' && empty($post['is_null'][$name]) && empty($post['expression'][$name])) continue;
+    if (!empty($post['expression'][$name])) {
+      $names[] = $name;
+    }
+    if (!empty($post['expression'][$name])) {
+      $expression = trim((string)$value);
+      if ($expression === '') throw new RuntimeException('SQL expression cannot be empty.');
+      // The complete prepared statement is checked again by the driver.
+      $expressions[] = '(' . $expression . ')';
+      continue;
+    }
+    if (!empty($post['is_null'][$name])) $value = null;
+    elseif ($hasUpload) {
+      if ((int)($files['error'][$name] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK || (int)($files['size'][$name] ?? 0) > 25 * 1024 * 1024) throw new RuntimeException('BLOB upload failed or exceeds 25 MB.');
+      $value = file_get_contents($files['tmp_name'][$name]);
+      if ($value === false) throw new RuntimeException('Cannot read uploaded BLOB.');
+    } elseif (!$identity && $source !== null && !empty($post['keep_blob'][$name])) $value = $source[$name];
+    else $value = ms_normalize_column_literal($column, $value);
+    if ($existing !== null && !$hasUpload && (($value === null && $existing[$name] === null) || ($value !== null && $existing[$name] !== null && (string)$value === (string)$existing[$name]))) continue;
+    $names[] = $name;
+    $expressions[] = '?';
+    if ($value !== null && ($hasUpload || $column['DATA_TYPE'] === 'blob')) $blobs[count($params)] = true;
+    $params[] = $value;
+  }
+  if ($identity !== null) {
+    if (!$names) return false;
+    [$where, $identityParams, $identityBlobs] = ms_sqlite_where($db, $table, $identity);
+    foreach ($identityBlobs as $i => $flag) $blobs[count($params) + $i] = $flag;
+    $sets = [];
+    foreach ($names as $i => $name) $sets[] = qi($name) . ' = ' . $expressions[$i];
+    $db->run('UPDATE ' . qi($table) . ' SET ' . implode(', ', $sets) . ' WHERE ' . $where, array_merge($params, $identityParams), $blobs);
+    if ($db->affected_rows !== 1) throw new RuntimeException('The row no longer exists. Reload the table.');
+  } else {
+    $sql = $names ? 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $names)) . ') VALUES (' . implode(', ', $expressions) . ')' : 'INSERT INTO ' . qi($table) . ' DEFAULT VALUES';
+    $db->run($sql, $params, $blobs);
+  }
+  return true;
+}
+
+function ms_sqlite_delete_rows(MSDatabase $db, string $table, array $identities): int {
+  if (!$identities) throw new RuntimeException('Select at least one row.');
+  $db->begin_transaction();
+  $count = 0;
+  try {
+    foreach (array_unique($identities) as $encoded) {
+      $identity = decode_identity((string)$encoded);
+      if ($identity === null) throw new RuntimeException('Invalid row identity.');
+      [$where, $params, $blobs] = ms_sqlite_where($db, $table, $identity);
+      $db->run('DELETE FROM ' . qi($table) . ' WHERE ' . $where, $params, $blobs);
+      $count += $db->affected_rows;
+    }
+    $db->commit();
+    return $count;
+  } catch (Throwable $e) { $db->rollback(); throw $e; }
+}
+
+function ms_sqlite_dispatch_action(MSDatabase $db, string $action): void {
+  if (in_array($action, ['save_row','delete_row','delete_rows','bulk_update'], true)) {
+    $table = g('table');
+    $return = ms_decode_navigation(p('return_to'));
+    if (($return['page'] ?? '') !== 'select' || ($return['table'] ?? '') !== $table) $return = ['page'=>'select', 'table'=>$table];
+    if ($action === 'save_row') {
+      $updated = decode_identity(p('identity')) !== null;
+      ms_sqlite_save_row($db, $table, $_POST, $_FILES['upload'] ?? []);
+      ms_go_to_query($return, $updated ? 'Row updated.' : 'Row inserted.');
+    }
+    $ids = $action === 'delete_row' ? [p('identity', g('single_id'))] : ($_POST['row_id'] ?? []);
+    if (!is_array($ids)) throw new RuntimeException('Invalid row selection.');
+    if ($action !== 'bulk_update') {
+      $count = ms_sqlite_delete_rows($db, $table, $ids);
+      ms_go_to_query($return, $count . ' row(s) deleted.');
+    }
+    $column = p('column');
+    $columns = array_column(table_columns($db, $table), null, 'COLUMN_NAME');
+    if (!isset($columns[$column]) || strpos($columns[$column]['EXTRA'], 'GENERATED') !== false) throw new RuntimeException('Choose a writable column.');
+    $value = p('bulk_value'); $operation = p('operation'); $expr = '?'; $valueParams = [$value];
+    if ($operation === 'null') { $expr = 'NULL'; $valueParams = []; }
+    elseif ($operation === 'append') $expr = qi($column) . ' || ?';
+    elseif ($operation === 'prepend') $expr = '? || ' . qi($column);
+    elseif ($operation === 'add') {
+      if (!is_numeric($value)) throw new RuntimeException('Enter a number to add.');
+      $expr = qi($column) . ' + ?';
+    } elseif ($operation !== 'set') throw new RuntimeException('Unsupported bulk operation.');
+    if (!$ids) throw new RuntimeException('Select at least one row.');
+    $db->begin_transaction(); $count = 0;
+    try {
+      foreach (array_unique($ids) as $encoded) {
+        $identity = decode_identity((string)$encoded);
+        if ($identity === null) throw new RuntimeException('Invalid row identity.');
+        [$where, $params, $blobs] = ms_sqlite_where($db, $table, $identity);
+        $shifted = [];
+        foreach ($blobs as $i => $flag) $shifted[count($valueParams) + $i] = $flag;
+        if ($operation === 'set' && $columns[$column]['DATA_TYPE'] === 'blob') $shifted[0] = true;
+        $db->run('UPDATE ' . qi($table) . ' SET ' . qi($column) . ' = ' . $expr . ' WHERE ' . $where, array_merge($valueParams, $params), $shifted);
+        $count += $db->affected_rows;
+      }
+      $db->commit();
+    } catch (Throwable $e) { $db->rollback(); throw $e; }
+    ms_go_to_query($return, $count . ' row(s) updated.');
+  }
+  if (!ms_sqlite_action_supported($action)) throw new RuntimeException('This operation is not yet available for SQLite. Use the SQLite SQL editor for supported database commands.');
+}
+
+function ms_sqlite_page_database(MSDatabase $db): void {
+  $tables = ms_table_list($db);
+  title_bar('SQLite: ' . basename($db->path), count($tables) . ' object(s) · SQLite ' . $db->server_info, '<a class="btn btn-primary" href="?page=sql">SQL command</a>');
+  ?><div class="alert alert-info">Create tables, indexes, views and triggers using SQLite SQL. This first backend supports browsing, filtering and row editing; advanced MySQL tools are hidden.</div><div class="card"><div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Name</th><th>Type</th><th></th></tr></thead><tbody><?php foreach ($tables as $table) { ?><tr><td><a href="?page=select&amp;table=<?= urlencode($table['TABLE_NAME']) ?>"><?= h($table['TABLE_NAME']) ?></a></td><td><?= h($table['TABLE_TYPE']) ?></td><td class="text-end"><a class="btn btn-secondary btn-sm" href="?page=structure&amp;table=<?= urlencode($table['TABLE_NAME']) ?>">Structure</a></td></tr><?php } ?></tbody></table></div></div><?php
+}
+
+function ms_sqlite_page_structure(MSDatabase $db): void {
+  $table = g('table'); $meta = ms_table_meta($db, $table);
+  if ($meta === null) throw new RuntimeException('Table or view not found.');
+  title_bar('Structure: ' . $table, $meta['TABLE_TYPE'], '<a class="btn btn-secondary" href="?page=select&amp;table=' . urlencode($table) . '">Browse</a> <a class="btn btn-primary" href="?page=sql">SQL command</a>');
+  ?><div class="card mb-3"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Column</th><th>Declared type</th><th>Affinity</th><th>Nullable</th><th>PK position</th><th>Default SQL</th><th>Extra</th></tr></thead><tbody><?php foreach (table_columns($db, $table) as $column) { ?><tr><td><?= h($column['COLUMN_NAME']) ?></td><td><?= h($column['COLUMN_TYPE']) ?></td><td><?= h($column['SQLITE_AFFINITY']) ?></td><td><?= h($column['IS_NULLABLE']) ?></td><td><?= h($column['SQLITE_PK_POSITION']) ?></td><td class="code"><?= h($column['COLUMN_DEFAULT']) ?></td><td><?= h($column['EXTRA']) ?></td></tr><?php } ?></tbody></table></div></div><div class="card mb-3"><div class="card-header">CREATE statement</div><pre class="card-body code mb-0"><?= h($meta['CREATE_SQL']) ?></pre></div><?php
+  foreach (['Indexes'=>'index_list','Foreign keys'=>'foreign_key_list'] as $label=>$pragma) {
+    $rows = db_all($db, 'PRAGMA ' . $pragma . '(' . qs($db, $table) . ')');
+    ?><div class="card mb-3"><div class="card-header"><?= h($label) ?></div><div class="card-body"><?php if (!$rows) echo '<span class="text-body-secondary">None</span>'; else { ?><div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><?php foreach (array_keys($rows[0]) as $name) { ?><th><?= h($name) ?></th><?php } ?></tr></thead><tbody><?php foreach ($rows as $row) { ?><tr><?php foreach ($row as $value) { ?><td><?= h($value) ?></td><?php } ?></tr><?php } ?></tbody></table></div><?php } ?></div></div><?php
+  }
+  $triggers = db_all($db, "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=" . qs($db, $table) . ' ORDER BY name');
+  foreach ($triggers as $trigger) echo '<div class="card mb-3"><div class="card-header">Trigger: ' . h($trigger['name']) . '</div><pre class="card-body code mb-0">' . h($trigger['sql']) . '</pre></div>';
+}
+
+/** Thin driver boundary: MySQL keeps its native mysqli behavior. */
+class MSDatabase {
+  public $engine = 'mysql';
+  protected $native;
+  private $preparedAffected = null;
+  private $preparedInsertId = null;
+
+  public function __construct($native) { $this->native = $native; }
+  public function __get(string $name) {
+    if ($name === 'affected_rows' && $this->preparedAffected !== null) return $this->preparedAffected;
+    if ($name === 'insert_id' && $this->preparedInsertId !== null) return $this->preparedInsertId;
+    return $this->native->$name;
+  }
+  public function __call(string $name, array $args) { return $this->native->$name(...$args); }
+  public function query(string $sql, int $mode = 0) {
+    $this->preparedAffected = null; $this->preparedInsertId = null;
+    return $this->native->query($sql, $mode);
+  }
+  public function quote($value): string {
+    return $value === null ? 'NULL' : "'" . $this->native->real_escape_string((string)$value) . "'";
+  }
+  public function run(string $sql, array $values = [], array $blobs = []) {
+    if (!$values) return $this->query($sql);
+    $stmt = $this->native->prepare($sql);
+    if (!$stmt) throw new RuntimeException($this->native->error);
+    try {
+      $types = '';
+      $values = array_values($values);
+      foreach ($values as $value) $types .= is_int($value) ? 'i' : (is_float($value) ? 'd' : 's');
+      $stmt->bind_param($types, ...$values);
+      if (!$stmt->execute()) throw new RuntimeException($stmt->error);
+      $this->preparedAffected = $stmt->affected_rows;
+      $this->preparedInsertId = $stmt->insert_id;
+      return $stmt->field_count ? $stmt->get_result() : true;
+    } finally { $stmt->close(); }
+  }
+}
+
+/** Buffered result with the small mysqli_result surface used by this file. */
+class MSSQLiteResult {
+  public $num_rows;
+  private $rows;
+  private $fields;
+  private $position = 0;
+  public function __construct(array $rows, array $names) {
+    $this->rows = $rows;
+    $this->num_rows = count($rows);
+    $this->fields = array_map(static function (string $name) { return (object)['name' => $name]; }, $names);
+  }
+  public function fetch_fields(): array { return $this->fields; }
+  public function fetch_row(): ?array { return $this->rows[$this->position++] ?? null; }
+  public function fetch_assoc(): ?array {
+    $row = $this->fetch_row();
+    return $row === null ? null : array_combine(array_column($this->fields, 'name'), $row);
+  }
+  public function free(): void { $this->rows = []; }
+}
+
+function ms_is_result($result): bool {
+  return $result instanceof mysqli_result || $result instanceof MSSQLiteResult;
+}
+
+function ms_engine(): string {
+  return ($_SESSION['ms_login']['engine'] ?? 'mysql') === 'sqlite' ? 'sqlite' : 'mysql';
+}
+
+function ms_sqlite_config(): array {
+  $root = defined('MS_SQLITE_ROOT') ? (string)MS_SQLITE_ROOT : (string)getenv('MS_SQLITE_ROOT');
+  $hash = defined('MS_SQLITE_PASSWORD_HASH') ? (string)MS_SQLITE_PASSWORD_HASH : (string)getenv('MS_SQLITE_PASSWORD_HASH');
+  return [$root, $hash];
+}
+
+function ms_path_inside(string $path, string $root): bool {
+  $root = rtrim($root, '/\\') . DIRECTORY_SEPARATOR;
+  return DIRECTORY_SEPARATOR === '\\' ? strncasecmp($path, $root, strlen($root)) === 0 : strpos($path, $root) === 0;
+}
+
+/** Only existing, regular SQLite files in an operator-configured private root. */
+function ms_sqlite_path(string $input): string {
+  [$configuredRoot] = ms_sqlite_config();
+  $root = $configuredRoot !== '' ? realpath($configuredRoot) : false;
+  if ($root === false || !is_dir($root)) throw new RuntimeException('SQLite is disabled. Configure MS_SQLITE_ROOT and MS_SQLITE_PASSWORD_HASH on the server.');
+  if ($input === '' || strpos($input, "\0") !== false || preg_match('~^[a-z][a-z0-9+.-]*:~i', $input) || $input === ':memory:') throw new RuntimeException('Enter an existing SQLite filename, not a URI or memory database.');
+  $absolute = $input[0] === '/' || preg_match('~^[A-Za-z]:[\\\\/]~', $input);
+  $path = realpath($absolute ? $input : $root . DIRECTORY_SEPARATOR . $input);
+  if ($path === false || !ms_path_inside($path, $root) || !is_file($path) || !is_readable($path) || !is_writable($path)) throw new RuntimeException('SQLite file must be a readable, writable regular file inside MS_SQLITE_ROOT.');
+  $documentRoot = !empty($_SERVER['DOCUMENT_ROOT']) ? realpath((string)$_SERVER['DOCUMENT_ROOT']) : false;
+  if (ms_path_inside($path, __DIR__) || ($documentRoot !== false && ms_path_inside($path, $documentRoot))) throw new RuntimeException('SQLite databases must be outside the application directory and document root.');
+  $header = file_get_contents($path, false, null, 0, 16);
+  if ($header !== "SQLite format 3\0") throw new RuntimeException('The selected file is not an initialized SQLite 3 database.');
+  return $path;
+}
+
+/** SQLite tokenizer: no backslash escaping; supports bracket identifiers. */
+function ms_sqlite_tokens(string $sql): array {
+  $tokens = [];
+  $length = strlen($sql);
+  for ($i = 0; $i < $length;) {
+    $start = $i;
+    $c = $sql[$i];
+    $next = $sql[$i + 1] ?? '';
+    if (ctype_space($c)) { $i++; continue; }
+    if ($c === '-' && $next === '-') {
+      $end = strpos($sql, "\n", $i + 2); $i = $end === false ? $length : $end + 1; continue;
+    }
+    if ($c === '/' && $next === '*') {
+      $end = strpos($sql, '*/', $i + 2);
+      if ($end === false) throw new RuntimeException('Unclosed SQL comment.');
+      $i = $end + 2; continue;
+    }
+    if (in_array($c, ["'", '"', '`', '['], true)) {
+      $close = $c === '[' ? ']' : $c;
+      $i++;
+      $closed = false;
+      while ($i < $length) {
+        if ($sql[$i++] !== $close) continue;
+        if ($close !== ']' && ($sql[$i] ?? '') === $close) { $i++; continue; }
+        $closed = true; break;
+      }
+      if (!$closed) throw new RuntimeException('Unclosed SQL quote.');
+      $tokens[] = ['text' => substr($sql, $start, $i - $start), 'word' => '', 'start' => $start, 'end' => $i];
+    } elseif (preg_match('/[A-Za-z_]/', $c)) {
+      while ($i < $length && preg_match('/[A-Za-z0-9_$]/', $sql[$i])) $i++;
+      $text = substr($sql, $start, $i - $start);
+      $tokens[] = ['text' => $text, 'word' => strtoupper($text), 'start' => $start, 'end' => $i];
+    } else {
+      $i++;
+      $tokens[] = ['text' => $c, 'word' => '', 'start' => $start, 'end' => $i];
+    }
+  }
+  return $tokens;
+}
+
+function ms_sqlite_split(string $sql): array {
+  $statements = []; $start = 0; $head = []; $trigger = false; $depth = 0;
+  foreach (ms_sqlite_tokens($sql) as $token) {
+    if (count($head) < 5 && $token['word'] !== '') $head[] = $token['word'];
+    $trigger = ($head[0] ?? '') === 'CREATE' && in_array('TRIGGER', $head, true);
+    if ($trigger && in_array($token['word'], ['BEGIN', 'CASE'], true)) $depth++;
+    if ($trigger && $token['word'] === 'END') $depth--;
+    if ($token['text'] === ';' && $depth <= 0) {
+      $statement = trim(substr($sql, $start, $token['start'] - $start));
+      if ($statement !== '' && ms_sqlite_tokens($statement)) $statements[] = $statement;
+      $start = $token['end']; $head = []; $trigger = false; $depth = 0;
+    }
+  }
+  $tail = trim(substr($sql, $start));
+  if ($tail !== '' && ms_sqlite_tokens($tail)) $statements[] = $tail;
+  return $statements;
+}
+
+/** A PHP 7.4-compatible file boundary (setAuthorizer is only available in PHP 8). */
+function ms_sqlite_assert_sql(string $sql): void {
+  if (strpos($sql, "\0") !== false) throw new RuntimeException('NUL bytes in SQL text are not allowed; use bound values.');
+  $tokens = ms_sqlite_tokens($sql);
+  if (($tokens[0]['word'] ?? '') === 'EXPLAIN') {
+    array_shift($tokens);
+    if (($tokens[0]['word'] ?? '') === 'QUERY' && ($tokens[1]['word'] ?? '') === 'PLAN') $tokens = array_slice($tokens, 2);
+  }
+  $words = array_values(array_filter(array_column($tokens, 'word')));
+  $first = $words[0] ?? '';
+  if (count(ms_sqlite_split($sql)) !== 1) throw new RuntimeException('Execute one complete SQLite statement at a time.');
+  if (in_array($first, ['ATTACH', 'DETACH'], true) || ($first === 'VACUUM' && in_array('INTO', $words, true))) throw new RuntimeException('Opening or writing other database files through SQL is disabled.');
+  // PRAGMAs may change global filesystem directories. Expose only safe reads.
+  if ($first === 'PRAGMA') {
+    $text = implode('', array_column($tokens, 'text'));
+    if (preg_match('/^PRAGMA(?:main\.)?(?:(?:table_info|table_xinfo|index_list|index_info|index_xinfo|foreign_key_list)\((?:\x27(?:[^\x27]|\x27\x27)*\x27|"(?:[^"]|"")*"|`(?:[^`]|``)*`|[A-Za-z0-9_]+)\)|(?:database_list|compile_options|foreign_keys|page_count|page_size|freelist_count|schema_version|user_version|integrity_check|quick_check|foreign_key_check|journal_mode));?$/iD', $text) !== 1) throw new RuntimeException('Only supported read-only SQLite PRAGMAs are allowed in the SQL editor.');
+  }
+  foreach ($tokens as $i => $token) {
+    $name = strtolower(trim($token['text'], "\x27\"`[]"));
+    if (($tokens[$i + 1]['text'] ?? '') === '(' && in_array($name, ['load_extension','readfile','writefile','edit','fts3_tokenizer'], true)) throw new RuntimeException('SQLite filesystem and extension functions are disabled.');
+  }
+}
+
+class MSSQLiteDatabase extends MSDatabase {
+  public $engine = 'sqlite';
+  public $path;
+  private $lastError = '';
+  private $lastErrno = 0;
+  private $affected = 0;
+  public function __construct(string $path) {
+    if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('The PHP PDO_SQLite extension is required. MySQL continues to use mysqli.');
+    $this->path = ms_sqlite_path($path);
+    $this->native = new PDO('sqlite:' . $this->path, null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES=>false, PDO::SQLITE_ATTR_OPEN_FLAGS=>PDO::SQLITE_OPEN_READWRITE]);
+    $this->native->exec('PRAGMA busy_timeout = 5000');
+    $this->native->exec('PRAGMA foreign_keys = ON');
+    $this->native->exec('PRAGMA trusted_schema = OFF');
+    // PDO_SQLite preserves embedded NULs in TEXT on PHP 7.4; SQLite3::fetchArray
+    // truncates them. No PDO MySQL driver is used and no filesystem UDF is registered.
+  }
+  public function __get(string $name) {
+    if ($name === 'error') return $this->lastError;
+    if ($name === 'errno') return $this->lastErrno;
+    if ($name === 'affected_rows') return $this->affected;
+    if ($name === 'insert_id') return $this->native->lastInsertId();
+    if ($name === 'server_info') return $this->native->query('SELECT sqlite_version()')->fetchColumn();
+    if ($name === 'info') return '';
+    throw new RuntimeException('Unsupported SQLite connection property: ' . $name);
+  }
+  public function __call(string $name, array $args) {
+    switch ($name) {
+      case 'select_db': return ($args[0] ?? '') === 'main';
+      case 'close': $this->native = null; return true;
+      case 'begin_transaction': return $this->run('BEGIN IMMEDIATE');
+      case 'commit': return $this->run('COMMIT');
+      case 'rollback': return $this->run('ROLLBACK');
+      case 'more_results': case 'next_result': return false;
+    }
+    throw new RuntimeException('Unsupported SQLite connection operation: ' . $name);
+  }
+  public function quote($value): string {
+    if ($value === null) return 'NULL';
+    $value = (string)$value;
+    return strpos($value, "\0") !== false ? "CAST(X'" . bin2hex($value) . "' AS TEXT)" : "'" . str_replace("'", "''", $value) . "'";
+  }
+  public function query(string $sql, int $mode = 0) {
+    try { return $this->run($sql); }
+    catch (Throwable $e) { $this->lastError = $e->getMessage(); $this->lastErrno = (int)$e->getCode() ?: 1; return false; }
+  }
+  /** PDO_SQLite before PHP 8 cannot describe a result with zero rows. */
+  private function emptyResultNames(string $sql, int $count): array {
+    if ($count < 1) return [];
+    $tokens = ms_sqlite_tokens($sql);
+    $first = $tokens[0]['word'] ?? '';
+    if (in_array($first, ['SELECT','WITH','VALUES'], true)) {
+      // Describe a temporary view without executing the original query again.
+      // View definitions cannot contain bind markers; NULL keeps the same names.
+      $definition = ''; $position = 0;
+      foreach ($tokens as $i => $token) {
+        if ($token['start'] < $position) continue;
+        $definition .= substr($sql, $position, $token['start'] - $position);
+        $end = $token['end'];
+        if ($token['text'] === '?') {
+          while (isset($sql[$end]) && ctype_digit($sql[$end])) $end++;
+          $definition .= 'NULL';
+        } elseif (in_array($token['text'], [':','@','$'], true) && ($tokens[$i + 1]['start'] ?? -1) === $end && ($tokens[$i + 1]['word'] ?? '') !== '') {
+          $end = $tokens[$i + 1]['end']; $definition .= 'NULL';
+        } else $definition .= $token['text'];
+        $position = $end;
+      }
+      $definition .= substr($sql, $position);
+      $name = '__ms_result_' . bin2hex(random_bytes(8));
+      $created = false;
+      try {
+        $this->native->exec('CREATE TEMP VIEW ' . qi($name) . ' AS ' . $definition);
+        $created = true;
+        $info = $this->native->query('PRAGMA table_info(' . $this->quote($name) . ')')->fetchAll(PDO::FETCH_ASSOC);
+        return array_column($info, 'name');
+      } catch (PDOException $unsupportedMetadata) {
+        // For example, WITH ... UPDATE ... RETURNING cannot define a view.
+      } finally { if ($created) $this->native->exec('DROP VIEW temp.' . qi($name)); }
+    }
+    $pragmaNames = ['table_info'=>['cid','name','type','notnull','dflt_value','pk'], 'table_xinfo'=>['cid','name','type','notnull','dflt_value','pk','hidden'], 'index_list'=>['seq','name','unique','origin','partial'], 'index_info'=>['seqno','cid','name'], 'index_xinfo'=>['seqno','cid','name','desc','coll','key'], 'foreign_key_list'=>['id','seq','table','from','to','on_update','on_delete','match'], 'foreign_key_check'=>['table','rowid','parent','fkid']];
+    if ($first === 'PRAGMA') {
+      foreach ($tokens as $token) if (isset($pragmaNames[strtolower($token['text'])])) return array_slice($pragmaNames[strtolower($token['text'])], 0, $count);
+    }
+    // DML RETURNING with zero affected rows has no values to display.
+    return array_map(static function (int $i): string { return 'column_' . ($i + 1); }, range(0, $count - 1));
+  }
+  public function run(string $sql, array $values = [], array $blobs = []) {
+    $this->lastError = ''; $this->lastErrno = 0; $this->affected = 0;
+    ms_sqlite_assert_sql($sql);
+    $stmt = $this->native->prepare($sql);
+    try {
+      foreach (array_values($values) as $i => $value) {
+        $type = $value === null ? PDO::PARAM_NULL : (isset($blobs[$i]) ? PDO::PARAM_LOB : (is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR));
+        $stmt->bindValue($i + 1, $value, $type);
+      }
+      $stmt->execute();
+      $this->affected = $stmt->columnCount() ? 0 : $stmt->rowCount();
+      $names = [];
+      try {
+        for ($i = 0; $i < $stmt->columnCount(); $i++) $names[] = $stmt->getColumnMeta($i)['name'];
+      } catch (PDOException $metadataError) {
+        if ((int)($metadataError->errorInfo[1] ?? 0) !== 25) throw $metadataError;
+        $names = $this->emptyResultNames($sql, $stmt->columnCount());
+      }
+      if (!$names) return true;
+      return new MSSQLiteResult($stmt->fetchAll(PDO::FETCH_NUM), $names);
+    } finally { $stmt->closeCursor(); }
+  }
+}
+
+function ms_table_list(MSDatabase $db): array {
+  if ($db->engine !== 'sqlite') return db_all($db, 'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
+  return db_all($db, "SELECT name AS TABLE_NAME, CASE type WHEN 'table' THEN 'BASE TABLE' ELSE 'VIEW' END AS TABLE_TYPE FROM sqlite_master WHERE type IN ('table','view') AND name NOT GLOB 'sqlite_*' ORDER BY name");
+}
+
+function ms_table_meta(MSDatabase $db, string $table): ?array {
+  if ($db->engine !== 'sqlite') return db_one($db, 'SELECT TABLE_TYPE, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+  return db_one($db, "SELECT name AS TABLE_NAME, CASE type WHEN 'table' THEN 'BASE TABLE' ELSE 'VIEW' END AS TABLE_TYPE, 'SQLite' AS ENGINE, sql AS CREATE_SQL FROM sqlite_master WHERE type IN ('table','view') AND name=" . qs($db, $table));
+}
+
+function ms_all_columns(MSDatabase $db): array {
+  if ($db->engine !== 'sqlite') return db_all($db, 'SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+  $columns = [];
+  foreach (ms_table_list($db) as $table) foreach (table_columns($db, $table['TABLE_NAME']) as $column) $columns[] = $column;
+  return $columns;
+}
+
+function ms_foreign_keys(MSDatabase $db, string $table): array {
+  if ($db->engine !== 'sqlite') return db_all($db, 'SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table) . ' AND REFERENCED_TABLE_NAME IS NOT NULL');
+  $rows = [];
+  foreach (db_all($db, 'PRAGMA foreign_key_list(' . qs($db, $table) . ')') as $key) {
+    $target = $key['to'];
+    if ($target === null) {
+      $pk = array_values(array_filter(table_columns($db, $key['table']), static function (array $c): bool { return (int)$c['SQLITE_PK_POSITION'] > 0; }));
+      usort($pk, static function (array $a, array $b): int { return $a['SQLITE_PK_POSITION'] <=> $b['SQLITE_PK_POSITION']; });
+      $target = $pk[(int)$key['seq']]['COLUMN_NAME'] ?? '';
+    }
+    $rows[] = ['TABLE_NAME'=>$table, 'COLUMN_NAME'=>$key['from'], 'REFERENCED_TABLE_NAME'=>$key['table'], 'REFERENCED_COLUMN_NAME'=>$target, 'CONSTRAINT_NAME'=>'fk_' . $key['id'], 'ORDINAL_POSITION'=>(int)$key['seq'] + 1, 'UPDATE_RULE'=>$key['on_update'], 'DELETE_RULE'=>$key['on_delete']];
+  }
+  return $rows;
+}
+
+function ms_sqlite_without_rowid(string $sql): bool {
+  $tokens = ms_sqlite_tokens($sql); $depth = 0;
+  foreach ($tokens as $i => $token) {
+    if ($token['text'] === '(') $depth++;
+    elseif ($token['text'] === ')') $depth--;
+    elseif ($depth === 0 && $token['word'] === 'WITHOUT' && ($tokens[$i + 1]['word'] ?? '') === 'ROWID') return true;
+  }
+  return false;
+}
+
+function ms_sqlite_columns(MSDatabase $db, string $table): array {
+  $meta = ms_table_meta($db, $table);
+  if ($meta === null) throw new RuntimeException('Table or view not found.');
+  $info = db_all($db, 'PRAGMA table_xinfo(' . qs($db, $table) . ')');
+  if (!$info) $info = db_all($db, 'PRAGMA table_info(' . qs($db, $table) . ')');
+  $pkIndex = false;
+  foreach (db_all($db, 'PRAGMA index_list(' . qs($db, $table) . ')') as $index) if (($index['origin'] ?? '') === 'pk') $pkIndex = true;
+  $withoutRowid = ms_sqlite_without_rowid((string)$meta['CREATE_SQL']);
+  $pkCount = count(array_filter($info, static function (array $c): bool { return (int)$c['pk'] > 0; }));
+  $rows = [];
+  foreach ($info as $c) {
+    if ((int)($c['hidden'] ?? 0) === 1) continue; // virtual-table implementation fields
+    $declared = trim((string)$c['type']);
+    $rowidAlias = !$withoutRowid && !$pkIndex && $pkCount === 1 && (int)$c['pk'] > 0 && strtoupper($declared) === 'INTEGER';
+    $affinity = stripos($declared, 'INT') !== false ? 'INTEGER' : (preg_match('/CHAR|CLOB|TEXT/i', $declared) ? 'TEXT' : ($declared === '' || stripos($declared, 'BLOB') !== false ? 'BLOB' : (preg_match('/REAL|FLOA|DOUB/i', $declared) ? 'REAL' : 'NUMERIC')));
+    // SQLite affinities do not impose MySQL integer widths or VARCHAR limits.
+    $rows[] = ['TABLE_NAME'=>$table, 'COLUMN_NAME'=>$c['name'], 'ORDINAL_POSITION'=>(int)$c['cid'] + 1, 'COLUMN_TYPE'=>$declared, 'DATA_TYPE'=>$declared !== '' && $affinity === 'BLOB' ? 'blob' : 'text', 'COLUMN_DEFAULT'=>$c['dflt_value'], 'IS_NULLABLE'=>($c['notnull'] || $rowidAlias || ($withoutRowid && $c['pk'])) ? 'NO' : 'YES', 'COLUMN_KEY'=>$c['pk'] ? 'PRI' : '', 'EXTRA'=>(int)($c['hidden'] ?? 0) > 1 ? 'GENERATED' : ($rowidAlias ? 'auto_increment' : ''), 'GENERATION_EXPRESSION'=>'', 'COLUMN_COMMENT'=>'', 'COLLATION_NAME'=>null, 'CHARACTER_MAXIMUM_LENGTH'=>null, 'NUMERIC_PRECISION'=>null, 'NUMERIC_SCALE'=>null, 'SQLITE_AFFINITY'=>$affinity, 'SQLITE_PK_POSITION'=>(int)$c['pk'], 'SQLITE_ROWID_ALIAS'=>$rowidAlias];
+  }
+  return $rows;
+}
+
+/** Prefer a guaranteed unique key; nullable SQLite PKs need rowid identities. */
+function ms_sqlite_identity_columns(MSDatabase $db, string $table): array {
+  $columns = table_columns($db, $table);
+  $primary = array_values(array_filter($columns, static function (array $c): bool { return (int)$c['SQLITE_PK_POSITION'] > 0; }));
+  usort($primary, static function (array $a, array $b): int { return $a['SQLITE_PK_POSITION'] <=> $b['SQLITE_PK_POSITION']; });
+  if ($primary && !array_filter($primary, static function (array $c): bool { return $c['IS_NULLABLE'] === 'YES'; })) return array_column($primary, 'COLUMN_NAME');
+  $meta = ms_table_meta($db, $table);
+  if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE' || ms_sqlite_without_rowid((string)($meta['CREATE_SQL'] ?? ''))) return [];
+  $names = array_map('strtolower', array_column($columns, 'COLUMN_NAME'));
+  foreach (['_rowid_', 'rowid', 'oid'] as $name) if (!in_array($name, $names, true)) return [$name];
+  return []; // All rowid names shadowed: browse safely, refuse ambiguous mutations.
+}
+
+function ms_sqlite_projection(MSDatabase $db, string $table): string {
+  $keys = primary_columns($db, $table);
+  $columns = table_columns($db, $table);
+  $names = array_column($columns, 'COLUMN_NAME');
+  $parts = $keys && !in_array($keys[0], $names, true) ? [qi($keys[0]) . ' AS ' . qi($keys[0]), '*'] : ['*'];
+  return implode(', ', array_merge($parts, ms_sqlite_identity_extras($columns, $keys)));
+}
+
+function ms_sqlite_page_supported(string $page): bool {
+  return in_array($page, ['databases','database','structure','select','row','sql','settings','global_search'], true);
+}
+
+function ms_sqlite_action_supported(string $action): bool {
+  return in_array($action, ['select_db','save_row','delete_row','delete_rows','bulk_update','run_sql','switch_profile','create_profile','rename_profile','delete_profile','reset_profile','save_settings','save_profile_settings','kick_session','kick_presence_session','save_view_preset','open_problem_queue','query_history_toggle','query_history_delete','query_history_clear','run_global_search','save_global_search','delete_global_search','open_generated_sql','column_view_hide','column_view_show','column_view_show_all','column_view_hide_primary','column_view_image_remove','column_view_soft_fk_remove','column_view_save','column_view_clear','column_view_label','column_view_presentation'], true) || strpos($action, 'column_view_') === 0;
+}
+
+// CLI tests load the same production functions without running the web router.
+if (PHP_SAPI === 'cli' && defined('MS_LIBRARY_ONLY') && MS_LIBRARY_ONLY) return;
+
 ms_auto_update();
 
-function db_all(mysqli $db, string $sql): array {
-  $result = $db->query($sql);
-  if (!$result instanceof mysqli_result) {
-    return [];
-  }
+function db_all(MSDatabase $db, string $sql, array $params = [], array $blobs = []): array {
+  $result = $params ? $db->run($sql, $params, $blobs) : $db->query($sql);
+  if ($result === false) throw new RuntimeException($db->error);
+  if (!ms_is_result($result)) return [];
   $rows = [];
   while ($row = $result->fetch_assoc()) {
     $rows[] = $row;
@@ -2635,17 +3242,18 @@ function db_all(mysqli $db, string $sql): array {
   return $rows;
 }
 
-function db_one(mysqli $db, string $sql): ?array {
-  $rows = db_all($db, $sql);
+function db_one(MSDatabase $db, string $sql, array $params = [], array $blobs = []): ?array {
+  $rows = db_all($db, $sql, $params, $blobs);
   return $rows[0] ?? null;
 }
 
-function server_version(mysqli $db): string {
+function server_version(MSDatabase $db): string {
+  if ($db->engine === 'sqlite') return 'SQLite ' . $db->server_info;
   $row = db_one($db, 'SELECT VERSION() AS version');
   return (string)($row['version'] ?? $db->server_info);
 }
 
-function is_mariadb(mysqli $db): bool {
+function is_mariadb(MSDatabase $db): bool {
   return stripos(server_version($db), 'mariadb') !== false;
 }
 
@@ -2653,11 +3261,17 @@ function selected_db(): string {
   return isset($_SESSION['ms_db']) ? (string)$_SESSION['ms_db'] : '';
 }
 
-function connect_db(bool $selectDatabase = true): mysqli {
+function connect_db(bool $selectDatabase = true): MSDatabase {
   if (empty($_SESSION['ms_login']) || !is_array($_SESSION['ms_login'])) {
     throw new RuntimeException('Not authenticated.');
   }
   $c = $_SESSION['ms_login'];
+  if (($c['engine'] ?? 'mysql') === 'sqlite') {
+    [, $hash] = ms_sqlite_config();
+    if ($hash === '' || !hash_equals(hash('sha256', $hash), (string)($c['sqlite_auth'] ?? ''))) throw new RuntimeException('SQLite credentials changed. Log in again.');
+    return new MSSQLiteDatabase((string)$c['path']);
+  }
+  if (!class_exists('mysqli')) throw new RuntimeException('The PHP mysqli extension is required.');
   mysqli_report(MYSQLI_REPORT_OFF);
   $socket = !empty($c['socket']) ? (string)$c['socket'] : '';
   if ($socket !== '') {
@@ -2674,7 +3288,7 @@ function connect_db(bool $selectDatabase = true): mysqli {
     unset($_SESSION['ms_db']);
     throw new RuntimeException('Cannot select database: ' . $db->error);
   }
-  return $db;
+  return new MSDatabase($db);
 }
 
 function ms_diagnostics_report_file(): string {
@@ -2732,11 +3346,11 @@ function ms_diagnostics_add_case(array &$results, string $group, string $name, s
   ];
 }
 
-function ms_diagnostics_query(mysqli $db, string $sql): void {
+function ms_diagnostics_query(MSDatabase $db, string $sql): void {
   if (!$db->query($sql)) throw new RuntimeException($db->error . ' — SQL: ' . $sql);
 }
 
-function ms_diagnostics_repair_cases(mysqli $db, array &$results, string $group): void {
+function ms_diagnostics_repair_cases(MSDatabase $db, array &$results, string $group): void {
   ms_diagnostics_query($db, "CREATE TABLE repair_rows (id INT NOT NULL, flag TINYINT NOT NULL, value VARCHAR(20) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB");
   ms_diagnostics_query($db, "INSERT INTO repair_rows VALUES (1,1,'old'),(2,0,'old'),(3,0,'old')");
   ms_diagnostics_query($db, "CREATE TABLE repair_unique (tenant BIGINT UNSIGNED NOT NULL, code VARBINARY(12) NOT NULL, value VARCHAR(20) NOT NULL, UNIQUE KEY uq (tenant,code)) ENGINE=InnoDB");
@@ -2938,7 +3552,7 @@ function ms_diagnostics_run(): array {
       }
     });
     ms_diagnostics_add_case($report['results'], $groups[0], 'NULL and empty string remain distinct', 'SELECT SUM(note IS NULL), SUM(note = \'\') FROM children', [], ['nulls'=>'1','empty'=>'1'], static function () use ($diag): array {
-      $row = db_one($diag, "SELECT CAST(SUM(`note` IS NULL) AS CHAR) AS nulls, CAST(SUM(`note` = '') AS CHAR) AS empty FROM `children`");
+      $row = db_one($diag, "SELECT CAST(SUM(`note` IS NULL) AS CHAR) AS nulls, CAST(SUM(`note` = '') AS CHAR) AS `empty` FROM `children`");
       return ['nulls'=>(string)($row['nulls'] ?? ''),'empty'=>(string)($row['empty'] ?? '')];
     });
 
@@ -3091,7 +3705,7 @@ function ms_diagnostics_run(): array {
       $report['results'][] = ['group'=>'Environment','name'=>'Diagnostics runner','status'=>'fail','duration_ms'=>0,'sql'=>'','parameters'=>[],'expected'=>'All cases execute','actual'=>null,'exception'=>get_class($setupError) . ': ' . $setupError->getMessage()];
     }
   } finally {
-    if ($diag instanceof mysqli && $created) {
+    if ($diag instanceof MSDatabase && $created) {
       if ($diag->query('DROP DATABASE ' . qi($database))) {
         $report['cleanup'] = ['status'=>'pass','exception'=>''];
       } else {
@@ -3100,7 +3714,7 @@ function ms_diagnostics_run(): array {
     } else {
       $report['cleanup'] = ['status'=>$created ? 'fail' : 'not_needed','exception'=>''];
     }
-    if ($diag instanceof mysqli) $diag->close();
+    if ($diag instanceof MSDatabase) $diag->close();
   }
 
   foreach ($groups as $group) {
@@ -3115,12 +3729,14 @@ function ms_diagnostics_run(): array {
   return $report;
 }
 
-function table_exists(mysqli $db, string $table): bool {
+function table_exists(MSDatabase $db, string $table): bool {
+  if ($db->engine === 'sqlite') return ms_table_meta($db, $table) !== null;
   $row = db_one($db, 'SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table));
   return (int)($row['n'] ?? 0) > 0;
 }
 
-function table_columns(mysqli $db, string $table): array {
+function table_columns(MSDatabase $db, string $table): array {
+  if ($db->engine === 'sqlite') return ms_sqlite_columns($db, $table);
   return db_all($db, 'SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table) . ' ORDER BY ORDINAL_POSITION');
 }
 
@@ -3133,9 +3749,9 @@ function ms_insight_groupable(array $column): bool {
   return in_array($type, ['tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double','real','date','datetime','timestamp','time','year'], true);
 }
 
-function ms_insight_rows(mysqli $db, string $sql): array {
+function ms_insight_rows(MSDatabase $db, string $sql): array {
   $result = $db->query($sql);
-  if (!$result instanceof mysqli_result) throw new RuntimeException('Analysis query failed: ' . $db->error);
+  if (!ms_is_result($result)) throw new RuntimeException('Analysis query failed: ' . $db->error);
   $rows = [];
   while ($row = $result->fetch_assoc()) $rows[] = $row;
   $result->free();
@@ -3160,7 +3776,7 @@ function ms_insight_group_decode(string $token, array $columns): array {
   return $values;
 }
 
-function ms_insight_analyze(mysqli $db, string $table, array $column): array {
+function ms_insight_analyze(MSDatabase $db, string $table, array $column): array {
   $name = (string)$column['COLUMN_NAME'];
   $field = qi($name);
   $type = strtolower((string)$column['DATA_TYPE']);
@@ -3212,7 +3828,7 @@ function ms_insight_analyze(mysqli $db, string $table, array $column): array {
     'groupable' => $groupable];
 }
 
-function ms_insight_duplicates(mysqli $db, string $table, array $names, array $columns, int $page): array {
+function ms_insight_duplicates(MSDatabase $db, string $table, array $names, array $columns, int $page): array {
   $available = [];
   foreach ($columns as $column) if (ms_insight_groupable($column)) $available[(string)$column['COLUMN_NAME']] = true;
   $names = array_values(array_unique($names));
@@ -3250,7 +3866,7 @@ function ms_soft_fk_format(array $rule, array $row): string {
   return strtr($format === '' ? '%1' : $format, $replace);
 }
 
-function ms_soft_fk_post_rule(mysqli $db): array {
+function ms_soft_fk_post_rule(MSDatabase $db): array {
   $table = p('soft_fk_table');
   $id = p('soft_fk_id_column');
   if ($table === '' || !table_exists($db, $table)) {
@@ -3275,7 +3891,7 @@ function ms_soft_fk_post_rule(mysqli $db): array {
   return ['table' => $table, 'id_column' => $id, 'value_column' => $columns[0], 'value_columns' => $columns, 'display_format' => $format];
 }
 
-function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
+function ms_soft_fk_maps(MSDatabase $db, array $rows, array $rules): array {
   $maps = [];
   if (!$rows || !$rules) {
     return $maps;
@@ -3290,7 +3906,8 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
     if ($targetTable === '' || $idColumn === '' || !$valueColumns || $valueColumns[0] === '' || !table_exists($db, $targetTable)) {
       continue;
     }
-    $targetColumns = array_column(table_columns($db, $targetTable), 'COLUMN_NAME');
+    $targetMeta = table_columns($db, $targetTable);
+    $targetColumns = array_column($targetMeta, 'COLUMN_NAME');
     if (!in_array($idColumn, $targetColumns, true) || array_diff($valueColumns, $targetColumns)) {
       continue;
     }
@@ -3311,7 +3928,9 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
       $quoted[] = qs($db, $value);
     }
     $selectedColumns = array_values(array_unique(array_merge([$idColumn], $valueColumns, $identityColumns)));
-    $lookup = db_all($db, 'SELECT ' . implode(', ', array_map('qi', $selectedColumns)) . ' FROM ' . qi($targetTable) .
+    $projection = array_map(static function (string $name) use ($db): string { return qi($name) . ($db->engine === 'sqlite' ? ' AS ' . qi($name) : ''); }, $selectedColumns);
+    if ($db->engine === 'sqlite') $projection = array_merge($projection, ms_sqlite_identity_extras($targetMeta, $identityColumns));
+    $lookup = db_all($db, 'SELECT ' . implode(', ', $projection) . ' FROM ' . qi($targetTable) .
       ' WHERE ' . qi($idColumn) . ' IN (' . implode(', ', $quoted) . ')');
     $map = [];
     foreach ($lookup as $targetRow) {
@@ -3328,6 +3947,7 @@ function ms_soft_fk_maps(mysqli $db, array $rows, array $rules): array {
       }
       $identity = [];
       foreach ($identityColumns as $identityColumn) $identity[$identityColumn] = $targetRow[$identityColumn] ?? null;
+      if ($db->engine === 'sqlite') $identity = ms_sqlite_row_identity($targetMeta, $identityColumns, $targetRow);
       $map[$key] = ['display' => $display, 'identity' => $identity, 'ambiguous' => false];
     }
     $maps[$sourceColumn] = $map;
@@ -3817,12 +4437,38 @@ function ms_display_rule_from_post(string $style): array {
   throw new RuntimeException('Choose a valid display style.');
 }
 
-function primary_columns(mysqli $db, string $table): array {
+function primary_columns(MSDatabase $db, string $table): array {
+  if ($db->engine === 'sqlite') return ms_sqlite_identity_columns($db, $table);
   $rows = db_all($db, 'SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . qs($db, $table) . " AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION");
   return array_column($rows, 'COLUMN_NAME');
 }
 
-function row_identity_where(mysqli $db, array $columns, array $source): string {
+function row_identity_where(MSDatabase $db, array $columns, array $source): string {
+  if ($db->engine === 'sqlite') {
+    if (isset($source["\0sqlite"])) {
+      [$where, $values, $blobs] = ms_sqlite_where($db, g('table'), $source);
+      $i = 0;
+      // Only generated placeholders are substituted; identifier text is tokenized.
+      $sql = ''; $end = 0;
+      foreach (ms_sqlite_tokens($where) as $token) {
+        if ($token['text'] !== '?') continue;
+        $sql .= substr($where, $end, $token['start'] - $end);
+        $sql .= isset($blobs[$i]) ? "X'" . bin2hex((string)$values[$i]) . "'" : qs($db, $values[$i]);
+        $i++; $end = $token['end'];
+      }
+      return $sql . substr($where, $end);
+    }
+    $names = primary_columns($db, g('table')) ?: array_column($columns, 'COLUMN_NAME');
+    $columnMap = array_column($columns, null, 'COLUMN_NAME');
+    $parts = [];
+    foreach ($names as $name) {
+      if (!array_key_exists($name, $source) || is_array($source[$name]) || is_object($source[$name])) throw new RuntimeException('Invalid row identity.');
+      $value = $source[$name];
+      $literal = ($columnMap[$name]['DATA_TYPE'] ?? '') === 'blob' && $value !== null ? "X'" . bin2hex((string)$value) . "'" : qs($db, $value);
+      $parts[] = qi($name) . ($value === null ? ' IS NULL' : ' = ' . $literal);
+    }
+    return implode(' AND ', $parts) ?: '0=1';
+  }
   $primary = primary_columns($db, g('table'));
   $names = $primary ?: array_column($columns, 'COLUMN_NAME');
   $parts = [];
@@ -3855,7 +4501,7 @@ function sql_type_options(): array {
   return ['BIT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'DEC', 'NUMERIC', 'FIXED', 'FLOAT', 'DOUBLE', 'DOUBLE PRECISION', 'REAL', 'BOOL', 'BOOLEAN', 'SERIAL', 'CHAR', 'VARCHAR', 'BINARY', 'VARBINARY', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'TINYBLOB', 'BLOB', 'MEDIUMBLOB', 'LONGBLOB', 'ENUM', 'SET', 'JSON', 'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR', 'GEOMETRY', 'POINT', 'LINESTRING', 'POLYGON', 'MULTIPOINT', 'MULTILINESTRING', 'MULTIPOLYGON', 'GEOMETRYCOLLECTION', 'VECTOR', 'UUID', 'INET6'];
 }
 
-function build_column_sql(mysqli $db, array $source, bool $includeName = true): string {
+function build_column_sql(MSDatabase $db, array $source, bool $includeName = true): string {
   $name = trim((string)($source['name'] ?? ''));
   $type = strtoupper(trim((string)($source['type'] ?? 'VARCHAR')));
   if (!in_array($type, sql_type_options(), true)) {
@@ -4142,6 +4788,13 @@ function ms_normalize_float_literal(array $column, string $value): string {
 
 function ms_normalize_column_literal(array $column, $rawValue): string {
   $value = is_scalar($rawValue) || $rawValue === null ? (string)$rawValue : '';
+  if (isset($column['SQLITE_AFFINITY'])) {
+    if (!empty($column['SQLITE_ROWID_ALIAS']) && $value !== '') {
+      $integerColumn = $column; $integerColumn['DATA_TYPE'] = 'bigint';
+      return ms_normalize_integer_literal($integerColumn, $value);
+    }
+    return $value;
+  }
   $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
   if (in_array($type, ['tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint'], true)) {
     return ms_normalize_integer_literal($column, $value);
@@ -4178,6 +4831,7 @@ function ms_normalize_column_literal(array $column, $rawValue): string {
 }
 
 function ms_column_edit_spec(array $column): array {
+  if (isset($column['SQLITE_AFFINITY'])) return ['kind'=>'text','inputmode'=>'text','placeholder'=>'','help'=>'SQLite ' . $column['SQLITE_AFFINITY'] . ' affinity','maxlength'=>0,'unsigned'=>false,'min'=>'','max'=>'','precision'=>0,'scale'=>0];
   $type = strtolower((string)($column['DATA_TYPE'] ?? ''));
   $columnType = strtolower((string)($column['COLUMN_TYPE'] ?? ''));
   $unsigned = strpos($columnType, 'unsigned') !== false;
@@ -4435,7 +5089,7 @@ function ms_sql_parameters_from_post(): array {
   return $parameters;
 }
 
-function ms_sql_parameter_literal(mysqli $db, string $name, array $parameter): string {
+function ms_sql_parameter_literal(MSDatabase $db, string $name, array $parameter): string {
   $type = (string)($parameter['type'] ?? 'text');
   $value = (string)($parameter['value'] ?? '');
   if ($type === 'null') return 'NULL';
@@ -4454,7 +5108,7 @@ function ms_sql_parameter_literal(mysqli $db, string $name, array $parameter): s
   return qs($db, $value);
 }
 
-function ms_expand_sql_parameters(mysqli $db, string $sql, array $parameters): string {
+function ms_expand_sql_parameters(MSDatabase $db, string $sql, array $parameters): string {
   $output = '';
   $length = strlen($sql);
   $quote = '';
@@ -4475,20 +5129,20 @@ function ms_expand_sql_parameters(mysqli $db, string $sql, array $parameters): s
     }
     if ($quote !== '') {
       $output .= $char;
-      if ($char === '\\' && $next !== '') { $output .= $next; $i++; }
-      elseif ($char === $quote) {
-        if ($next === $quote) { $output .= $next; $i++; }
+      if ($db->engine !== 'sqlite' && $char === '\\' && $next !== '') { $output .= $next; $i++; }
+      elseif ($char === $quote || ($quote === '[' && $char === ']')) {
+        if ($quote !== '[' && $next === $quote) { $output .= $next; $i++; }
         else $quote = '';
       }
       continue;
     }
-    if ($char === '#' || ($char === '-' && $next === '-' && ($i + 2 >= $length || ctype_space($sql[$i + 2])))) {
+    if (($db->engine !== 'sqlite' && $char === '#') || ($char === '-' && $next === '-' && ($db->engine === 'sqlite' || $i + 2 >= $length || ctype_space($sql[$i + 2])))) {
       $lineComment = true; $output .= $char; continue;
     }
     if ($char === '/' && $next === '*') {
       $blockComment = true; $output .= '/*'; $i++; continue;
     }
-    if (in_array($char, ["'", '"', '`'], true)) {
+    if (in_array($char, $db->engine === 'sqlite' ? ["'", '"', '`', '['] : ["'", '"', '`'], true)) {
       $quote = $char; $output .= $char; continue;
     }
     if ($char === ':' && preg_match('/[A-Za-z_]/', $next) === 1) {
@@ -4505,23 +5159,23 @@ function ms_expand_sql_parameters(mysqli $db, string $sql, array $parameters): s
   return $output;
 }
 
-function execute_sql(mysqli $db, string $sql, bool $showAll = false, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
+function execute_sql(MSDatabase $db, string $sql, bool $showAll = false, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
   $started = microtime(true);
   $results = [];
   $displayLimit = max(1, min(100000, $displayLimit));
-  $statements = split_sql_script($sql);
+  $statements = $db->engine === 'sqlite' ? ms_sqlite_split($sql) : split_sql_script($sql);
   if (!$statements) {
     throw new RuntimeException('No executable SQL statement found.');
   }
   foreach ($statements as $statement) {
-    $exportable = sql_exportable_statement($statement);
+    $exportable = $db->engine !== 'sqlite' && sql_exportable_statement($statement);
     $exportToken = '';
     $result = $db->query($statement);
     if ($result === false) {
       throw new RuntimeException($db->error . ' — Statement: ' . substr($statement, 0, 300));
     }
     do {
-    if ($result instanceof mysqli_result) {
+    if (ms_is_result($result)) {
       $fields = $result->fetch_fields();
       $totalRows = $result->num_rows;
       $rows = [];
@@ -4566,7 +5220,7 @@ function execute_sql(mysqli $db, string $sql, bool $showAll = false, int $displa
     while ($db->more_results()) {
       $db->next_result();
       $extra = $db->store_result();
-      if ($extra instanceof mysqli_result) {
+      if (ms_is_result($extra)) {
         $extra->free();
       }
     }
@@ -4587,8 +5241,8 @@ function sql_statement_explainable(string $statement): bool {
   return preg_match('/\A(?:SELECT|UPDATE|DELETE|INSERT|REPLACE|WITH)\b/i', $clean) === 1;
 }
 
-function explain_sql(mysqli $db, string $sql, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
-  $statements = split_sql_script($sql);
+function explain_sql(MSDatabase $db, string $sql, int $displayLimit = MS_SQL_ROWS_DEFAULT): array {
+  $statements = $db->engine === 'sqlite' ? ms_sqlite_split($sql) : split_sql_script($sql);
   if (!$statements) {
     throw new RuntimeException('No executable SQL statement found.');
   }
@@ -4756,7 +5410,7 @@ function ms_download_export(string $filename, string $format, bool $zip, callabl
 }
 
 /** Bounded INSERT batches: never accumulate the entire MySQL result in PHP. */
-function ms_export_insert_rows(mysqli $db, mysqli_result $result, string $table, array $columnNames, $out): void {
+function ms_export_insert_rows(MSDatabase $db, $result, string $table, array $columnNames, $out): void {
   $prefix = 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $columnNames)) . ") VALUES\n";
   $batch = [];
   $batchBytes = 0;
@@ -4789,6 +5443,7 @@ function ms_export_hidden_fields(array $query, string $prefix = ''): void {
 
 /** Native GET controls: ZIP works without browser-side file generation. */
 function ms_render_result_export_controls(array $query, bool $selectPage = false): void {
+  if (ms_engine() === 'sqlite') return;
   static $counter = 0;
   $id = 'ms-result-zip-' . (++$counter);
   unset($query['format'], $query['zip'], $query['export_scope']);
@@ -4841,13 +5496,13 @@ function sql_result_export_entry(string $token): array {
   return ['database' => $database, 'statement' => $statement, 'created' => (int)$entry['created']];
 }
 
-function stream_sql_result_export(mysqli $db, array $entry, string $format, bool $zip = false, string $filenamePrefix = 'query-result'): void {
+function stream_sql_result_export(MSDatabase $db, array $entry, string $format, bool $zip = false, string $filenamePrefix = 'query-result'): void {
   ms_export_content_type($format);
   if (!$db->select_db((string)$entry['database'])) throw new RuntimeException($db->error);
   $filename = $filenamePrefix . '-' . gmdate('Ymd-His') . '.' . $format;
   ms_download_export($filename, $format, $zip, static function ($out) use ($db, $entry, $format): void {
-    $result = $db->query((string)$entry['statement'], MYSQLI_USE_RESULT);
-    if (!$result instanceof mysqli_result) {
+    $result = $db->query((string)$entry['statement'], (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
+    if (!ms_is_result($result)) {
       throw new RuntimeException($db->error ?: 'The statement did not return a result set.');
     }
     try {
@@ -4889,7 +5544,7 @@ function stream_sql_result_export(mysqli $db, array $entry, string $format, bool
   });
 }
 
-function dump_database(mysqli $db, array $tables, bool $structure, bool $data, bool $drop, $out = null): void {
+function dump_database(MSDatabase $db, array $tables, bool $structure, bool $data, bool $drop, $out = null): void {
   $ownsStream = $out === null;
   if ($ownsStream) $out = @fopen('php://output', 'wb');
   if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
@@ -4911,8 +5566,8 @@ function dump_database(mysqli $db, array $tables, bool $structure, bool $data, b
         ms_export_write($out, $create['Create Table'] . ";\n\n");
       }
       if ($data) {
-        $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
-        if (!$result instanceof mysqli_result) throw new RuntimeException('Unable to export ' . $table . ': ' . $db->error);
+        $result = $db->query('SELECT * FROM ' . qi($table), (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
+        if (!ms_is_result($result)) throw new RuntimeException('Unable to export ' . $table . ': ' . $db->error);
         try {
           $columns = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
           ms_export_insert_rows($db, $result, $table, $columns, $out);
@@ -4963,14 +5618,14 @@ function dump_database(mysqli $db, array $tables, bool $structure, bool $data, b
   }
 }
 
-function csv_export(mysqli $db, string $table, string $delimiter = ',', $out = null): void {
+function csv_export(MSDatabase $db, string $table, string $delimiter = ',', $out = null): void {
   $ownsStream = $out === null;
   if ($ownsStream) $out = @fopen('php://output', 'wb');
   if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
   $result = null;
   try {
-    $result = $db->query('SELECT * FROM ' . qi($table), MYSQLI_USE_RESULT);
-    if (!$result instanceof mysqli_result) throw new RuntimeException($db->error);
+    $result = $db->query('SELECT * FROM ' . qi($table), (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
+    if (!ms_is_result($result)) throw new RuntimeException($db->error);
     $headers = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
     ms_export_csv_row($out, $headers, $delimiter);
     while (($row = $result->fetch_row()) !== null && $row !== false) {
@@ -4978,7 +5633,7 @@ function csv_export(mysqli $db, string $table, string $delimiter = ',', $out = n
     }
     if ($db->errno) throw new RuntimeException('MySQL export failed: ' . $db->error);
   } finally {
-    if ($result instanceof mysqli_result) $result->free();
+    if (ms_is_result($result)) $result->free();
     if ($ownsStream && is_resource($out)) fclose($out);
   }
 }
@@ -5130,11 +5785,11 @@ function ms_import_cell_text($value): string {
   return (string)$value;
 }
 
-function ms_import_execute_rows(mysqli $db, string $token): array {
+function ms_import_execute_rows(MSDatabase $db, string $token): array {
   $entry = ms_import_entry($token);
   $data = ms_import_load_rows($entry);
   $table = p('import_table');
-  $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+  $meta = ms_table_meta($db, $table);
   if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('Choose a valid target table.');
   $columns = table_columns($db, $table);
   $columnMap = [];
@@ -5218,7 +5873,7 @@ function ms_import_execute_rows(mysqli $db, string $token): array {
   return ['table' => $table, 'success' => $success, 'errors' => count($errors), 'error_token' => $errorToken, 'mode' => $mode];
 }
 
-function raw_definition(mysqli $db, string $kind, string $name): string {
+function raw_definition(MSDatabase $db, string $kind, string $name): string {
   if ($kind === 'VIEW') {
     $row = db_one($db, 'SHOW CREATE VIEW ' . qi($name));
     return (string)($row['Create View'] ?? '');
@@ -5249,29 +5904,45 @@ try {
     if ($attempts >= 5 && time() - $lastAttempt < 60) {
       throw new RuntimeException('Too many connection attempts. Wait one minute.');
     }
-    $host = trim(p('host', 'localhost'));
-    $port = max(1, min(65535, (int)p('port', '3306')));
-    $user = trim(p('user'));
-    $password = p('password');
-    $socket = trim(p('socket'));
-    if ($host === '' || $user === '' || $password === '') {
-      throw new RuntimeException('Host, user and a non-empty password are required.');
-    }
-    mysqli_report(MYSQLI_REPORT_OFF);
-    if ($socket !== '') {
-      $test = new mysqli($host, $user, $password, '', $port, $socket);
-    } else {
-      $test = new mysqli($host, $user, $password, '', $port);
-    }
-    if ($test->connect_errno) {
+    $engine = p('engine', 'mysql');
+    if (!in_array($engine, ['mysql','sqlite'], true)) throw new RuntimeException('Unknown database engine.');
+    try {
+      if ($engine === 'sqlite') {
+        [, $hash] = ms_sqlite_config();
+        if ($hash === '' || !password_verify(p('password'), $hash)) throw new RuntimeException('SQLite login failed. Check the administrator password and server configuration.');
+        $path = ms_sqlite_path(trim(p('sqlite_file')));
+        $test = new MSSQLiteDatabase($path);
+        $test->close();
+        $login = ['engine'=>'sqlite', 'path'=>$path, 'sqlite_auth'=>hash('sha256', $hash), 'user'=>'SQLite administrator'];
+      } else {
+        $host = trim(p('host', 'localhost'));
+        $port = max(1, min(65535, (int)p('port', '3306')));
+        $user = trim(p('user'));
+        $password = p('password');
+        $socket = trim(p('socket'));
+        if ($host === '' || $user === '' || $password === '') throw new RuntimeException('Host, user and a non-empty password are required.');
+        if (!class_exists('mysqli')) throw new RuntimeException('The PHP mysqli extension is required.');
+        mysqli_report(MYSQLI_REPORT_OFF);
+        $test = $socket !== '' ? new mysqli($host, $user, $password, '', $port, $socket) : new mysqli($host, $user, $password, '', $port);
+        if ($test->connect_errno) throw new RuntimeException('Connection failed: ' . $test->connect_error);
+        $test->close();
+        $login = compact('engine', 'host', 'port', 'user', 'password', 'socket');
+      }
+    } catch (Throwable $loginError) {
       $_SESSION['ms_attempts'] = $attempts + 1;
       $_SESSION['ms_last_attempt'] = time();
-      throw new RuntimeException('Connection failed: ' . $test->connect_error);
+      throw $loginError;
     }
-    $test->close();
+    $previousEngine = ms_engine();
     $returnQuery = ms_decode_navigation(p('return_to'));
     session_regenerate_id(true);
-    $_SESSION['ms_login'] = compact('host', 'port', 'user', 'password', 'socket');
+    $_SESSION['ms_login'] = $login;
+    if ($engine === 'sqlite') $_SESSION['ms_db'] = 'main';
+    elseif ($previousEngine !== 'mysql') unset($_SESSION['ms_db']);
+    if ($previousEngine !== $engine) {
+      unset($_SESSION['ms_last_sql'], $_SESSION['ms_last_sql_params'], $_SESSION['ms_clone'], $_SESSION['ms_clone_rows'], $_SESSION['ms_sql_exports']);
+      $returnQuery = [];
+    }
     $_SESSION['ms_presence_id'] = bin2hex(random_bytes(32));
     $_SESSION['ms_presence_login_at'] = time();
     $_SESSION['ms_attempts'] = 0;
@@ -5322,6 +5993,7 @@ try {
     }
     ms_profile_config_ensure();
     $db = connect_db(false);
+    if ($db->engine === 'sqlite' && g('download') !== '' && !in_array(g('download'), ['blob','table_structure_sql'], true)) throw new RuntimeException('SQLite export is not yet available.');
 
     if (g('ajax') === 'profile_config') {
       header('Content-Type: application/json; charset=UTF-8');
@@ -5352,7 +6024,7 @@ try {
           if (strlen($orderJson) > 2097152) throw new RuntimeException('The object order is too large.');
           $order = json_decode($orderJson, true);
           if (!is_array($order) || json_last_error() !== JSON_ERROR_NONE) throw new RuntimeException('Invalid object order.');
-          $available = array_column(db_all($db, 'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'), 'TABLE_NAME');
+          $available = array_column(ms_table_list($db), 'TABLE_NAME');
           ms_profile_set_sidebar_object_order($database, $order, $available);
         } elseif ($configAction === 'edit_pretty_view') {
           $database = selected_db();
@@ -5365,7 +6037,7 @@ try {
           if ($database === '' || !$db->select_db($database)) throw new RuntimeException('Choose a database first.');
           $table = p('table');
           if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
-          $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+          $meta = ms_table_meta($db, $table);
           $displayName = trim(p('display_name'));
           $displayLength = preg_match_all('/./us', $displayName);
           if ($displayLength === false || $displayLength > 120 || preg_match('/[\x00-\x1f\x7f]/', $displayName)) throw new RuntimeException('Displayed table name must be at most 120 characters on one line.');
@@ -5466,6 +6138,7 @@ try {
         $table = g('table');
         if ($table === '' || !table_exists($db, $table)) throw new RuntimeException('Table or view not found.');
         $columns = table_columns($db, $table);
+        if ($db->engine === 'sqlite') throw new RuntimeException('Column analysis is not yet available for SQLite.');
         if (g('kind') === 'analyze') {
           $column = null;
           foreach ($columns as $candidate) if ((string)$candidate['COLUMN_NAME'] === g('column')) $column = $candidate;
@@ -5506,7 +6179,7 @@ try {
           if (!array_key_exists($key, $identity) || (is_array($identity[$key]) || is_object($identity[$key]))) throw new RuntimeException('Invalid row identity.');
           $where[] = qi((string)$key) . ($identity[$key] === null ? ' IS NULL' : ' = ' . qs($db, $identity[$key]));
         }
-        $row = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . implode(' AND ', $where) . ' LIMIT 1');
+        $row = db_one($db, 'SELECT * FROM ' . qi($table) . ' WHERE ' . ($db->engine === 'sqlite' ? row_identity_where($db, $columns, $identity) : implode(' AND ', $where)) . ' LIMIT 1');
         if ($row === null) throw new RuntimeException('The row was not found. Reload the table and try again.');
         $view = ms_column_view_table_config($database, $table);
         $hidden = $view['hidden'];
@@ -5568,8 +6241,8 @@ try {
           throw new RuntimeException('Table or view not found.');
         }
         $columns = table_columns($db, $table);
-        $meta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
-        $editable = ($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE';
+        $meta = ms_table_meta($db, $table);
+        $editable = ($meta['TABLE_TYPE'] ?? '') === 'BASE TABLE' && ($db->engine !== 'sqlite' || primary_columns($db, $table));
         $offset = max(0, (int)g('offset', '0'));
         $count = max(1, min(5000, (int)g('count', (string)ms_profile_setting_int('selectRows', MS_ROWS_PER_PAGE, 1, 500))));
         [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll] = build_select_query($db, $table, $columns, $offset, $count);
@@ -5592,7 +6265,7 @@ try {
         $softFkMaps = $aggregated ? [] : ms_soft_fk_maps($db, $rows, $softFkRules);
         $relations = [];
         if (!$aggregated) {
-          foreach (db_all($db, "SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=" . qs($db,$table) . " AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation) {
+          foreach (ms_foreign_keys($db, $table) as $relation) {
             $relations[$relation['COLUMN_NAME']] = $relation;
           }
         }
@@ -5602,7 +6275,7 @@ try {
           $returnQuery = ['page'=>'select','table'=>$table];
         }
         $returnToken = ms_encode_navigation($returnQuery);
-        $softDeleteRule = $aggregated ? null : ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $table), $columns);
+        $softDeleteRule = $aggregated || $db->engine === 'sqlite' ? null : ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $table), $columns);
         $html = ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
         $nextOffset = $offset + count($rows);
         echo json_encode([
@@ -5647,7 +6320,7 @@ try {
       if ($table === '' || !table_exists($db, $table)) {
         throw new RuntimeException('Table not found.');
       }
-      $create = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
+      $create = $db->engine === 'sqlite' ? ['Create Table'=>ms_table_meta($db, $table)['CREATE_SQL']] : db_one($db, 'SHOW CREATE TABLE ' . qi($table));
       $statement = (string)($create['Create Table'] ?? '');
       if ($statement === '') {
         throw new RuntimeException('Unable to read the CREATE TABLE statement.');
@@ -5725,7 +6398,7 @@ try {
       ms_export_content_type($format);
       $zip = g('zip') === '1';
       $selected = isset($_GET['tables']) && is_array($_GET['tables']) ? array_map('strval', $_GET['tables']) : [];
-      $available = array_column(db_all($db, 'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME'), 'TABLE_NAME');
+      $available = array_column(ms_table_list($db), 'TABLE_NAME');
       $tables = $selected ? array_values(array_intersect($available, $selected)) : $available;
       if ($selected && count(array_unique($selected)) !== count($tables)) throw new RuntimeException('One or more selected objects are no longer available.');
       if ($format === 'csv' || $format === 'tsv') {
@@ -5750,6 +6423,7 @@ try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && p('action') !== '') {
       require_csrf();
       $action = p('action');
+      if ($db->engine === 'sqlite') ms_sqlite_dispatch_action($db, $action);
 
       if ($action === 'switch_profile') {
         ms_set_active_profile(p('profile'));
@@ -5812,7 +6486,7 @@ try {
 
       if ($action === 'select_db') {
         $database = p('database');
-        $allowed = array_column(db_all($db, 'SHOW DATABASES'), 'Database');
+        $allowed = $db->engine === 'sqlite' ? ['main'] : array_column(db_all($db, 'SHOW DATABASES'), 'Database');
         if (!in_array($database, $allowed, true)) {
           throw new RuntimeException('Database is not available.');
         }
@@ -6600,7 +7274,7 @@ try {
           throw new RuntimeException('The soft-delete settings changed. Refresh the table and try again.');
         }
         if ($action === 'soft_delete_row') {
-          $meta = db_one($db, 'SELECT TABLE_TYPE, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
+          $meta = ms_table_meta($db, $table);
           if (($meta['TABLE_TYPE'] ?? '') !== 'BASE TABLE') throw new RuntimeException('Only tables can have rows soft-deleted.');
           if ($rule === null) throw new RuntimeException('This table has no valid soft-delete column.');
           $transactional = false;
@@ -8279,6 +8953,7 @@ function render_sidebar(): void {
     ['variables', 'fa-sliders', 'Variables'],
     ['diagnostics', 'fa-stethoscope', 'Diagnostics']
   ];
+  if (ms_engine() === 'sqlite') $items = array_values(array_filter($items, static function (array $item): bool { return ms_sqlite_page_supported($item[0]); }));
   $rawDbView = ms_raw_db_view();
   $profileNames = ms_profile_names();
   $activeProfile = ms_active_profile_name();
@@ -8288,8 +8963,8 @@ function render_sidebar(): void {
   $databaseConfig = $dbName !== '' ? ms_profile_database_config($dbName) : [];
   $sidebarTableConfigs = isset($databaseConfig['tables']) && is_array($databaseConfig['tables']) ? $databaseConfig['tables'] : [];
   $availableDatabases = [];
-  if (isset($GLOBALS['db']) && $GLOBALS['db'] instanceof mysqli) {
-    foreach (db_all($GLOBALS['db'], 'SHOW DATABASES') as $databaseRow) {
+  if (isset($GLOBALS['db']) && $GLOBALS['db'] instanceof MSDatabase) {
+    foreach (ms_engine() === 'sqlite' ? [['Database'=>'main']] : db_all($GLOBALS['db'], 'SHOW DATABASES') as $databaseRow) {
       if (isset($databaseRow['Database'])) $availableDatabases[] = (string)$databaseRow['Database'];
     }
   }
@@ -8317,7 +8992,7 @@ function render_sidebar(): void {
       if ($dbName === '') return;
       try {
         $sideDb = connect_db();
-        $tables = db_all($sideDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
+        $tables = ms_table_list($sideDb);
         $tables = ms_sidebar_ordered_objects($tables, $dbName);
         ?><div id="ms-sidebar-objects-block"><div class="d-flex align-items-center gap-1 mb-2"><div class="small text-uppercase text-body-secondary">Objects</div><button class="btn btn-sm ms-pretty-toggle ms-sidebar-order-toggle" type="button" data-ms-sidebar-order-toggle aria-controls="ms-sidebar-objects-list" aria-pressed="false" title="View objects. Enable editing to reorder tables and views" aria-label="View objects. Enable editing to reorder tables and views"><i class="fa-solid fa-eye" aria-hidden="true"></i></button></div><div class="list-group list-group-flush small" id="ms-sidebar-objects-list" data-ms-sidebar-order-mode="view">
         <?php foreach ($tables as $t) {
@@ -8405,7 +9080,7 @@ function render_sql_results(array $results, float $time): void {
   }
 }
 
-function column_form_fields(mysqli $db, array $values = [], string $prefix = '', bool $showIndex = false): void {
+function column_form_fields(MSDatabase $db, array $values = [], string $prefix = '', bool $showIndex = false): void {
   $name = (string)($values['name'] ?? '');
   $type = strtoupper((string)($values['type'] ?? 'VARCHAR'));
   $index = strtoupper((string)($values['index'] ?? ''));
@@ -8434,26 +9109,49 @@ function page_login(string $error): void {
   }
   $returnToken = ms_encode_navigation($returnQuery);
   page_head('Connect', false);
-  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= flash() ?><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB administration</p></div>
+  ?><div class="row justify-content-center"><div class="col-lg-5 col-md-7"><?= flash() ?><?= ms_update_notice() ?><div class="text-center mb-4"><div class="display-5"><i class="fa-solid fa-cube text-primary"></i></div><h1 class="h2 d-flex justify-content-center align-items-center gap-2"><span><?= h(MS_APP_NAME) ?></span><span class="badge text-bg-secondary fs-6 fw-normal">v<?= h(MS_VERSION) ?></span></h1><p class="text-body-secondary">Single-file MySQL/MariaDB and SQLite administration</p></div>
   <?php if ($error !== '') { ?><div class="alert alert-danger"><?= h($error) ?></div><?php } ?>
   <div class="card shadow-sm"><div class="card-body p-4"><form method="post" autocomplete="off"><input type="hidden" name="action" value="login"><?php if ($returnToken !== '') { ?><input type="hidden" name="return_to" value="<?= h($returnToken) ?>"><?php } ?><?= csrf_field() ?>
-    <div class="row g-3"><div class="col-8"><label class="form-label">Server</label><input class="form-control" name="host" value="<?= h(p('host','localhost')) ?>" required autofocus></div><div class="col-4"><label class="form-label">Port</label><input class="form-control" type="number" name="port" value="<?= h(p('port','3306')) ?>" min="1" max="65535" required></div>
-    <div class="col-12"><label class="form-label">Unix socket <span class="text-body-secondary">(optional)</span></label><input class="form-control" name="socket" value="<?= h(p('socket')) ?>"></div>
-    <div class="col-12"><label class="form-label">Username</label><input class="form-control" name="user" value="<?= h(p('user')) ?>" required></div>
-    <div class="col-12"><label class="form-label">Password</label><input class="form-control" type="password" name="password" required></div>
-    <div class="col-12"><button class="btn btn-primary w-100"><i class="fa-solid fa-plug me-2"></i>Connect</button></div></div>
-  </form></div></div><div class="alert alert-warning small mt-3"><i class="fa-solid fa-shield-halved me-1"></i>Use HTTPS and restrict this file by IP or web-server authentication. Empty database passwords are intentionally refused.</div></div></div><?php
+    <div class="row g-3">
+      <div class="col-12"><label class="form-label" for="ms-engine">Database engine</label><select class="form-select" id="ms-engine" name="engine"><option value="mysql"<?= p('engine','mysql')==='mysql'?' selected':'' ?>>MySQL / MariaDB</option><option value="sqlite"<?= p('engine')==='sqlite'?' selected':'' ?>>SQLite</option></select></div>
+      <div class="col-8" data-ms-mysql-login><label class="form-label">Server</label><input class="form-control" name="host" value="<?= h(p('host','localhost')) ?>" required autofocus></div><div class="col-4" data-ms-mysql-login><label class="form-label">Port</label><input class="form-control" type="number" name="port" value="<?= h(p('port','3306')) ?>" min="1" max="65535" required></div>
+      <div class="col-12" data-ms-mysql-login><label class="form-label">Unix socket <span class="text-body-secondary">(optional)</span></label><input class="form-control" name="socket" value="<?= h(p('socket')) ?>"></div>
+      <div class="col-12" data-ms-mysql-login><label class="form-label">Username</label><input class="form-control" name="user" value="<?= h(p('user')) ?>" required></div>
+      <div class="col-12" data-ms-sqlite-login hidden><label class="form-label">SQLite filename</label><input class="form-control" name="sqlite_file" value="<?= h(p('sqlite_file')) ?>" placeholder="example.sqlite"><div class="form-text">Existing file inside the server's configured private SQLite directory. SQLite access requires MS_SQLITE_ROOT and MS_SQLITE_PASSWORD_HASH.</div></div>
+      <div class="col-12"><label class="form-label" id="ms-password-label">Password</label><input class="form-control" type="password" name="password" required></div>
+      <div class="col-12"><button class="btn btn-primary w-100"><i class="fa-solid fa-plug me-2"></i>Connect</button></div>
+    </div>
+  </form></div></div><div class="alert alert-warning small mt-3"><i class="fa-solid fa-shield-halved me-1"></i>Use HTTPS and restrict this file by IP or web-server authentication. Empty database passwords are intentionally refused.</div></div></div>
+  <script>
+  (() => {
+    const engine = document.getElementById('ms-engine');
+    const update = () => {
+      const sqlite = engine.value === 'sqlite';
+      document.querySelectorAll('[data-ms-mysql-login], [data-ms-sqlite-login]').forEach(group => {
+        const hidden = group.hasAttribute('data-ms-mysql-login') ? sqlite : !sqlite;
+        group.hidden = hidden;
+        group.querySelectorAll('input').forEach(input => { input.disabled = hidden; });
+      });
+      document.getElementById('ms-password-label').textContent = sqlite ? 'SQLite administrator password' : 'Password';
+      document.querySelector('[name="sqlite_file"]').required = sqlite;
+    };
+    engine.addEventListener('change', update);
+    update();
+  })();
+  </script><?php
   page_foot();
 }
 
-function page_databases(mysqli $db): void {
+function page_databases(MSDatabase $db): void {
+  if ($db->engine === 'sqlite') { ms_sqlite_page_database($db); return; }
   $rows = db_all($db, "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME");
   title_bar('Databases', server_version($db), '<button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#createDatabase"><i class="fa-solid fa-plus me-1"></i>Create database</button>');
   ?><div class="card"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>Name</th><th>Character set</th><th>Collation</th></tr></thead><tbody><?php foreach ($rows as $row) { ?><tr><td><form method="post" class="d-inline"><input type="hidden" name="action" value="select_db"><input type="hidden" name="database" value="<?= h($row['SCHEMA_NAME']) ?>"><?= csrf_field() ?><button class="btn btn-link p-0 border-0 align-baseline text-decoration-none fw-semibold" type="submit"><i class="fa-solid fa-database text-primary me-2"></i><?= h($row['SCHEMA_NAME']) ?></button></form></td><td><?= h($row['DEFAULT_CHARACTER_SET_NAME']) ?></td><td><?= h($row['DEFAULT_COLLATION_NAME']) ?></td></tr><?php } ?></tbody></table></div></div>
   <div class="modal fade" id="createDatabase" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="post"><div class="modal-header"><h2 class="modal-title fs-5">Create database</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" name="action" value="create_database"><?= csrf_field() ?><label class="form-label">Name</label><input class="form-control mb-3" name="name" required><label class="form-label">Collation</label><input class="form-control" name="collation" value="utf8mb4_unicode_ci" required></div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Create</button></div></form></div></div></div><?php
 }
 
-function page_database(mysqli $db): void {
+function page_database(MSDatabase $db): void {
+  if ($db->engine === 'sqlite') { ms_sqlite_page_database($db); return; }
   $rows = db_all($db, "SELECT TABLE_NAME,TABLE_TYPE,ENGINE,TABLE_ROWS,DATA_LENGTH,INDEX_LENGTH,TABLE_COLLATION,TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_TYPE,TABLE_NAME");
   $size = 0; foreach ($rows as $row) $size += (int)$row['DATA_LENGTH'] + (int)$row['INDEX_LENGTH'];
   $queues = ms_problem_queue_list(selected_db());
@@ -8464,7 +9162,7 @@ function page_database(mysqli $db): void {
   <div class="card danger-zone"><div class="card-body"><h2 class="h5 text-danger">Drop database</h2><p>This permanently removes every object and row in <strong><?= h(selected_db()) ?></strong>.</p><form method="post" class="row g-2 align-items-end"><input type="hidden" name="action" value="drop_database"><?= csrf_field() ?><div class="col-md-6"><label class="form-label">Type the database name to confirm</label><input class="form-control" name="confirm_name" required></div><div class="col-auto"><button class="btn btn-danger" data-confirm="Permanently drop this database?">Drop database</button></div></form></div></div><?php
 }
 
-function page_create_table(mysqli $db): void {
+function page_create_table(MSDatabase $db): void {
   title_bar('Create table', selected_db());
 
   $isRetry = p('action') === 'create_table';
@@ -8591,7 +9289,7 @@ function page_create_table(mysqli $db): void {
   </script><?php
 }
 
-function exact_column_definition(mysqli $db, string $table, string $columnName): string {
+function exact_column_definition(MSDatabase $db, string $table, string $columnName): string {
   $row = db_one($db, 'SHOW CREATE TABLE ' . qi($table));
   if (!$row) {
     throw new RuntimeException('Unable to read the table definition.');
@@ -8658,7 +9356,7 @@ function column_is_binary_type(string $type): bool {
   ], true);
 }
 
-function column_statistics_summary(mysqli $db, string $table, array $column): array {
+function column_statistics_summary(MSDatabase $db, string $table, array $column): array {
   $name = (string)$column['COLUMN_NAME'];
   $type = strtolower((string)$column['DATA_TYPE']);
   $value = qi($name);
@@ -8737,7 +9435,7 @@ function render_stat_box(string $label, string $value, string $hint = ''): void 
   ?><div class="col-6 col-md-4 col-xl-3"><div class="border rounded p-2 h-100"><div class="small text-body-secondary"><?= h($label) ?></div><div class="fw-semibold text-break"><?= h($value) ?></div><?php if ($hint !== '') { ?><div class="small text-body-secondary mt-1"><?= h($hint) ?></div><?php } ?></div></div><?php
 }
 
-function render_column_statistics(mysqli $db, string $table, array $column, bool $expandDistinct): void {
+function render_column_statistics(MSDatabase $db, string $table, array $column, bool $expandDistinct): void {
   $name = (string)$column['COLUMN_NAME'];
   $type = strtolower((string)$column['DATA_TYPE']);
   try {
@@ -8795,8 +9493,8 @@ function render_column_statistics(mysqli $db, string $table, array $column, bool
         [$displayExpression, $groupExpression] = column_distinct_select_parts($column);
         $sql = 'SELECT ' . $displayExpression . ' AS value_display, COUNT(*) AS occurrences FROM ' . qi($table) . ' GROUP BY ' . $groupExpression . ' ORDER BY occurrences DESC';
         $started = microtime(true);
-        $result = $db->query($sql, MYSQLI_USE_RESULT);
-        if (!$result instanceof mysqli_result) {
+        $result = $db->query($sql, (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
+        if (!ms_is_result($result)) {
           ?><div class="alert alert-danger mb-0">Unable to calculate value frequencies: <?= h($db->error) ?></div><?php
         } else {
           ?><div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2"><strong>Value frequencies</strong><span class="small text-body-secondary"><?= $distinct < 10 ? 'Shown automatically because there are fewer than 10 distinct non-NULL values.' : 'All distinct values requested explicitly.' ?></span></div>
@@ -8815,7 +9513,8 @@ function render_column_statistics(mysqli $db, string $table, array $column, bool
   </div><?php
 }
 
-function page_structure(mysqli $db): void {
+function page_structure(MSDatabase $db): void {
+  if ($db->engine === 'sqlite') { ms_sqlite_page_structure($db); return; }
   $table=g('table'); if(!table_exists($db,$table)) throw new RuntimeException('Table not found.');
   $columns=table_columns($db,$table); $status=db_one($db,'SHOW TABLE STATUS LIKE '.qs($db,$table));
   $createRow=db_one($db,'SHOW CREATE TABLE '.qi($table));
@@ -9059,13 +9758,13 @@ function render_table_triggers(array $triggers): void {
   ?><div class="card"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Name</th><th>Timing</th><th>Event</th><th>Statement</th><th></th></tr></thead><tbody><?php foreach($triggers as $trigger){?><tr><td><?= h($trigger['TRIGGER_NAME']) ?></td><td><?= h($trigger['ACTION_TIMING']) ?></td><td><?= h($trigger['EVENT_MANIPULATION']) ?></td><td class="code small"><?= h($trigger['ACTION_STATEMENT']) ?></td><td><a class="btn btn-secondary btn-sm" href="?page=triggers&amp;name=<?= urlencode((string)$trigger['TRIGGER_NAME']) ?>">Edit</a></td></tr><?php }?></tbody></table></div><div class="card-footer"><a class="btn btn-primary" href="?page=triggers&amp;name=__new__">Create trigger</a></div></div><?php
 }
 
-function render_indexes(mysqli $db,string $table,array $indexes,array $columns): void {
+function render_indexes(MSDatabase $db,string $table,array $indexes,array $columns): void {
   $grouped=[]; foreach($indexes as $row){$grouped[$row['Key_name']][]=$row;}
   ?><div class="card mb-3"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Name</th><th>Type</th><th>Columns</th><th>Cardinality</th><th>Alter</th><th></th></tr></thead><tbody><?php foreach($grouped as $name=>$rows){?><tr><td><?= h($name) ?></td><td><?= !$rows[0]['Non_unique']?'UNIQUE ':'' ?><?= h($rows[0]['Index_type']) ?></td><td class="code"><?= h(implode(', ',array_column($rows,'Column_name'))) ?></td><td><?= h(number_format((int)$rows[0]['Cardinality'])) ?></td><td><?php if($name!=='PRIMARY'){?><form method="post" class="d-flex gap-1"><input type="hidden" name="action" value="rename_index"><input type="hidden" name="old_index_name" value="<?= h($name) ?>"><?= csrf_field() ?><input class="form-control form-control-sm" name="new_index_name" value="<?= h($name) ?>" required><button class="btn btn-secondary btn-sm">Rename</button></form><?php }?></td><td><form method="post"><input type="hidden" name="action" value="drop_index"><input type="hidden" name="index_name" value="<?= h($name) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Drop this index?">Drop</button></form></td></tr><?php }?></tbody></table></div></div>
   <div class="card"><div class="card-header">Create index</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_index"><?= csrf_field() ?><div class="row g-3"><div class="col-md-3"><label class="form-label">Type</label><select class="form-select" name="index_type"><option>INDEX</option><option>UNIQUE</option><option>FULLTEXT</option><option>SPATIAL</option><option>PRIMARY</option></select></div><div class="col-md-3"><label class="form-label">Name</label><input class="form-control" name="index_name"></div><div class="col-md-6"><label class="form-label">Columns (select multiple in order)</label><select class="form-select" name="index_columns[]" multiple size="5" required><?php foreach($columns as $c){?><option value="<?= h($c['COLUMN_NAME']) ?>"><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-12"><button class="btn btn-primary">Create index</button></div></div></form></div></div><?php
 }
 
-function render_foreign_keys(mysqli $db,string $table,array $foreign,array $columns): void {
+function render_foreign_keys(MSDatabase $db,string $table,array $foreign,array $columns): void {
   $grouped=[]; foreach($foreign as $row){$grouped[$row['CONSTRAINT_NAME']][]=$row;}
   $rules=[]; foreach(db_all($db,"SELECT CONSTRAINT_NAME,UPDATE_RULE,DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)) as $r)$rules[$r['CONSTRAINT_NAME']]=$r;
   ?><div class="card mb-3"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Name</th><th>Columns</th><th>References</th><th>Rules</th><th></th></tr></thead><tbody><?php foreach($grouped as $name=>$rows){$rule=$rules[$name]??[];?><tr><td><?= h($name) ?></td><td><?= h(implode(', ',array_column($rows,'COLUMN_NAME'))) ?></td><td><?= h($rows[0]['REFERENCED_TABLE_NAME']) ?> (<?= h(implode(', ',array_column($rows,'REFERENCED_COLUMN_NAME'))) ?>)</td><td>UPDATE <?= h($rule['UPDATE_RULE']??'') ?> / DELETE <?= h($rule['DELETE_RULE']??'') ?></td><td><form method="post"><input type="hidden" name="action" value="drop_foreign_key"><input type="hidden" name="constraint_name" value="<?= h($name) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Drop this foreign key?">Drop</button></form></td></tr><?php }?></tbody></table></div></div>
@@ -9073,11 +9772,11 @@ function render_foreign_keys(mysqli $db,string $table,array $foreign,array $colu
   <div class="card"><div class="card-header">Create foreign key</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="add_foreign_key"><?= csrf_field() ?><div class="row g-3"><div class="col-md-3"><label class="form-label">Constraint name</label><input class="form-control" name="constraint_name" required></div><div class="col-md-3"><label class="form-label">Local columns</label><select class="form-select" name="local_columns[]" multiple size="5" required><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Referenced table</label><select class="form-select" name="reference_table"><?php foreach($tables as $t){?><option><?= h($t) ?></option><?php }?></select></div><div class="col-md-3"><label class="form-label">Referenced columns</label><input class="form-control" name="foreign_columns[]" placeholder="First column" required><input class="form-control mt-1" name="foreign_columns[]" placeholder="Second (optional)"><input class="form-control mt-1" name="foreign_columns[]" placeholder="Third (optional)"></div><div class="col-md-3"><label class="form-label">On update</label><select class="form-select" name="on_update"><option>RESTRICT</option><option>CASCADE</option><option>SET NULL</option><option>NO ACTION</option></select></div><div class="col-md-3"><label class="form-label">On delete</label><select class="form-select" name="on_delete"><option>RESTRICT</option><option>CASCADE</option><option>SET NULL</option><option>NO ACTION</option></select></div><div class="col-12"><button class="btn btn-primary">Create foreign key</button></div></div></form><div class="form-text mt-2">For composite keys, select local columns in order and fill the same number of referenced-column inputs.</div></div></div><?php
 }
 
-function render_checks(mysqli $db,array $checks): void {
+function render_checks(MSDatabase $db,array $checks): void {
   ?><div class="card mb-3"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Name</th><th>Expression</th><th></th></tr></thead><tbody><?php foreach($checks as $check){?><tr><td><?= h($check['CONSTRAINT_NAME']) ?></td><td class="code"><?= h($check['CHECK_CLAUSE']) ?></td><td><form method="post"><input type="hidden" name="action" value="drop_check"><input type="hidden" name="constraint_name" value="<?= h($check['CONSTRAINT_NAME']) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Drop this check constraint?">Drop</button></form></td></tr><?php }?></tbody></table></div></div><div class="card"><div class="card-header">Create check constraint</div><div class="card-body"><form method="post" class="row g-3"><input type="hidden" name="action" value="add_check"><?= csrf_field() ?><div class="col-md-4"><label class="form-label">Name</label><input class="form-control" name="constraint_name" required></div><div class="col-md-8"><label class="form-label">Expression</label><input class="form-control code" name="expression" placeholder="price >= 0" required></div><div class="col"><button class="btn btn-primary">Create check</button></div></form></div></div><?php
 }
 
-function render_partitions(mysqli $db,string $table): void {
+function render_partitions(MSDatabase $db,string $table): void {
   $parts=db_all($db,'SELECT PARTITION_NAME,PARTITION_METHOD,PARTITION_EXPRESSION,PARTITION_DESCRIPTION,TABLE_ROWS,DATA_LENGTH FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table).' AND PARTITION_NAME IS NOT NULL ORDER BY PARTITION_ORDINAL_POSITION');
   ?><div class="card mb-3"><div class="table-responsive"><table class="table mb-0"><thead><tr><th>Name</th><th>Method</th><th>Expression</th><th>Description</th><th>Rows</th><th>Size</th></tr></thead><tbody><?php foreach($parts as $part){?><tr><td><?= h($part['PARTITION_NAME']) ?></td><td><?= h($part['PARTITION_METHOD']) ?></td><td class="code"><?= h($part['PARTITION_EXPRESSION']) ?></td><td><?= h($part['PARTITION_DESCRIPTION']) ?></td><td><?= h($part['TABLE_ROWS']) ?></td><td><?= h(number_format((int)$part['DATA_LENGTH']/1024,1)) ?> KB</td></tr><?php }?></tbody></table></div></div><div class="card"><div class="card-header">Partition SQL</div><div class="card-body"><p class="text-body-secondary">Create, reorganize, truncate, exchange or remove partitions using a complete <code>ALTER TABLE</code> clause.</p><form method="post"><input type="hidden" name="action" value="generic_sql"><?= csrf_field() ?><textarea class="form-control sql-editor" name="statement">ALTER TABLE <?= h(qi($table)) ?> PARTITION BY RANGE (YEAR(created_at)) (
   PARTITION p2025 VALUES LESS THAN (2026),
@@ -9085,7 +9784,7 @@ function render_partitions(mysqli $db,string $table): void {
 );</textarea><button class="btn btn-primary mt-2">Execute partition statement</button></form></div></div><?php
 }
 
-function render_table_settings(mysqli $db,string $table,?array $status): void {
+function render_table_settings(MSDatabase $db,string $table,?array $status): void {
   ?><div class="card mb-3"><div class="card-body"><form method="post"><input type="hidden" name="action" value="alter_table"><?= csrf_field() ?><div class="row g-3"><div class="col-md-4"><label class="form-label">Name</label><input class="form-control" name="name" value="<?= h($table) ?>"></div><div class="col-md-2"><label class="form-label">Engine</label><input class="form-control" name="engine" value="<?= h($status['Engine']??'InnoDB') ?>"></div><div class="col-md-3"><label class="form-label">Collation</label><input class="form-control" name="collation" value="<?= h($status['Collation']??'') ?>"></div><div class="col-md-3"><label class="form-label">Next auto increment</label><input class="form-control" type="number" name="auto_increment" value="<?= h($status['Auto_increment']??'') ?>"></div><div class="col-12"><label class="form-label">Comment</label><input class="form-control" name="comment" value="<?= h($status['Comment']??'') ?>"></div><div class="col"><button class="btn btn-primary">Save table</button></div></div></form></div></div>
   <div class="card danger-zone"><div class="card-body"><h3 class="h5 text-danger">Danger zone</h3><div class="d-flex flex-wrap gap-2"><form method="post"><input type="hidden" name="action" value="truncate_table"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Delete every row but keep the table?">Empty table</button></form><form method="post" class="d-flex gap-2"><input type="hidden" name="action" value="drop_table"><?= csrf_field() ?><input class="form-control" name="confirm_name" placeholder="Type <?= h($table) ?>" required><button class="btn btn-danger text-nowrap" data-confirm="Permanently drop this table?">Drop table</button></form></div></div></div><?php
 }
@@ -9107,7 +9806,7 @@ function ms_filter_relative_count(string $value): ?int {
   return $count <= 100000 ? $count : null;
 }
 
-function build_select_query(mysqli $db,string $table,array $columns,?int $overrideOffset=null,?int $overrideLimit=null,bool $withoutPagination=false): array {
+function build_select_query(MSDatabase $db,string $table,array $columns,?int $overrideOffset=null,?int $overrideLimit=null,bool $withoutPagination=false): array {
   $allowed=array_column($columns,'COLUMN_NAME');
   $columnTypes=array_column($columns,'DATA_TYPE','COLUMN_NAME');
   $where=[]; $filterCols=$_GET['filter_col']??[]; $filterOps=$_GET['filter_op']??[]; $filterValues=$_GET['filter_val']??[]; $filterValuesTo=$_GET['filter_val_to']??[]; $filterUnits=$_GET['filter_unit']??[];
@@ -9143,6 +9842,8 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
       if($normalized===null)continue;
       $value=$normalized;
     }
+    if($op==='fulltext'&&$db->engine==='sqlite')throw new RuntimeException('MySQL full-text filters are unavailable for SQLite.');
+    if($op==='regexp'&&$db->engine==='sqlite')throw new RuntimeException('REGEXP needs an application-defined SQLite function; use a text filter.');
     if($op==='fulltext'){$where[]='MATCH('.qi($column).') AGAINST ('.qs($db,$value).' IN BOOLEAN MODE)';continue;}
     if($op==='contains')$value='%'.$value.'%';
     if($op==='starts')$value=$value.'%';
@@ -9150,7 +9851,7 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
     $where[]=qi($column).' '.$sqlOp.' '.qs($db,$value);
   }
   foreach(ms_insight_group_decode(g('duplicate_group'),$columns) as $column=>$value){
-    $where[]=qi((string)$column).' <=> '.qs($db,$value);
+    $where[]=qi((string)$column).($db->engine==='sqlite'?' IS ':' <=> ').qs($db,$value);
   }
   $globalSearch=g('global_search');
   if($globalSearch!==''&&$columns){
@@ -9165,7 +9866,7 @@ function build_select_query(mysqli $db,string $table,array $columns,?int $overri
     $where[]='('.implode(' OR ',$globalTerms).')';
   }
   $aggregate=strtoupper(g('aggregate'));$aggregateColumn=g('aggregate_column');$groupColumn=g('group_column');$validAgg=['COUNT','SUM','AVG','MIN','MAX'];
-  $select='*';$group='';
+  $select=$db->engine==='sqlite'?ms_sqlite_projection($db,$table):'*';$group='';
   if(in_array($aggregate,$validAgg,true)&&in_array($aggregateColumn,$allowed,true)){$select=($groupColumn!==''&&in_array($groupColumn,$allowed,true)?qi($groupColumn).', ':'').$aggregate.'('.qi($aggregateColumn).') AS '.qi(strtolower($aggregate).'_'.$aggregateColumn);if($groupColumn!==''&&in_array($groupColumn,$allowed,true))$group=' GROUP BY '.qi($groupColumn);}
   $orderParts=[];$orderCols=$_GET['order_col']??[];$orderDirs=$_GET['order_dir']??[];if(!is_array($orderCols))$orderCols=[];if(!is_array($orderDirs))$orderDirs=[];foreach($orderCols as $i=>$column){if(in_array($column,$allowed,true))$orderParts[]=qi((string)$column).' '.(strtoupper((string)($orderDirs[$i]??'ASC'))==='DESC'?'DESC':'ASC');}
   $defaultLimit=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$limit=max(1,min(500,(int)g('limit',(string)$defaultLimit)));$showAll=$withoutPagination||g('show_all')==='1';$page=$showAll?1:max(1,(int)g('p','1'));$offset=$overrideOffset!==null?max(0,$overrideOffset):(($page-1)*$limit);$queryLimit=$overrideLimit!==null?max(1,min(5000,$overrideLimit)):$limit;
@@ -9224,7 +9925,7 @@ function ms_pdf_display_text($value, array $rule = []): string {
   return $plain;
 }
 
-function ms_render_select_rows_html(mysqli $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken,array $labelRules=[]): string {
+function ms_render_select_rows_html(MSDatabase $db,string $table,array $columns,array $rows,bool $editable,bool $aggregated,array $hiddenColumns,array $imageColumns,array $softFkRules,array $softFkMaps,array $formatRules,array $alignmentRules,array $fixedFontRules,?array $softDeleteRule,array $relations,array $returnQuery,string $returnToken,array $labelRules=[]): string {
   $primary = primary_columns($db, $table) ?: array_column($columns, 'COLUMN_NAME');
   $columnMap = [];
   foreach ($columns as $column) {
@@ -9237,6 +9938,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
     foreach ($primary as $key) {
       $identity[(string)$key] = $row[$key] ?? null;
     }
+    if ($db->engine === 'sqlite') $identity = ms_sqlite_row_identity($columns, $primary, $row);
     $encoded = encode_identity($identity);
     $viewUrl = '?' . http_build_query(['page'=>'row','mode'=>'view','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
     $editUrl = '?' . http_build_query(['page'=>'row','mode'=>'edit','table'=>$table,'id'=>$encoded,'return_to'=>$returnToken]);
@@ -9262,6 +9964,7 @@ function ms_render_select_rows_html(mysqli $db,string $table,array $columns,arra
     <?php }
     foreach ($row as $name => $value) {
       $name = (string)$name;
+      if ($db->engine === 'sqlite' && !$aggregated && !isset($columnMap[$name])) continue;
       if (!$aggregated && !empty($hiddenColumns[$name])) continue;
       $colMeta = $columnMap[$name] ?? null;
       $cellClasses = [];
@@ -9463,8 +10166,8 @@ function ms_render_json_viewer_modal(): void {
   <?php
 }
 
-function page_select(mysqli $db): void {
-  $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=db_one($db,'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='.qs($db,$table));$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE';
+function page_select(MSDatabase $db): void {
+  $table=g('table');if(!table_exists($db,$table))throw new RuntimeException('Table or view not found.');$columns=table_columns($db,$table);$meta=ms_table_meta($db, $table);$editable=($meta['TABLE_TYPE']??'')==='BASE TABLE'&&($db->engine!=='sqlite'||primary_columns($db,$table));
   $tableIcon=ms_profile_table_icon(selected_db(),$table,$editable);
   $tableDisplayName=ms_profile_table_display_name(selected_db(),$table);
   $masterRelation=ms_profile_master_relation(selected_db(),$table);
@@ -9474,13 +10177,13 @@ function page_select(mysqli $db): void {
     '#06b6d4'=>'Cyan','#0ea5e9'=>'Sky','#3b82f6'=>'Blue','#6366f1'=>'Indigo',
     '#8b5cf6'=>'Violet','#a855f7'=>'Purple','#ec4899'=>'Pink','#64748b'=>'Slate'
   ];
-  $relations=[];foreach(db_all($db,"SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=".qs($db,$table)." AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
+  $relations=[];foreach(ms_foreign_keys($db, $table) as $relation){$relations[$relation['COLUMN_NAME']]=$relation;}
   [$sql,$countSql,$limit,$page,$where,$aggregated,$showAll]=build_select_query($db,$table,$columns);$rows=db_all($db,$sql);$totalRow=db_one($db,$countSql);$total=(int)($totalRow['n']??0);$pages=$showAll?1:max(1,(int)ceil($total/$limit));$initialOffset=$showAll?0:(($page-1)*$limit);$nextOffset=$initialOffset+count($rows);$moreRowsDefault=ms_profile_setting_int('selectRows',MS_ROWS_PER_PAGE,1,500);$hasMoreRows=!$showAll&&$nextOffset<$total;
   $viewMode=!$aggregated&&g('view_mode')==='cards'?'cards':'table';
   $selectToolsAfter=ms_profile_settings()['selectToolsPosition']==='after';
   $emptyViewConfig=['hidden'=>[],'images'=>[],'soft_fk'=>[],'formats'=>[],'labels'=>[],'alignments'=>[],'fixed_fonts'=>[]];
   $storedViewConfig=$aggregated?$emptyViewConfig:ms_column_view_table_config(selected_db(),$table);
-  $softDeleteRule=$aggregated?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
+  $softDeleteRule=$aggregated||$db->engine==='sqlite'?null:ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(),$table),$columns);
   $viewConfig=(!$aggregated&&ms_raw_db_view())?$emptyViewConfig:$storedViewConfig;
   $hiddenColumns=is_array($viewConfig['hidden']??null)?$viewConfig['hidden']:[];$imageColumns=is_array($viewConfig['images']??null)?$viewConfig['images']:[];$softFkRules=is_array($viewConfig['soft_fk']??null)?$viewConfig['soft_fk']:[];$formatRules=is_array($viewConfig['formats']??null)?$viewConfig['formats']:[];$labelRules=is_array($viewConfig['labels']??null)?$viewConfig['labels']:[];$alignmentRules=is_array($viewConfig['alignments']??null)?$viewConfig['alignments']:[];$fixedFontRules=is_array($viewConfig['fixed_fonts']??null)?$viewConfig['fixed_fonts']:[];
   $headerAlignmentRules=is_array($viewConfig['header_alignments']??null)?$viewConfig['header_alignments']:[];
@@ -9488,7 +10191,7 @@ function page_select(mysqli $db): void {
   $storedHeaderAlignmentRules=is_array($storedViewConfig['header_alignments']??null)?$storedViewConfig['header_alignments']:[];
   $columnMetaMap=[];foreach($columns as $columnMeta)$columnMetaMap[(string)$columnMeta['COLUMN_NAME']]=$columnMeta;
   $allColumnNames=array_values(array_map('strval',array_column($columns,'COLUMN_NAME')));$visibleColumnNames=$aggregated?$allColumnNames:array_values(array_filter($allColumnNames,static function(string $column) use($hiddenColumns):bool{return empty($hiddenColumns[$column]);}));
-  $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
+  $headers=$rows?array_keys($rows[0]):$visibleColumnNames;if($db->engine==='sqlite'&&!$aggregated)$headers=array_values(array_intersect($headers,$allColumnNames));if(!$aggregated)$headers=array_values(array_filter($headers,static function($header) use($hiddenColumns):bool{return empty($hiddenColumns[(string)$header]);}));
   $softFkMaps=$aggregated?[]:ms_soft_fk_maps($db,$rows,$softFkRules);
   $layoutColumns=$allColumnNames;$layoutColumnsJson=json_encode($layoutColumns,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'[]';$savedLayout=ms_profile_table_layout(selected_db(),$table);$savedLayoutJson=json_encode($savedLayout,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?:'{}';$sidebarHidden=!empty(ms_profile_hidden_sidebar(selected_db())[$table]);$savedSearches=ms_profile_table_saved_searches(selected_db(),$table);
   $viewPresets=ms_view_preset_list(selected_db(),$table);
@@ -9496,7 +10199,7 @@ function page_select(mysqli $db): void {
     'order'=>$savedLayout['order']??[],'widths'=>$savedLayout['widths']??[],
     'view_mode'=>$viewMode,'raw_db_view'=>ms_raw_db_view(),'limit'=>$limit];
   $presetSeedJson=json_encode($presetSeed,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'{}';
-  $softTargetTables=array_values(array_map('strval',array_column(db_all($db,'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME'),'TABLE_NAME')));
+  $softTargetTables=array_values(array_map('strval',array_column(ms_table_list($db),'TABLE_NAME')));
   $returnQuery=ms_navigation_query($_GET);if(!$returnQuery)$returnQuery=['page'=>'select','table'=>$table];$returnToken=ms_encode_navigation($returnQuery);
   $prettyEdit=!$aggregated&&ms_profile_edit_pretty_view(selected_db(),$table);
   $pdfFieldOrder=$allColumnNames;
@@ -10252,6 +10955,7 @@ function page_select(mysqli $db): void {
     <form method="get" id="ms-query-builder-form"><input type="hidden" name="page" value="select"><input type="hidden" name="table" value="<?= h($table) ?>"><input type="hidden" name="view_mode" value="<?= h($viewMode) ?>"><h3 class="h6">Filters</h3>
     <?php
       $filterOperatorLabels=['='=>'=','!='=>'!=','>'=>'>','>='=>'>=','<'=>'<','<='=>'<=','contains'=>'contains','starts'=>'starts','ends'=>'ends','regexp'=>'regexp','fulltext'=>'fulltext','null'=>'null','not_null'=>'not_null','between'=>'Between','older_than'=>'Older than','newer_than'=>'Newer than'];
+      if($db->engine==='sqlite')foreach(['regexp','fulltext','between','older_than','newer_than'] as $unsupported)unset($filterOperatorLabels[$unsupported]);
       for($i=0;$i<3;$i++){
         $filterSelectedColumn=(string)($_GET['filter_col'][$i]??'');
         $filterSelectedOperator=(string)($_GET['filter_op'][$i]??'=');
@@ -10491,7 +11195,7 @@ function page_select(mysqli $db): void {
   ?></tr></thead><tbody><?php
   echo ms_render_select_rows_html($db,$table,$columns,$rows,$editable,$aggregated,$hiddenColumns,$imageColumns,$softFkRules,$softFkMaps,$formatRules,$alignmentRules,$fixedFontRules,$softDeleteRule,$relations,$returnQuery,$returnToken,$labelRules);
   ?></tbody></table></div><?php if(!$rows){?><div class="p-4 text-center text-body-secondary">No rows.</div><?php }?></div>
-  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
+  <?php if($editable&&!$aggregated){?><div class="card mt-3 no-print"><div class="card-body"><div class="row g-2 align-items-end"><div class="col-md-auto"><div class="btn-group"><button class="btn btn-danger" name="action" value="delete_rows" data-confirm="<?= $softDeleteRule!==null?'Permanently delete the selected rows?':'Delete the selected rows?' ?>"><?= $softDeleteRule!==null?'Permanently delete selected':'Delete selected' ?></button><?php if($db->engine!=='sqlite'){?><button class="btn btn-secondary" name="action" value="clone_selected_prepare"><i class="fa-solid fa-clone me-1"></i>Clone selected</button><?php } ?></div></div><div class="col-md-2"><select class="form-select" name="operation" formaction="<?= h(url()) ?>"><option value="set">Set</option><option value="add">Add number</option><option value="append">Append</option><option value="prepend">Prepend</option><option value="null">Set NULL</option></select></div><div class="col-md-3"><select class="form-select" name="column"><?php foreach($columns as $c){?><option><?= h($c['COLUMN_NAME']) ?></option><?php }?></select></div><div class="col-md-3"><input class="form-control" name="bulk_value" placeholder="Bulk value"></div><div class="col-md-auto"><button class="btn btn-primary" name="action" value="bulk_update">Update selected</button></div></div></div></div><?php }?></form>
   <?php if(!$aggregated){ ?>
   <script>
   (()=>{
@@ -10641,8 +11345,8 @@ function page_select(mysqli $db): void {
   ?>
     <div id="ms-insight-context-menu" class="dropdown-menu ms-insight-menu no-print" role="menu" hidden>
       <button class="dropdown-item" type="button" role="menuitem" data-ms-column-like-search><i class="fa-solid fa-magnifying-glass me-2" aria-hidden="true"></i>Search LIKE %%</button>
-      <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="analyze"><i class="fa-solid fa-chart-simple me-2" aria-hidden="true"></i>Analyze column</button>
-      <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="duplicates"><i class="fa-solid fa-clone me-2" aria-hidden="true"></i>Find duplicates</button>
+      <?php if($db->engine!=='sqlite'){?><button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="analyze"><i class="fa-solid fa-chart-simple me-2" aria-hidden="true"></i>Analyze column</button>
+      <button class="dropdown-item" type="button" role="menuitem" data-ms-insight-kind="duplicates"><i class="fa-solid fa-clone me-2" aria-hidden="true"></i>Find duplicates</button><?php } ?>
     </div>
     <div class="modal fade" id="ms-column-insights-modal" tabindex="-1" aria-labelledby="ms-column-insights-title" aria-hidden="true" data-ms-eligible-columns="<?= h($insightColumnsJson) ?>">
       <div class="modal-dialog modal-xl modal-fullscreen-md-down modal-dialog-scrollable"><div class="modal-content">
@@ -11118,10 +11822,10 @@ function page_select(mysqli $db): void {
             <?php } ?>
           </div>
           <div class="mt-3"><label class="form-label" for="ms-soft-fk-format">Display format</label><input class="form-control font-monospace" id="ms-soft-fk-format" name="soft_fk_display_format" value="%1" maxlength="2000"><div class="form-text">Default: <code>%1</code>. Example: <code>%1 (%2/%3)</code> displays the first field followed by the second and third in parentheses, e.g. <code>John (London/UK)</code>. Unselected fields are empty.</div></div>
-          <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>This is display-only. MySQL referential integrity is not changed.</div>
+          <div class="alert alert-warning mt-3 mb-0 small"><i class="fa-solid fa-triangle-exclamation me-1"></i>This is display-only. Database referential integrity is not changed.</div>
         </div>
 
-        <div class="border rounded p-3 mt-3">
+        <div class="border rounded p-3 mt-3"<?= $db->engine === 'sqlite' ? ' hidden' : '' ?>>
           <div class="form-check form-switch ms-ios-switch"><input class="form-check-input" type="checkbox" role="switch" id="ms-soft-delete-enabled" name="soft_delete_enabled" value="1"><label class="form-check-label fw-semibold" for="ms-soft-delete-enabled">This column is a soft-delete value</label></div>
           <div class="mt-3" data-ms-soft-delete-options hidden>
             <div data-ms-soft-delete-enum-wrap hidden><label class="form-label" for="ms-soft-delete-enum">Value meaning deleted</label><select class="form-select" id="ms-soft-delete-enum" name="soft_delete_enum_index" disabled><option value="">Choose the deleted value…</option></select></div>
@@ -11536,7 +12240,7 @@ function page_select(mysqli $db): void {
   </script><?php
 }
 
-function page_clone_rows(mysqli $db): void {
+function page_clone_rows(MSDatabase $db): void {
   $table = g('table');
   $selection = $_SESSION['ms_clone_rows'] ?? null;
   if (!is_array($selection) || (string)($selection['database'] ?? '') !== selected_db() || (string)($selection['table'] ?? '') !== $table) {
@@ -11610,14 +12314,14 @@ function page_clone_rows(mysqli $db): void {
   </script><?php
 }
 
-function page_row(mysqli $db): void {
+function page_row(MSDatabase $db): void {
   $table = g('table');
   if (!table_exists($db, $table)) {
     throw new RuntimeException('Table not found.');
   }
   $columns = table_columns($db, $table);
-  $tableMeta = db_one($db, 'SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $table));
-  $isBaseTable = ($tableMeta['TABLE_TYPE'] ?? '') === 'BASE TABLE';
+  $tableMeta = ms_table_meta($db, $table);
+  $isBaseTable = ($tableMeta['TABLE_TYPE'] ?? '') === 'BASE TABLE' && ($db->engine !== 'sqlite' || primary_columns($db, $table));
   $mode = g('mode', 'insert');
   if (!in_array($mode, ['insert','edit','view','clone'], true)) {
     $mode = 'insert';
@@ -11677,7 +12381,7 @@ function page_row(mysqli $db): void {
     $headerAlignmentRules = is_array($viewConfig['header_alignments'] ?? null) ? $viewConfig['header_alignments'] : [];
     $softFkMaps = ms_soft_fk_maps($db, [$values], $softFkRules);
     $relations = [];
-    foreach (db_all($db, "SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=" . qs($db,$table) . " AND REFERENCED_TABLE_NAME IS NOT NULL") as $relation) {
+    foreach (ms_foreign_keys($db, $table) as $relation) {
       $relations[$relation['COLUMN_NAME']] = $relation;
     }
     $encoded = encode_identity($sourceIdentity);
@@ -11754,7 +12458,7 @@ function page_row(mysqli $db): void {
         $slaveReturnToken = ms_encode_navigation(['page' => 'select', 'table' => $slaveTable]);
         $slaveSoftDeleteRule = ms_active_soft_delete_rule(ms_profile_soft_delete_rule(selected_db(), $slaveTable), $slaveColumns);
         $slaveRelations = [];
-        foreach (db_all($db, 'SELECT COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . qs($db, $slaveTable) . ' AND REFERENCED_TABLE_NAME IS NOT NULL') as $slaveRelation) {
+        foreach (ms_foreign_keys($db, $slaveTable) as $slaveRelation) {
           $slaveRelations[(string)$slaveRelation['COLUMN_NAME']] = $slaveRelation;
         }
         $slaveReturnQuery = ['page' => 'select', 'table' => $slaveTable];
@@ -11766,8 +12470,8 @@ function page_row(mysqli $db): void {
         $slaveRows = null;
         if ($values[$masterField] !== null) {
           // Buffer the result on this connection so display lookups can run between batches.
-          $slaveRows = $db->query('SELECT * FROM ' . qi($slaveTable) . ' WHERE ' . qi($slaveField) . ' = ' . qs($db, $values[$masterField]), MYSQLI_STORE_RESULT);
-          if (!$slaveRows instanceof mysqli_result) throw new RuntimeException('Unable to load the related slave rows: ' . $db->error);
+          $slaveRows = $db->query('SELECT ' . ($db->engine === 'sqlite' ? ms_sqlite_projection($db, $slaveTable) : '*') . ' FROM ' . qi($slaveTable) . ' WHERE ' . qi($slaveField) . ' = ' . qs($db, $values[$masterField]), (defined('MYSQLI_STORE_RESULT') ? MYSQLI_STORE_RESULT : 0));
+          if (!ms_is_result($slaveRows)) throw new RuntimeException('Unable to load the related slave rows: ' . $db->error);
         }
         ?><div class="card mt-3"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong>Slave rows: <?= h($slaveTable) ?></strong><span class="small text-body-secondary"><?= h($slaveField) ?> = <?= h($masterField) ?></span></div><div class="table-responsive"><table class="table table-sm table-striped table-hover align-middle mb-0 ms-data-table ms-layout-table" data-ms-table-layout data-ms-database="<?= h(selected_db()) ?>" data-ms-table="<?= h($slaveTable) ?>" data-ms-pretty-mode="view" data-ms-columns="<?= h($slaveLayoutColumnsJson) ?>" data-ms-layout="<?= h($slaveLayoutJson) ?>"><thead><tr><th class="ms-row-actions-cell" data-ms-static-column="actions" aria-label="Row actions"></th><?php foreach ($slaveVisibleColumns as $slaveColumnName) {
           $slaveLabel = trim((string)($slaveLabelRules[$slaveColumnName] ?? ''));
@@ -11777,7 +12481,7 @@ function page_row(mysqli $db): void {
           if (!empty($slaveFixedFontRules[$slaveColumnName])) $slaveHeaderClasses[] = 'font-monospace';
           ?><th scope="col" data-ms-column="<?= h($slaveColumnName) ?>" data-ms-header-alignment="<?= h($slaveHeaderAlignment) ?>" class="<?= h(implode(' ', $slaveHeaderClasses)) ?>" title="<?= h($slaveColumnName) ?>"><span class="ms-col-header-main"><span class="ms-col-header-name"><?= h($slaveLabel !== '' ? $slaveLabel : $slaveColumnName) ?></span></span></th><?php } ?></tr></thead><tbody><?php
         $slaveCount = 0;
-        if ($slaveRows instanceof mysqli_result) {
+        if (ms_is_result($slaveRows)) {
           $batch = [];
           while ($slaveRow = $slaveRows->fetch_assoc()) {
             $slaveCount++;
@@ -11858,6 +12562,7 @@ function page_row(mysqli $db): void {
         <?php } ?>
         <?php if ($spec['help'] !== '') { ?><div class="form-text"><?= h($spec['help']) ?><?= in_array($spec['kind'], ['date','datetime'], true) ? ' · switch between typing and the native picker' : '' ?></div><?php } ?>
       <?php } ?></td><td><?php if (!$generated) { ?>
+        <?php if ($db->engine === 'sqlite' && $mode === 'insert' && $column['COLUMN_DEFAULT'] !== null) { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="use_default[<?= h($name) ?>]" value="1"<?= !$retrySave || !empty($_POST['use_default'][$name]) ? ' checked' : '' ?>> Use default SQL</label><?php } ?>
         <label class="d-block"><input class="form-check-input" type="checkbox" name="is_null[<?= h($name) ?>]" data-ms-null<?= $currentIsNull ? ' checked' : '' ?>> NULL</label>
         <label class="d-block"><input class="form-check-input" type="checkbox" name="expression[<?= h($name) ?>]" data-ms-expression<?= $retrySave && !empty($postedExpressions[$name]) ? ' checked' : '' ?>> SQL expression</label>
         <?php if ($binary && in_array($mode, ['edit','clone'], true)) { ?><label class="d-block"><input class="form-check-input" type="checkbox" name="keep_blob[<?= h($name) ?>]"<?= (!$retrySave || isset($postedKeepBlobs[$name]) && !$uploadedOnRetry) ? ' checked' : '' ?>> <?= $mode === 'clone' ? 'Copy existing BLOB' : 'Keep existing' ?></label><?php } ?>
@@ -12225,10 +12930,10 @@ function page_row(mysqli $db): void {
 }
 
 
-function page_sql(mysqli $db, ?array $results, float $time): void {
+function page_sql(MSDatabase $db, ?array $results, float $time): void {
   $sqlDefaultRows = ms_profile_setting_int('sqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000);
-  $tableRows = db_all($db, 'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
-  $columnRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+  $tableRows = ms_table_list($db);
+  $columnRows = ms_all_columns($db);
   $sqlSchema = ['tables' => [], 'columns' => []];
   foreach ($tableRows as $tableRow) {
     $tableName = (string)$tableRow['TABLE_NAME'];
@@ -12248,7 +12953,7 @@ function page_sql(mysqli $db, ?array $results, float $time): void {
     try { $initialParams = ms_sql_parameters_from_post(); } catch (Throwable $ignored) {}
   }
   $initialParamsJson = json_encode($initialParams, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?: '{}';
-  $actions = '<a class="btn btn-primary" href="?page=query_builder"><i class="fa-solid fa-diagram-project me-1"></i>Visual query builder</a>';
+  $actions = $db->engine === 'sqlite' ? '' : '<a class="btn btn-primary" href="?page=query_builder"><i class="fa-solid fa-diagram-project me-1"></i>Visual query builder</a>';
   title_bar('SQL command', selected_db(), $actions);
   if (!empty($_SESSION['ms_history_warning'])) {
     echo '<div class="alert alert-warning">The query ran, but its history could not be saved: ' . h((string)$_SESSION['ms_history_warning']) . '</div>';
@@ -12306,8 +13011,8 @@ function page_sql(mysqli $db, ?array $results, float $time): void {
   </div></section><?php
 }
 
-function page_export(mysqli $db): void {
-  $tables=db_all($db,'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');title_bar('Export',selected_db());
+function page_export(MSDatabase $db): void {
+  $tables=ms_table_list($db);title_bar('Export',selected_db());
   $databaseJson=json_encode(selected_db(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'"database"';
   ?><div class="card"><div class="card-body"><form method="get" id="msExportForm" autocomplete="off"><input type="hidden" name="page" value="export"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input type="hidden" name="structure" value="0"><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input type="hidden" name="data" value="0"><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input type="hidden" name="drop" value="0"><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><div class="form-check form-switch ms-ios-switch m-0 me-2" title="Compress the SQL, CSV or TSV file on the server"><input class="form-check-input" type="checkbox" role="switch" id="msExportZip" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="msExportZip">Zip</label></div><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
@@ -12474,7 +13179,7 @@ function page_export(mysqli $db): void {
   </script><?php
 }
 
-function page_import(mysqli $db): void {
+function page_import(MSDatabase $db): void {
   ms_import_cleanup();
   $tables = array_values(array_map('strval', array_column(db_all($db, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"), 'TABLE_NAME')));
   $tableColumns = [];
@@ -12556,9 +13261,9 @@ function page_import(mysqli $db): void {
   </script><?php
 }
 
-function page_query_builder(mysqli $db): void {
-  $tableRows = db_all($db, 'SELECT TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME');
-  $columnRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION');
+function page_query_builder(MSDatabase $db): void {
+  $tableRows = ms_table_list($db);
+  $columnRows = ms_all_columns($db);
   $foreignRows = db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION');
   $schema = ['tables' => [], 'columns' => [], 'foreign' => []];
   foreach ($tableRows as $row) {
@@ -12626,7 +13331,7 @@ function page_query_builder(mysqli $db): void {
   </script><?php
 }
 
-function page_schema(mysqli $db): void {
+function page_schema(MSDatabase $db): void {
   $tables=db_all($db,"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME");$foreign=db_all($db,"SELECT TABLE_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION");$refs=[];foreach($foreign as $f)$refs[$f['TABLE_NAME']][$f['COLUMN_NAME']]=$f;
   title_bar('Database schema',selected_db(),'<button class="btn btn-primary" onclick="window.print()"><i class="fa-solid fa-print me-1"></i>Print</button>');
   ?>
@@ -12678,26 +13383,26 @@ function page_schema(mysqli $db): void {
   </script><?php
 }
 
-function object_page_data(mysqli $db,string $type): array {
+function object_page_data(MSDatabase $db,string $type): array {
   if($type==='VIEW')return db_all($db,"SELECT TABLE_NAME AS name,CHECK_OPTION AS detail,IS_UPDATABLE AS extra FROM information_schema.VIEWS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
   if(in_array($type,['PROCEDURE','FUNCTION'],true))return db_all($db,'SELECT ROUTINE_NAME AS name,DATA_TYPE AS detail,SECURITY_TYPE AS extra FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() AND ROUTINE_TYPE='.qs($db,$type).' ORDER BY ROUTINE_NAME');
   if($type==='TRIGGER')return db_all($db,"SELECT TRIGGER_NAME AS name,CONCAT(ACTION_TIMING,' ',EVENT_MANIPULATION,' ON ',EVENT_OBJECT_TABLE) AS detail,ACTION_ORIENTATION AS extra FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME");
   return db_all($db,"SELECT EVENT_NAME AS name,CONCAT(EVENT_TYPE,' ',COALESCE(INTERVAL_VALUE,''),' ',COALESCE(INTERVAL_FIELD,'')) AS detail,STATUS AS extra FROM information_schema.EVENTS WHERE EVENT_SCHEMA=DATABASE() ORDER BY EVENT_NAME");
 }
 
-function page_objects(mysqli $db,string $page): void {
+function page_objects(MSDatabase $db,string $page): void {
   $map=['views'=>['VIEW','Views'],'triggers'=>['TRIGGER','Triggers'],'events'=>['EVENT','Events']];[$type,$title]=$map[$page];$rows=object_page_data($db,$type);$name=g('name');$definition=$name!==''?raw_definition($db,$type,$name):'';$templates=['VIEW'=>'CREATE VIEW `view_name` AS\nSELECT * FROM `table_name`','TRIGGER'=>'CREATE TRIGGER `trigger_name` BEFORE INSERT ON `table_name`\nFOR EACH ROW SET NEW.created_at = CURRENT_TIMESTAMP','EVENT'=>'CREATE EVENT `event_name`\nON SCHEDULE EVERY 1 DAY\nDO DELETE FROM `logs` WHERE created_at < NOW() - INTERVAL 30 DAY'];
   title_bar($title,selected_db(),'<a class="btn btn-primary" href="?page='.h($page).'&amp;name=__new__"><i class="fa-solid fa-plus me-1"></i>Create</a>');
   ?><div class="row g-3"><div class="col-lg-5"><div class="card"><div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Name</th><th>Details</th><th></th></tr></thead><tbody><?php foreach($rows as $row){?><tr><td><a href="?page=<?= h($page) ?>&amp;name=<?= urlencode((string)$row['name']) ?>"><?= h($row['name']) ?></a></td><td><?= h($row['detail'].' '.$row['extra']) ?></td><td><?php if($type==='VIEW'){?><a class="btn btn-secondary btn-sm" href="?page=select&amp;table=<?= urlencode((string)$row['name']) ?>">Select</a><?php }?></td></tr><?php }?></tbody></table></div></div></div><div class="col-lg-7"><?php if($name!==''){if($name==='__new__')$definition=$templates[$type];?><div class="card"><div class="card-header"><?= $name==='__new__'?'Create':'Alter' ?> <?= h(strtolower($type)) ?></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_object"><input type="hidden" name="kind" value="<?= h($type) ?>"><input type="hidden" name="old_name" value="<?= h($name==='__new__'?'':$name) ?>"><?= csrf_field() ?><textarea class="form-control sql-editor" name="definition" required><?= h($definition) ?></textarea><div class="mt-2 d-flex gap-2"><button class="btn btn-primary">Save</button></form><?php if($name!=='__new__'){?><form method="post"><input type="hidden" name="action" value="drop_object"><input type="hidden" name="kind" value="<?= h($type) ?>"><input type="hidden" name="name" value="<?= h($name) ?>"><?= csrf_field() ?><button class="btn btn-danger" data-confirm="Drop this object?">Drop</button></form><?php }?></div></div></div><?php }else{?><div class="alert alert-info">Select an object to inspect or alter it.</div><?php }?></div></div><?php
 }
 
-function page_routines(mysqli $db): void {
+function page_routines(MSDatabase $db): void {
   $rows=db_all($db,"SELECT ROUTINE_NAME,ROUTINE_TYPE,DATA_TYPE,SECURITY_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=DATABASE() ORDER BY ROUTINE_TYPE,ROUTINE_NAME");$name=g('name');$kind=strtoupper(g('kind','PROCEDURE'));$definition=$name!==''?raw_definition($db,$kind,$name):'';
   title_bar('Stored routines',selected_db(),'<a class="btn btn-primary" href="?page=routines&amp;name=__new__&amp;kind=PROCEDURE">Create procedure</a> <a class="btn btn-secondary" href="?page=routines&amp;name=__new__&amp;kind=FUNCTION">Create function</a>');
   ?><div class="row g-3"><div class="col-lg-5"><div class="card"><table class="table mb-0"><thead><tr><th>Name</th><th>Type</th><th>Returns</th></tr></thead><tbody><?php foreach($rows as $r){?><tr><td><a href="?page=routines&amp;name=<?= urlencode((string)$r['ROUTINE_NAME']) ?>&amp;kind=<?= h($r['ROUTINE_TYPE']) ?>"><?= h($r['ROUTINE_NAME']) ?></a></td><td><?= h($r['ROUTINE_TYPE']) ?></td><td><?= h($r['DATA_TYPE']) ?></td></tr><?php }?></tbody></table></div></div><div class="col-lg-7"><?php if($name!==''){if($name==='__new__')$definition=$kind==='FUNCTION'?"CREATE FUNCTION `function_name` (`value` INT)\nRETURNS INT DETERMINISTIC\nRETURN `value` * 2":"CREATE PROCEDURE `procedure_name` (IN `value` INT)\nBEGIN\n  SELECT `value`;\nEND";?><div class="card mb-3"><div class="card-header"><?= $name==='__new__'?'Create':'Alter' ?> <?= h(strtolower($kind)) ?></div><div class="card-body"><form method="post"><input type="hidden" name="action" value="save_object"><input type="hidden" name="kind" value="<?= h($kind) ?>"><input type="hidden" name="old_name" value="<?= h($name==='__new__'?'':$name) ?>"><?= csrf_field() ?><textarea class="form-control sql-editor" name="definition"><?= h($definition) ?></textarea><button class="btn btn-primary mt-2">Save</button></form></div></div><?php if($name!=='__new__'){$params=db_all($db,"SELECT PARAMETER_NAME,PARAMETER_MODE,DTD_IDENTIFIER FROM information_schema.PARAMETERS WHERE SPECIFIC_SCHEMA=DATABASE() AND SPECIFIC_NAME=".qs($db,$name)." AND PARAMETER_MODE IS NOT NULL ORDER BY ORDINAL_POSITION");?><div class="card"><div class="card-header">Call routine</div><div class="card-body"><form method="post"><input type="hidden" name="action" value="call_routine"><input type="hidden" name="kind" value="<?= h($kind) ?>"><input type="hidden" name="name" value="<?= h($name) ?>"><?= csrf_field() ?><?php foreach($params as $param){?><label class="form-label"><?= h($param['PARAMETER_MODE'].' '.$param['PARAMETER_NAME'].' '.$param['DTD_IDENTIFIER']) ?></label><input class="form-control mb-2" name="arg[]"><?php }?><button class="btn btn-primary">Call</button></form></div></div><?php }}else{?><div class="alert alert-info">Select a routine to alter or call it.</div><?php }?></div></div><?php
 }
 
-function page_global_search(mysqli $db): void {
+function page_global_search(MSDatabase $db): void {
   $database = selected_db();
   $schema = ms_global_search_schema($db);
   $saved = ms_profile_global_searches($database);
@@ -12726,7 +13431,7 @@ function page_global_search(mysqli $db): void {
   </script><?php
 }
 
-function page_repair_recipes(mysqli $db, ?array $preview = null): void {
+function page_repair_recipes(MSDatabase $db, ?array $preview = null): void {
   $database = selected_db();
   $recipes = ms_profile_repair_recipes($database);
   $id = g('recipe');
@@ -12745,18 +13450,18 @@ function page_repair_recipes(mysqli $db, ?array $preview = null): void {
   </div></div><?php
 }
 
-function page_processes(mysqli $db): void {
+function page_processes(MSDatabase $db): void {
   $rows=db_all($db,'SHOW FULL PROCESSLIST');title_bar('Server processes',count($rows).' active process(es)','<a class="btn btn-primary" href="?page=processes"><i class="fa-solid fa-rotate me-1"></i>Refresh</a>');
   ?><div class="card"><div class="table-scroll"><table class="table table-sm table-striped align-middle mb-0"><thead><tr><th>ID</th><th>User</th><th>Host</th><th>DB</th><th>Command</th><th>Time</th><th>State</th><th>Info</th><th></th></tr></thead><tbody><?php foreach($rows as $r){?><tr><td><?= h($r['Id']) ?></td><td><?= h($r['User']) ?></td><td><?= h($r['Host']) ?></td><td><?= h($r['db']) ?></td><td><?= h($r['Command']) ?></td><td><?= h($r['Time']) ?></td><td><?= h($r['State']) ?></td><td><?= render_value($r['Info'],300) ?></td><td><form method="post"><input type="hidden" name="action" value="kill_process"><input type="hidden" name="process_id" value="<?= h($r['Id']) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Kill this database process?">Kill</button></form></td></tr><?php }?></tbody></table></div></div><?php
 }
 
-function page_variables(mysqli $db): void {
+function page_variables(MSDatabase $db): void {
   $kind=g('kind','variables');$rows=$kind==='status'?db_all($db,'SHOW GLOBAL STATUS'):db_all($db,'SHOW GLOBAL VARIABLES');$filter=strtolower(g('q'));if($filter!=='')$rows=array_values(array_filter($rows,static function($r)use($filter){return strpos(strtolower(implode(' ',array_map('strval',$r))),$filter)!==false;}));
   title_bar('Server variables & status',server_version($db));
   ?><div class="card mb-3 no-print"><div class="card-body"><form method="get" class="row g-2"><input type="hidden" name="page" value="variables"><div class="col-md-3"><select class="form-select" name="kind"><option value="variables"<?= $kind==='variables'?' selected':'' ?>>Variables</option><option value="status"<?= $kind==='status'?' selected':'' ?>>Status</option></select></div><div class="col-md-7"><input class="form-control" name="q" value="<?= h(g('q')) ?>" placeholder="Filter name or value"></div><div class="col-md-2"><button class="btn btn-primary w-100">Filter</button></div></form></div></div><div class="card"><div class="table-responsive"><table class="table table-sm table-striped mb-0"><thead><tr><th>Name</th><th>Value</th><th>Documentation</th></tr></thead><tbody><?php foreach($rows as $r){$values=array_values($r);$name=(string)($values[0]??'');?><tr><td class="code"><?= h($name) ?></td><td><?= render_value($values[1]??'') ?></td><td><a target="_blank" rel="noopener" href="https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_<?= urlencode(strtolower($name)) ?>"><i class="fa-solid fa-arrow-up-right-from-square"></i></a></td></tr><?php }?></tbody></table></div></div><?php
 }
 
-function page_users(mysqli $db): void {
+function page_users(MSDatabase $db): void {
   $rows=[];try{$rows=db_all($db,'SELECT User,Host,plugin,account_locked,password_expired FROM mysql.user ORDER BY User,Host');}catch(Throwable $ignored){$rows=db_all($db,'SELECT User,Host FROM mysql.user ORDER BY User,Host');}
   title_bar('Users & privileges',count($rows).' account(s)');
   ?><div class="card mb-3"><div class="table-responsive"><table class="table table-hover align-middle mb-0"><thead><tr><th>User</th><th>Host</th><th>Plugin</th><th>Status</th><th>Rights</th><th></th></tr></thead><tbody><?php foreach($rows as $r){$grants=[];try{$grants=db_all($db,'SHOW GRANTS FOR '.qs($db,$r['User']).'@'.qs($db,$r['Host']));}catch(Throwable $ignored){}?><tr><td><?= h($r['User']) ?></td><td><?= h($r['Host']) ?></td><td><?= h($r['plugin']??'') ?></td><td><?= h(($r['account_locked']??'').' '.($r['password_expired']??'')) ?></td><td class="small code"><?php foreach($grants as $grant)echo h((string)array_values($grant)[0]).'<br>';?></td><td><form method="post"><input type="hidden" name="action" value="drop_user"><input type="hidden" name="drop_user" value="<?= h($r['User']) ?>"><input type="hidden" name="drop_host" value="<?= h($r['Host']) ?>"><?= csrf_field() ?><button class="btn btn-danger btn-sm" data-confirm="Drop this user account?">Drop</button></form></td></tr><?php }?></tbody></table></div></div>
@@ -12906,7 +13611,7 @@ function page_settings(): void {
   if ($settingsDbName !== '') {
     try {
       $settingsDb = connect_db();
-      $settingsTables = db_all($settingsDb, "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME");
+      $settingsTables = ms_table_list($settingsDb);
       foreach ($settingsTables as $settingsTable) {
         $settingsName = (string)$settingsTable['TABLE_NAME'];
         $settingsSidebarObjects[] = [
@@ -13021,6 +13726,7 @@ if (empty($_SESSION['ms_login'])) {
 try {
   $db = connect_db(false);
   $page = g('page', selected_db() !== '' ? 'database' : 'databases');
+  if ($db->engine === 'sqlite' && !ms_sqlite_page_supported($page)) throw new RuntimeException('This page is not yet available for SQLite.');
   $allowedPages = ms_allowed_pages();
   if (!in_array($page, $allowedPages, true)) {
     $page = selected_db() !== '' ? 'database' : 'databases';
