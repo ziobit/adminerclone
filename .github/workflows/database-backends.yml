@@ -1,0 +1,53 @@
+name: Database backends
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.3']
+        database: ['mysql:8.0', 'mariadb:10.11']
+    services:
+      database:
+        image: ${{ matrix.database }}
+        env:
+          MYSQL_ROOT_PASSWORD: regression-only-password
+          MYSQL_ROOT_HOST: '%'
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mariadb-admin ping -h 127.0.0.1 -uroot -pregression-only-password || mysqladmin ping -h 127.0.0.1 -uroot -pregression-only-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mysqli, pdo_sqlite, sqlite3
+          coverage: none
+      - name: PHP syntax
+        run: |
+          php -l index.php
+          php -l tests/database_backends.php
+      - name: SQLite regressions
+        run: php tests/database_backends.php sqlite
+      - name: MySQL or MariaDB regressions and existing diagnostics
+        env:
+          MS_TEST_HOST: 127.0.0.1
+          MS_TEST_PORT: 3306
+          MS_TEST_USER: root
+          MS_TEST_PASSWORD: regression-only-password
+        run: php tests/database_backends.php mysql
+      - name: SQLite HTTP regression flow
+        run: python3 tests/http_sqlite.py
