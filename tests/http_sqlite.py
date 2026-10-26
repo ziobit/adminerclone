@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 
 php = os.environ.get('PHP_BINARY', 'php')
+php_command = [php, '-d', 'error_reporting=-1', '-d', 'display_errors=1', '-d', 'log_errors=1', '-d', 'html_errors=0']
 source = Path(__file__).resolve().parents[1] / 'index.php'
 checks = 0
 
@@ -30,8 +31,11 @@ with tempfile.TemporaryDirectory(prefix='ms-http-') as temporary:
   root = Path(temporary)
   public = root / 'public'
   databases = root / 'databases'
+  sessions = root / 'sessions'
   public.mkdir()
   databases.mkdir()
+  sessions.mkdir()
+  php_command += ['-d', 'session.save_path=' + str(sessions)]
   app = public / 'index.php'
   shutil.copyfile(source, app)
   env = dict(os.environ, MS_SQLITE_ROOT=str(databases))
@@ -48,7 +52,9 @@ with tempfile.TemporaryDirectory(prefix='ms-http-') as temporary:
     $db->exec('CREATE VIEW item_names AS SELECT id,name FROM items');
     echo password_hash('test-admin-password',PASSWORD_DEFAULT);
   '''
-  result = subprocess.run([php, '-r', init, str(app), str(fixture)], check=True, capture_output=True, text=True)
+  result = subprocess.run(php_command + ['-r', init, str(app), str(fixture)], check=True, capture_output=True, text=True)
+  if result.stderr or re.search(r'(Deprecated|Warning|Notice|Fatal error):', result.stdout):
+    raise AssertionError('PHP startup diagnostics: ' + result.stderr + result.stdout)
   env['MS_SQLITE_PASSWORD_HASH'] = result.stdout.strip()
   with socket.socket() as probe:
     probe.bind(('127.0.0.1', 0))
@@ -57,19 +63,22 @@ with tempfile.TemporaryDirectory(prefix='ms-http-') as temporary:
   jar = http.cookiejar.CookieJar()
   opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
   log = open(root / 'server.log', 'w+')
-  server = subprocess.Popen([php, '-S', '127.0.0.1:' + str(port), '-t', str(public)], env=env, stdout=log, stderr=log)
+  server = subprocess.Popen(php_command + ['-S', '127.0.0.1:' + str(port), '-t', str(public)], env=env, stdout=log, stderr=log)
   def request(query='', data=None):
     payload = None if data is None else urllib.parse.urlencode(data, doseq=True).encode()
     try:
       with opener.open(base + query, payload, timeout=15) as response:
-        return response.status, response.read().decode('utf-8', errors='replace')
+        status, body = response.status, response.read().decode('utf-8', errors='replace')
     except urllib.error.HTTPError as error:
-      return error.code, error.read().decode('utf-8', errors='replace')
+      status, body = error.code, error.read().decode('utf-8', errors='replace')
+    if re.search(r'(Deprecated|Warning|Notice|Fatal error):', body):
+      raise AssertionError('PHP diagnostics in HTTP response: ' + body[:2000])
+    return status, body
   def token(html):
     return re.search(r'name="csrf" value="([a-f0-9]+)"', html).group(1)
   def rows():
     command = '$d=new PDO("sqlite:".$argv[1]);echo json_encode($d->query("SELECT * FROM items ORDER BY id")->fetchAll(PDO::FETCH_ASSOC));'
-    return json.loads(subprocess.run([php,'-r',command,str(fixture)],check=True,capture_output=True,text=True).stdout)
+    return json.loads(subprocess.run(php_command + ['-r',command,str(fixture)],check=True,capture_output=True,text=True).stdout)
   try:
     for attempt in range(100):
       try:
@@ -129,6 +138,9 @@ with tempfile.TemporaryDirectory(prefix='ms-http-') as temporary:
     check('other database files through SQL is disabled' in html, 'SQL editor refuses filesystem escape')
     status, html = request(data={'action':'logout','csrf':csrf})
     check(status == 200 and 'Database engine' in html and 'Log out' not in html, 'Logout returns to engine selection')
+    log.flush()
+    log.seek(0)
+    check(re.search(r'(Deprecated|Warning|Notice|Fatal error):', log.read()) is None, 'HTTP flow emits no PHP diagnostics with E_ALL')
     print(str(checks) + ' HTTP checks passed')
   except Exception:
     log.flush()

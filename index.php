@@ -1,7 +1,7 @@
 <?php
 /**
  * MySQL Studio - single-file MySQL/MariaDB and SQLite administration application.
- * PHP 7.4+, mysqli (MySQL) or PDO_SQLite (SQLite), no framework. Independent implementation based on the
+ * PHP 7.4 through 8.5, mysqli (MySQL) or PDO_SQLite (SQLite), no framework. Independent implementation based on the
  * public Adminer feature list; this file contains no Adminer source code.
  *
  * IMPORTANT: expose this file only through HTTPS and restrict it by IP or
@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.20.0';
+const MS_VERSION = '1.20.1';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2336,7 +2336,9 @@ function ms_update_download(): ?string {
       ]);
       $source = curl_exec($ch);
       $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-      curl_close($ch);
+      // PHP 7.4 uses a resource; PHP 8+ releases CurlHandle objects automatically.
+      if (is_resource($ch)) curl_close($ch);
+      unset($ch);
       if (is_string($source) && $status >= 200 && $status < 300 && strlen($source) <= MS_UPDATE_MAX_BYTES) {
         return $source;
       }
@@ -3033,7 +3035,14 @@ class MSSQLiteDatabase extends MSDatabase {
   public function __construct(string $path) {
     if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('The PHP PDO_SQLite extension is required. MySQL continues to use mysqli.');
     $this->path = ms_sqlite_path($path);
-    $this->native = new PDO('sqlite:' . $this->path, null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES=>false, PDO::SQLITE_ATTR_OPEN_FLAGS=>PDO::SQLITE_OPEN_READWRITE]);
+    $options = [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_STRINGIFY_FETCHES=>false];
+    // Driver constants moved to Pdo\Sqlite in PHP 8.4; the PDO aliases are deprecated in 8.5.
+    if (class_exists('Pdo\\Sqlite')) {
+      $options[\Pdo\Sqlite::ATTR_OPEN_FLAGS] = \Pdo\Sqlite::OPEN_READWRITE;
+    } else {
+      $options[PDO::SQLITE_ATTR_OPEN_FLAGS] = PDO::SQLITE_OPEN_READWRITE;
+    }
+    $this->native = new PDO('sqlite:' . $this->path, null, null, $options);
     $this->native->exec('PRAGMA busy_timeout = 5000');
     $this->native->exec('PRAGMA foreign_keys = ON');
     $this->native->exec('PRAGMA trusted_schema = OFF');
@@ -3636,7 +3645,7 @@ function ms_diagnostics_run(): array {
         $rows = db_all($diag, $sql);
         foreach ($rows as $row) ms_export_csv_row($stream, array_values($row), ',');
         rewind($stream); $csvRows = 0;
-        while (fgetcsv($stream) !== false) $csvRows++;
+        while (fgetcsv($stream, 0, ',', '"', '') !== false) $csvRows++;
         return ['query_rows'=>count($rows),'csv_rows'=>$csvRows];
       } finally {
         fclose($stream);
@@ -5675,7 +5684,8 @@ function ms_import_unique_headers(array $headers): array {
 
 function ms_import_detect_delimiter(string $line): string {
   $candidates = [',' => 0, ';' => 0, "\t" => 0, '|' => 0];
-  foreach ($candidates as $delimiter => $unused) $candidates[$delimiter] = count(str_getcsv($line, $delimiter));
+  // Preserve the importer's legacy backslash escaping explicitly on PHP 8.4+.
+  foreach ($candidates as $delimiter => $unused) $candidates[$delimiter] = count(str_getcsv($line, $delimiter, '"', '\\'));
   arsort($candidates);
   $delimiter = (string)array_key_first($candidates);
   return (int)($candidates[$delimiter] ?? 0) > 1 ? $delimiter : ',';
@@ -5689,12 +5699,12 @@ function ms_import_parse_csv_file(string $path, string $delimiterChoice): array 
   $delimiters = ['comma' => ',', 'semicolon' => ';', 'tab' => "\t", 'pipe' => '|'];
   $delimiter = $delimiters[$delimiterChoice] ?? ms_import_detect_delimiter($firstLine);
   rewind($handle);
-  $headers = fgetcsv($handle, 0, $delimiter);
+  $headers = fgetcsv($handle, 0, $delimiter, '"', '\\');
   if (!is_array($headers) || !$headers) { fclose($handle); throw new RuntimeException('The CSV header row could not be read.'); }
   if (count($headers) > 200) { fclose($handle); throw new RuntimeException('Import files can contain at most 200 columns.'); }
   $headers = ms_import_unique_headers($headers);
   $rows = [];
-  while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
+  while (($row = fgetcsv($handle, 0, $delimiter, '"', '\\')) !== false) {
     if (count($rows) >= 50000) { fclose($handle); throw new RuntimeException('Import files can contain at most 50,000 data rows.'); }
     $row = array_values($row);
     if (count($row) < count($headers)) $row = array_pad($row, count($headers), '');
@@ -5857,11 +5867,11 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
     $out = @fopen($errorPath, 'wb');
     if ($out !== false) {
       fwrite($out, "\xEF\xBB\xBF");
-      fputcsv($out, array_merge(['source_row'], $data['headers'], ['error']));
+      fputcsv($out, array_merge(['source_row'], $data['headers'], ['error']), ',', '"', '\\');
       foreach ($errors as $error) {
         $row = array_map('ms_import_cell_text', is_array($error['values']) ? $error['values'] : []);
         if (count($row) < count($data['headers'])) $row = array_pad($row, count($data['headers']), '');
-        fputcsv($out, array_merge([(string)$error['row']], array_slice($row, 0, count($data['headers'])), [(string)$error['error']]));
+        fputcsv($out, array_merge([(string)$error['row']], array_slice($row, 0, count($data['headers'])), [(string)$error['error']]), ',', '"', '\\');
       }
       fclose($out);
       if (!isset($_SESSION['ms_import_errors']) || !is_array($_SESSION['ms_import_errors'])) $_SESSION['ms_import_errors'] = [];

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['7.4', '8.3']
+        php: ['7.4', '8.3', '8.4', '8.5']
         database: ['mysql:8.0', 'mariadb:10.11']
     services:
       database:
@@ -34,12 +34,17 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: mysqli, pdo_sqlite, sqlite3
+          extensions: mysqli, pdo_sqlite, sqlite3, curl
+          ini-values: error_reporting=E_ALL, display_errors=On, log_errors=On
           coverage: none
       - name: PHP syntax
         run: |
           php -l index.php
           php -l tests/database_backends.php
+          php -l tests/deprecations.php
+          php -l tests/php_compatibility.php
+      - name: PHP compatibility and CSV regressions
+        run: php tests/php_compatibility.php
       - name: SQLite regressions
         run: php tests/database_backends.php sqlite
       - name: MySQL or MariaDB regressions and existing diagnostics
@@ -51,3 +56,5 @@ jobs:
         run: php tests/database_backends.php mysql
       - name: SQLite HTTP regression flow
         run: python3 tests/http_sqlite.py
+      - name: Updater cURL and stream compatibility
+        run: python3 tests/http_updater.py
