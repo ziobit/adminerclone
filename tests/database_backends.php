@@ -1,6 +1,7 @@
 <?php
 /** Run against disposable databases only. No dependencies beyond PHP extensions. */
 declare(strict_types=1);
+require __DIR__ . '/deprecations.php';
 ini_set('session.save_path', sys_get_temp_dir());
 define('MS_LIBRARY_ONLY', true);
 require dirname(__DIR__) . '/index.php';
@@ -50,6 +51,33 @@ if ($engine === 'mysql') {
     check('MySQL SQL execution returns rows and errors', static function () use ($db): void { [$sets] = execute_sql($db,'SELECT 7 AS value; SELECT 9 AS value'); same((string)$sets[1]['rows'][0][0],'9'); rejects(static function () use ($db): void { execute_sql($db,'SELECT missing FROM sample'); }); });
     check('MySQL transaction rollback', static function () use ($db): void { $db->begin_transaction(); $db->query('DELETE FROM sample'); $db->rollback(); same((int)db_one($db,'SELECT COUNT(*) AS n FROM sample')['n'],1); });
     check('MySQL prepared delete', static function () use ($db): void { $db->run('DELETE FROM sample WHERE id=?',[1]); same((int)$db->affected_rows,1); });
+    check('Rejected import CSV retains source values and errors', static function () use ($db): void {
+      $headers = ['id', 'label'];
+      $rows = [['2', "valid ภาษาไทย"], ['bad-id', 'Rejected "quoted", C:\\folder']];
+      $upload = tempnam(sys_get_temp_dir(), 'ms-import-test-');
+      $before = $_POST;
+      try {
+        file_put_contents($upload, json_encode(array_map(static function (array $row) use ($headers): array { return array_combine($headers, $row); }, $rows)));
+        $token = ms_import_create_preview($upload, 'compatibility.json', 'auto');
+        $_POST = ['import_table'=>'sample', 'mapping'=>$headers, 'import_mode'=>'insert'];
+        $result = ms_import_execute_rows($db, $token);
+        same($result['success'], 1);
+        same($result['errors'], 1);
+        same(db_one($db, 'SELECT label FROM sample WHERE id=2')['label'], $rows[0][1]);
+        $entry = $_SESSION['ms_import_errors'][$result['error_token']];
+        [$actualHeaders, $actualRows] = ms_import_parse_csv_file($entry['path'], 'comma');
+        same($actualHeaders, ['source_row', 'id', 'label', 'error']);
+        same(array_slice($actualRows[0], 0, 3), ['3', $rows[1][0], $rows[1][1]]);
+        same($actualRows[0][3] !== '', true);
+      } finally {
+        unlink($upload);
+        $_POST = $before;
+        foreach (['ms_imports', 'ms_import_errors'] as $key) {
+          foreach ($_SESSION[$key] ?? [] as $entry) if (is_file($entry['path'])) unlink($entry['path']);
+          unset($_SESSION[$key]);
+        }
+      }
+    });
     check('Existing MySQL diagnostic regression suite', static function (): void {
       $report = ms_diagnostics_run();
       $failed = array_filter($report['results'], static function (array $r): bool { return $r['status'] !== 'pass'; });

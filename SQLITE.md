@@ -79,7 +79,7 @@ MS_TEST_HOST=127.0.0.1 MS_TEST_PORT=3306 MS_TEST_USER=root \
 
 The MySQL runner creates and removes a randomly named `ms_backend_test_*` database and runs the existing embedded diagnostic suite, which creates its own randomly named disposable database. It never selects a user database. The SQLite runner uses a private temporary directory; the HTTP runner copies the single production file into a temporary web root and tests login, browsing, CRUD, SQL, CSRF and unsupported-route guards.
 
-The GitHub Actions matrix runs PHP 7.4 and 8.3 against MySQL 8.0 and MariaDB 10.11, plus SQLite and the HTTP flow on every job.
+The GitHub Actions matrix runs PHP 7.4, 8.3, 8.4 and 8.5 against MySQL 8.0 and MariaDB 10.11, plus SQLite and the HTTP flow on every job. Runtime deprecations fail the CLI regression runs; the HTTP flow checks for PHP diagnostics with `E_ALL` enabled. See [PHP compatibility](PHP_COMPATIBILITY.md) for the v1.20.1 changes and additional checks.
 
 ### Locally verified runtime matrix (20 October 2026)
 
