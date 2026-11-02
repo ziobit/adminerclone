@@ -34,7 +34,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: mysqli, pdo_sqlite, sqlite3, curl
+          extensions: mysqli, pdo_sqlite, sqlite3, curl, zip
           ini-values: error_reporting=E_ALL, display_errors=On, log_errors=On
           coverage: none
       - name: PHP syntax
@@ -43,10 +43,13 @@ jobs:
           php -l tests/database_backends.php
           php -l tests/deprecations.php
           php -l tests/php_compatibility.php
+          php -l tests/sqlite_tools.php
       - name: PHP compatibility and CSV regressions
         run: php tests/php_compatibility.php
       - name: SQLite regressions
-        run: php tests/database_backends.php sqlite
+        run: |
+          php tests/database_backends.php sqlite
+          php tests/sqlite_tools.php
       - name: MySQL or MariaDB regressions and existing diagnostics
         env:
           MS_TEST_HOST: 127.0.0.1

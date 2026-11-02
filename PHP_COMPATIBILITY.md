@@ -13,12 +13,13 @@ The changes follow the official [PHP 8.5 deprecations](https://www.php.net/manua
 
 ## Run the checks
 
-Required test extensions: `mysqli`, `pdo_sqlite`, `sqlite3`, `curl`, `ctype`, and sessions. The HTTP tests use Python 3's standard library and temporary local servers. They copy the application into a temporary directory; updater tests download only a local fixture and never install an update.
+Required test extensions: `mysqli`, `pdo_sqlite`, `sqlite3`, `curl`, `zip`, `ctype`, and sessions. The HTTP tests use Python 3's standard library and temporary local servers. They copy the application into a temporary directory; updater tests download only a local fixture and never install an update.
 
 ```sh
 php -d error_reporting=-1 -l index.php
 php tests/php_compatibility.php
 php tests/database_backends.php sqlite
+php tests/sqlite_tools.php
 python3 tests/http_sqlite.py
 python3 tests/http_updater.py
 
@@ -28,6 +29,10 @@ MS_TEST_HOST=127.0.0.1 MS_TEST_PORT=3306 MS_TEST_USER=root \
 ```
 
 Set `PHP_BINARY` to a specific PHP executable when running the Python tests. PHP regression runners collect `E_DEPRECATED`/`E_USER_DEPRECATED` before loading the application and exit unsuccessfully if any are emitted, including errors suppressed with `@`. HTTP tests enable `E_ALL` and check responses and server logs.
+
+### v1.21.0 SQLite compatibility
+
+SQLite's new import/restore workflows use PDO-managed transactions: PHP 7.4 does not reliably report a transaction opened with raw SQL `BEGIN` through `PDO::inTransaction()`. If a trigger performs `RAISE(ROLLBACK)`, older PDO_SQLite versions (including PHP 7.4 and 8.3) can also retain a stale PDO transaction flag; after confirming that SQLite has already rolled back, the adapter reopens the same validated file without retrying any writes. These cases have dedicated regression coverage. MySQL/MariaDB transaction and CSV-escape behavior is unchanged. SQLite CSV imports use the same standard doubled-quote escaping as exports, preserving literal backslashes.
 
 ## Local validation, 26 October 2026
 

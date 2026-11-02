@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.20.1';
+const MS_VERSION = '1.21.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -3032,6 +3032,8 @@ class MSSQLiteDatabase extends MSDatabase {
   private $lastError = '';
   private $lastErrno = 0;
   private $affected = 0;
+  /** Trusted internal streaming/transaction access; user SQL goes through run(). */
+  public function sqlite(): PDO { return $this->native; }
   public function __construct(string $path) {
     if (!class_exists('PDO') || !in_array('sqlite', PDO::getAvailableDrivers(), true)) throw new RuntimeException('The PHP PDO_SQLite extension is required. MySQL continues to use mysqli.');
     $this->path = ms_sqlite_path($path);
@@ -3042,7 +3044,8 @@ class MSSQLiteDatabase extends MSDatabase {
     } else {
       $options[PDO::SQLITE_ATTR_OPEN_FLAGS] = PDO::SQLITE_OPEN_READWRITE;
     }
-    $this->native = new PDO('sqlite:' . $this->path, null, null, $options);
+    $driver = class_exists('Pdo\\Sqlite') ? 'Pdo\\Sqlite' : 'PDO';
+    $this->native = new $driver('sqlite:' . $this->path, null, null, $options);
     $this->native->exec('PRAGMA busy_timeout = 5000');
     $this->native->exec('PRAGMA foreign_keys = ON');
     $this->native->exec('PRAGMA trusted_schema = OFF');
@@ -3226,11 +3229,180 @@ function ms_sqlite_projection(MSDatabase $db, string $table): string {
   return implode(', ', array_merge($parts, ms_sqlite_identity_extras($columns, $keys)));
 }
 
+function ms_sqlite_exportable_statement(string $sql): bool {
+  $tokens = ms_sqlite_tokens($sql);
+  return count(ms_sqlite_split($sql)) === 1 && in_array($tokens[0]['word'] ?? '', ['SELECT','WITH','VALUES'], true) && sql_exportable_statement($sql);
+}
+
+/** Older PDO_SQLite versions retain a stale flag after an implicit ROLLBACK. */
+function ms_sqlite_rollback_managed(MSDatabase $db): void {
+  if (!$db->sqlite()->inTransaction()) return;
+  try { $db->sqlite()->rollBack(); }
+  catch (PDOException $e) {
+    if (strpos($e->getMessage(), 'no transaction is active') === false) throw $e;
+    // SQLite has already rolled back (e.g. RAISE(ROLLBACK)); clear PDO's stale
+    // flag by reopening the same validated file. Never retry the failed writes.
+    $path = $db->path;
+    $db->close();
+    $db->__construct($path);
+  }
+}
+
+/** Ask SQLite to encode storage classes; PHP must not round 64-bit values. */
+function ms_sqlite_export_literal(string $column): string {
+  $c = qi($column);
+  return "CASE typeof($c) WHEN 'text' THEN 'CAST(X''' || hex(CAST($c AS BLOB)) || ''' AS TEXT)' WHEN 'real' THEN CASE WHEN $c > 1.7976931348623157e308 THEN '9e999' WHEN $c < -1.7976931348623157e308 THEN '-9e999' ELSE printf('%!.26g', $c) END ELSE quote($c) END";
+}
+
+/** Stream native SQLite rows, excluding only explicitly identified editor metadata. */
+function ms_sqlite_export_result(MSDatabase $db, string $sql, string $format, $out, ?array $columns = null, bool $bom = true): void {
+  ms_export_content_type($format);
+  ms_sqlite_assert_sql($sql);
+  if (!ms_sqlite_exportable_statement($sql)) throw new RuntimeException('Only read-only SQLite SELECT, WITH SELECT or VALUES results can be exported.');
+  $statement = ms_sqlite_split($sql)[0];
+  $view = '__ms_export_' . bin2hex(random_bytes(8));
+  $created = false; $cursor = null;
+  $ownsTransaction = !$db->sqlite()->inTransaction();
+  if ($ownsTransaction) $db->sqlite()->beginTransaction();
+  try {
+    // The subquery is SELECT-only. OFFSET prevents flattening/re-evaluation of
+    // volatile expressions when the SQL encoder references a column twice.
+    $db->sqlite()->exec('CREATE TEMP VIEW ' . qi($view) . ' AS SELECT * FROM (' . "\n" . $statement . "\n) LIMIT -1 OFFSET 0");
+    $created = true;
+    $info = $db->sqlite()->query('PRAGMA temp.table_info(' . qs($db, $view) . ')')->fetchAll(PDO::FETCH_ASSOC);
+    $names = array_column($info, 'name');
+    if ($columns !== null) {
+      if (!$columns || array_diff($columns, $names)) throw new RuntimeException('Export columns no longer match the query. Reload the table.');
+      $names = array_values($columns);
+    }
+    if (!$names) throw new RuntimeException('The query has no exportable columns.');
+    $projection = $format === 'sql' ? array_map('ms_sqlite_export_literal', $names) : array_map('qi', $names);
+    $cursor = $db->sqlite()->query('SELECT ' . implode(', ', $projection) . ' FROM temp.' . qi($view));
+    if ($format === 'sql') {
+      ms_export_write($out, "-- SQLite query-result export; reruns the query at download time.\n-- Restore using Import > Restore SQLite SQL.\nCREATE TABLE `query_result` (" . implode(', ', array_map('qi', $names)) . ");\n");
+      $prefix = 'INSERT INTO `query_result` (' . implode(', ', array_map('qi', $names)) . ') VALUES (';
+      while (($row = $cursor->fetch(PDO::FETCH_NUM)) !== false) ms_export_write($out, $prefix . implode(', ', $row) . ");\n");
+    } else {
+      $delimiter = $format === 'tsv' ? "\t" : ',';
+      if ($bom) ms_export_write($out, "\xEF\xBB\xBF");
+      ms_export_csv_row($out, $names, $delimiter);
+      while (($row = $cursor->fetch(PDO::FETCH_NUM)) !== false) ms_export_csv_row($out, $row, $delimiter);
+    }
+  } finally {
+    if ($cursor !== null) $cursor->closeCursor();
+    try { if ($created) $db->sqlite()->exec('DROP VIEW temp.' . qi($view)); }
+    finally { if ($ownsTransaction && $db->sqlite()->inTransaction()) $db->sqlite()->rollBack(); }
+  }
+}
+
+/** Portable SQL snapshot: schema first, data next, triggers/indexes/views last. */
+function ms_sqlite_dump(MSDatabase $db, array $tables, bool $structure, bool $data, bool $drop, $out): void {
+  if (!$structure && !$data) throw new RuntimeException('Select structure, data, or both.');
+  $ownsTransaction = !$db->sqlite()->inTransaction();
+  if ($ownsTransaction) $db->sqlite()->beginTransaction();
+  try {
+    $objects = [];
+    foreach (array_unique($tables) as $table) {
+      $meta = ms_table_meta($db, $table);
+      if (!$meta || !$meta['CREATE_SQL']) throw new RuntimeException('Export object not found: ' . $table);
+      if (preg_match('/^CREATE\s+VIRTUAL\s+TABLE\b/i', $meta['CREATE_SQL'])) throw new RuntimeException('Virtual-table dumps are not supported. Export their rows as CSV instead.');
+      $objects[] = $meta;
+    }
+    ms_export_write($out, "-- SQLite export (MySQL Studio " . MS_VERSION . ")\n-- Restore atomically using Import > Restore SQLite SQL.\n-- Selected objects only; include referenced tables for a complete backup.\n\n");
+    if ($structure && $drop) foreach (array_reverse($objects) as $meta) ms_export_write($out, 'DROP ' . ($meta['TABLE_TYPE'] === 'VIEW' ? 'VIEW' : 'TABLE') . ' IF EXISTS ' . qi($meta['TABLE_NAME']) . ";\n");
+    if ($structure) foreach ($objects as $meta) if ($meta['TABLE_TYPE'] !== 'VIEW') ms_export_write($out, $meta['CREATE_SQL'] . ";\n");
+    if ($data) foreach ($objects as $meta) {
+      $table = (string)$meta['TABLE_NAME'];
+      if ($meta['TABLE_TYPE'] === 'VIEW') continue;
+      $columns = table_columns($db, $table);
+      $names = array_column(array_values(array_filter($columns, static function (array $c): bool { return stripos($c['EXTRA'], 'GENERATED') === false; })), 'COLUMN_NAME');
+      // Preserve implicit rowids (including gaps) when they are addressable.
+      if (!ms_sqlite_without_rowid($meta['CREATE_SQL']) && !array_filter($columns, static function (array $c): bool { return $c['SQLITE_ROWID_ALIAS']; })) {
+        $lower = array_map('strtolower', array_column($columns, 'COLUMN_NAME'));
+        foreach (['_rowid_', 'rowid', 'oid'] as $alias) if (!in_array($alias, $lower, true)) { array_unshift($names, $alias); break; }
+      }
+      $cursor = $db->sqlite()->query('SELECT ' . implode(', ', array_map('ms_sqlite_export_literal', $names)) . ' FROM ' . qi($table));
+      try {
+        $prefix = 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $names)) . ') VALUES (';
+        while (($row = $cursor->fetch(PDO::FETCH_NUM)) !== false) ms_export_write($out, $prefix . implode(', ', $row) . ");\n");
+      } finally { $cursor->closeCursor(); }
+      // AUTOINCREMENT remembers deleted high IDs, not just MAX(id).
+      if (preg_match('/\bAUTOINCREMENT\b/i', $meta['CREATE_SQL']) && db_one($db, "SELECT name FROM sqlite_master WHERE name='sqlite_sequence'")) {
+        $sequence = db_one($db, 'SELECT ' . ms_sqlite_export_literal('seq') . ' AS seq FROM sqlite_sequence WHERE name=' . qs($db, $table));
+        if ($sequence !== null) {
+          ms_export_write($out, 'DELETE FROM sqlite_sequence WHERE name=' . qs($db, $table) . ";\nINSERT INTO sqlite_sequence(name,seq) VALUES (" . qs($db, $table) . ', ' . $sequence['seq'] . ");\n");
+        }
+      }
+    }
+    if ($structure) {
+      foreach ($objects as $meta) if ($meta['TABLE_TYPE'] === 'VIEW') ms_export_write($out, $meta['CREATE_SQL'] . ";\n");
+      foreach ($objects as $meta) foreach (db_all($db, "SELECT sql FROM sqlite_master WHERE type IN ('index','trigger') AND sql IS NOT NULL AND tbl_name=" . qs($db, $meta['TABLE_NAME']) . " ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name") as $object) ms_export_write($out, $object['sql'] . ";\n");
+    }
+  } finally { if ($ownsTransaction && $db->sqlite()->inTransaction()) $db->sqlite()->rollBack(); }
+}
+
+/** A bounded, atomic restore; never relax the SQL editor's filesystem boundary. */
+function ms_sqlite_restore(MSDatabase $db, string $sql): int {
+  if ($db->engine !== 'sqlite') throw new RuntimeException('SQLite restore requires a SQLite connection.');
+  if (strlen($sql) > 20 * 1024 * 1024) throw new RuntimeException('SQLite restore files must not exceed 20 MB.');
+  $statements = ms_sqlite_split($sql);
+  if (!$statements || count($statements) > 100000) throw new RuntimeException('Choose a non-empty SQLite SQL dump with at most 100,000 statements.');
+  foreach ($statements as $statement) {
+    ms_sqlite_assert_sql($statement);
+    $tokens = ms_sqlite_tokens($statement);
+    if (!in_array($tokens[0]['word'] ?? '', ['CREATE','DROP','INSERT','UPDATE','DELETE','REPLACE'], true)) throw new RuntimeException('Restore accepts schema/data statements only, without PRAGMAs or transaction commands.');
+    if (($tokens[0]['word'] ?? '') === 'CREATE' && ($tokens[1]['word'] ?? '') === 'VIRTUAL') throw new RuntimeException('Virtual-table restores are not supported.');
+  }
+  if ($db->sqlite()->inTransaction()) throw new RuntimeException('Finish the active transaction before restoring.');
+  // Only this dedicated restore may disable FK actions. This avoids DROP TABLE
+  // cascading into other tables; all foreign keys are checked before commit.
+  $db->sqlite()->exec('PRAGMA foreign_keys = OFF');
+  try {
+    $db->sqlite()->beginTransaction();
+    foreach ($statements as $statement) $db->run($statement);
+    $violations = db_all($db, 'PRAGMA foreign_key_check');
+    if ($violations) throw new RuntimeException('Restore would leave foreign-key violations. All changes were rolled back. Include the referenced tables.');
+    $db->sqlite()->commit();
+  } finally {
+    try { ms_sqlite_rollback_managed($db); }
+    finally { $db->sqlite()->exec('PRAGMA foreign_keys = ON'); }
+  }
+  return count($statements);
+}
+
+/** A single row's import must either complete or undo its trigger side effects. */
+function ms_sqlite_import_row(MSDatabase $db, string $table, array $values, string $mode, string $key): void {
+  $names = array_keys($values);
+  $parameters = array_values($values);
+  if ($mode === 'update') {
+    if (!isset($values[$key])) throw new RuntimeException('Update match keys cannot be NULL.');
+    $matches = db_all($db, 'SELECT 1 AS found FROM ' . qi($table) . ' WHERE ' . qi($key) . '=? LIMIT 2', [$values[$key]]);
+    if (count($matches) !== 1) throw new RuntimeException('Update match key must identify exactly one row (found ' . count($matches) . ').');
+    $updates = $values; unset($updates[$key]);
+    if (!$updates) throw new RuntimeException('Update needs a mapped column besides the match key.');
+    $sql = 'UPDATE ' . qi($table) . ' SET ' . implode(', ', array_map(static function (string $name): string { return qi($name) . '=?'; }, array_keys($updates))) . ' WHERE ' . qi($key) . '=?';
+    $parameters = array_merge(array_values($updates), [$values[$key]]);
+  } else {
+    $sql = 'INSERT INTO ' . qi($table) . ' (' . implode(', ', array_map('qi', $names)) . ') VALUES (' . implode(', ', array_fill(0, count($names), '?')) . ')';
+    if ($mode === 'upsert') {
+      $primary = array_values(array_filter(table_columns($db, $table), static function (array $c): bool { return (int)$c['SQLITE_PK_POSITION'] > 0; }));
+      usort($primary, static function (array $a, array $b): int { return $a['SQLITE_PK_POSITION'] <=> $b['SQLITE_PK_POSITION']; });
+      $keys = array_column($primary, 'COLUMN_NAME');
+      if (!$keys || array_diff($keys, $names)) throw new RuntimeException('SQLite upsert requires every declared PRIMARY KEY column to be mapped.');
+      foreach ($keys as $name) if ($values[$name] === null) throw new RuntimeException('SQLite upsert keys cannot be NULL.');
+      $updates = array_diff($names, $keys);
+      $sql .= ' ON CONFLICT (' . implode(', ', array_map('qi', $keys)) . ') DO ' . ($updates ? 'UPDATE SET ' . implode(', ', array_map(static function (string $name): string { return qi($name) . '=excluded.' . qi($name); }, $updates)) : 'NOTHING');
+    }
+  }
+  $db->run($sql, $parameters);
+}
+
 function ms_sqlite_page_supported(string $page): bool {
-  return in_array($page, ['databases','database','structure','select','row','sql','settings','global_search'], true);
+  return in_array($page, ['databases','database','structure','select','row','sql','settings','global_search','diagnostics','import','export'], true);
 }
 
 function ms_sqlite_action_supported(string $action): bool {
+  if (in_array($action, ['run_diagnostics','import_preview','import_execute','sqlite_restore'], true)) return true;
   return in_array($action, ['select_db','save_row','delete_row','delete_rows','bulk_update','run_sql','switch_profile','create_profile','rename_profile','delete_profile','reset_profile','save_settings','save_profile_settings','kick_session','kick_presence_session','save_view_preset','open_problem_queue','query_history_toggle','query_history_delete','query_history_clear','run_global_search','save_global_search','delete_global_search','open_generated_sql','column_view_hide','column_view_show','column_view_show_all','column_view_hide_primary','column_view_image_remove','column_view_soft_fk_remove','column_view_save','column_view_clear','column_view_label','column_view_presentation'], true) || strpos($action, 'column_view_') === 0;
 }
 
@@ -3490,7 +3662,115 @@ function ms_diagnostics_repair_cases(MSDatabase $db, array &$results, string $gr
   });
 }
 
+function ms_sqlite_diagnostics_run(): array {
+  $groups = ['SQLite editing and identities','SQLite query state and Explain','SQLite import and export','SQLite safety boundary'];
+  $report = ['version'=>MS_VERSION,'server_key'=>ms_server_config_key(),'started_at'=>time(),'completed_at'=>0,'database'=>'','cleanup'=>['status'=>'pending','exception'=>''],'results'=>[],'group_status'=>[],'blocking_passed'=>false];
+  $diag = null; $initializer = null; $directory = ''; $path = '';
+  // Captures only paths created by this invocation, never the active DB path.
+  $cleanup = static function () use (&$diag, &$initializer, &$directory, &$path): bool {
+    if ($diag !== null) { $diag->close(); $diag = null; }
+    $initializer = null;
+    $ok = true;
+    if ($path !== '') foreach (['','-wal','-shm','-journal'] as $suffix) if (is_file($path . $suffix) && !@unlink($path . $suffix)) $ok = false;
+    if ($directory !== '' && is_dir($directory) && !@rmdir($directory)) $ok = false;
+    return $ok;
+  };
+  register_shutdown_function($cleanup);
+  try {
+    [$configuredRoot] = ms_sqlite_config();
+    $root = realpath($configuredRoot);
+    $documentRoot = !empty($_SERVER['DOCUMENT_ROOT']) ? realpath($_SERVER['DOCUMENT_ROOT']) : false;
+    if ($root === false || !is_dir($root) || $root === __DIR__ || ms_path_inside($root, __DIR__) || ($documentRoot !== false && ($root === $documentRoot || ms_path_inside($root, $documentRoot)))) throw new RuntimeException('Diagnostics require a writable private MS_SQLITE_ROOT outside the web root.');
+    $candidate = $root . DIRECTORY_SEPARATOR . 'ms-diagnostics-' . bin2hex(random_bytes(12));
+    if (!@mkdir($candidate, 0700)) throw new RuntimeException('Cannot create a private disposable diagnostics directory in MS_SQLITE_ROOT.');
+    $directory = $candidate;
+    $path = $directory . DIRECTORY_SEPARATOR . 'diagnostics.sqlite';
+    $report['database'] = $path;
+    $initializer = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+    $initializer->exec('CREATE TABLE fixture (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, value, amount NUMERIC DEFAULT 7)');
+    $initializer = null;
+    @chmod($path, 0600);
+    $diag = new MSSQLiteDatabase($path);
+    $diag->run("INSERT INTO fixture(id,name) VALUES (1,'Alpha'),(2,'Beta'),(3,'Gamma')");
+    $diag->run('CREATE TABLE no_key(value TEXT)');
+    $diag->run("INSERT INTO no_key VALUES ('same'),('same')");
+    $diag->run('CREATE TABLE composite(a TEXT, b INTEGER, value TEXT, PRIMARY KEY(a,b)) WITHOUT ROWID');
+    ms_diagnostics_add_case($report['results'], $groups[0], 'Prepared values preserve NULL, NUL TEXT and BLOB storage', 'UPDATE fixture SET value=? WHERE id=?', [], ['610062','text','00FF','blob','null'], static function () use ($diag): array {
+      $diag->run('UPDATE fixture SET value=? WHERE id=?', ["a\0b",1]);
+      $diag->run('UPDATE fixture SET value=? WHERE id=?', ["\0\xff",2], [0=>true]);
+      $r = db_one($diag, 'SELECT hex(value) AS v,typeof(value) AS t FROM fixture WHERE id=1');
+      $s = db_one($diag, 'SELECT hex(value) AS v,typeof(value) AS t FROM fixture WHERE id=2');
+      return [$r['v'],$r['t'],$s['v'],$s['t'],db_one($diag,'SELECT typeof(value) AS t FROM fixture WHERE id=3')['t']];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[0], 'Row editor uses the original identity and defaults', 'ms_sqlite_save_row()', [], ['Edited','7'], static function () use ($diag): array {
+      ms_sqlite_save_row($diag,'fixture',['identity'=>encode_identity(['id'=>3]),'value'=>['id'=>'3','name'=>'Edited','amount'=>'7'],'is_null'=>['value'=>1]]);
+      $r = db_one($diag,'SELECT name,CAST(amount AS TEXT) AS amount FROM fixture WHERE id=3');
+      return [$r['name'],$r['amount']];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[0], 'No-PK duplicates and composite keys have safe identities', 'primary_columns()', [], [['_rowid_'],['a','b']], static function () use ($diag): array { return [primary_columns($diag,'no_key'),primary_columns($diag,'composite')]; });
+    ms_diagnostics_add_case($report['results'], $groups[1], 'Filters, sort and page are shared with the Explain query', 'build_select_query() / EXPLAIN QUERY PLAN', ['page'=>2,'limit'=>1], ['2','3',true], static function () use ($diag): array {
+      $before = $_GET;
+      try {
+        $_GET = ['filter_col'=>['amount'],'filter_op'=>['='],'filter_val'=>['7'],'order_col'=>['id'],'order_dir'=>['DESC'],'limit'=>'1','p'=>'2'];
+        [$sql,$count] = build_select_query($diag,'fixture',table_columns($diag,'fixture'));
+        [$plans] = explain_sql($diag,$sql);
+        return [(string)db_one($diag,$sql)['id'],(string)db_one($diag,$count)['n'],in_array('detail',array_column($plans[0]['fields'],'name'),true)];
+      } finally { $_GET = $before; }
+    });
+    ms_diagnostics_add_case($report['results'], $groups[1], 'Explain never executes the submitted DELETE', 'EXPLAIN QUERY PLAN DELETE FROM fixture', [], '3', static function () use ($diag): string {
+      explain_sql($diag,'DELETE FROM fixture');
+      return (string)db_one($diag,'SELECT COUNT(*) AS n FROM fixture')['n'];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[2], 'CSV retains quotes, backslashes, Unicode and newlines', 'CSV stream round-trip', [], true, static function () use ($diag): bool {
+      $value = "quoted \"value\", C:\\file\nภาษาไทย";
+      $out = fopen('php://temp','w+b');
+      try {
+        ms_sqlite_export_result($diag,'SELECT ' . qs($diag,$value) . ' AS value','csv',$out,null,false);
+        rewind($out); fgetcsv($out,0,',','"','');
+        return fgetcsv($out,0,',','"','')[0] === $value;
+      } finally { fclose($out); }
+    });
+    ms_diagnostics_add_case($report['results'], $groups[2], 'Mapped upsert and update preserve omitted fields', 'ms_sqlite_import_row()', [], ['Updated','7'], static function () use ($diag): array {
+      ms_sqlite_import_row($diag,'fixture',['id'=>'3','name'=>'Upserted'],'upsert','');
+      ms_sqlite_import_row($diag,'fixture',['id'=>'3','name'=>'Updated'],'update','id');
+      $r = db_one($diag,'SELECT name,CAST(amount AS TEXT) AS amount FROM fixture WHERE id=3');
+      return [$r['name'],$r['amount']];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[2], 'SQL dump restores data and storage classes atomically', 'ms_sqlite_dump() / ms_sqlite_restore()', [], true, static function () use ($diag): bool {
+      $signature = 'SELECT id,name,hex(value) AS bytes,typeof(value) AS storage,amount FROM fixture ORDER BY id';
+      $before = db_all($diag,$signature);
+      $out = fopen('php://temp','w+b');
+      try { ms_sqlite_dump($diag,['fixture'],true,true,true,$out); rewind($out); $sql = stream_get_contents($out); }
+      finally { fclose($out); }
+      ms_sqlite_restore($diag,$sql);
+      return db_all($diag,$signature) === $before;
+    });
+    ms_diagnostics_add_case($report['results'], $groups[3], 'Unsafe restore is rejected before its first write', 'DELETE; ATTACH', [], '3', static function () use ($diag): string {
+      try { ms_sqlite_restore($diag,"DELETE FROM fixture; ATTACH ':memory:' AS outside"); } catch (Throwable $expected) {}
+      return (string)db_one($diag,'SELECT COUNT(*) AS n FROM fixture')['n'];
+    });
+    ms_diagnostics_add_case($report['results'], $groups[3], 'Invalid restore rolls back earlier writes and re-enables foreign keys', 'DELETE; invalid INSERT', [], ['3','1'], static function () use ($diag): array {
+      try { ms_sqlite_restore($diag,"DELETE FROM fixture; INSERT INTO fixture(id,name) VALUES (4,NULL)"); } catch (Throwable $expected) {}
+      return [(string)db_one($diag,'SELECT COUNT(*) AS n FROM fixture')['n'],(string)db_one($diag,'PRAGMA foreign_keys')['foreign_keys']];
+    });
+  } catch (Throwable $e) {
+    $report['results'][] = ['group'=>'Environment','name'=>'Disposable SQLite setup/runner','status'=>'fail','duration_ms'=>0,'sql'=>'','parameters'=>[],'expected'=>'All checks run in a separate private file','actual'=>null,'exception'=>$e->getMessage()];
+  } finally {
+    $cleaned = $cleanup();
+    $report['cleanup'] = ['status'=>$cleaned?'pass':'fail','exception'=>$cleaned?'':'Could not remove the disposable diagnostics files.'];
+  }
+  foreach ($groups as $group) {
+    $cases = array_filter($report['results'], static function (array $r) use ($group): bool { return $r['group'] === $group; });
+    $report['group_status'][$group] = $cases && !array_filter($cases, static function (array $r): bool { return $r['status'] !== 'pass'; }) ? 'pass' : 'fail';
+  }
+  $report['completed_at'] = time();
+  $report['blocking_passed'] = $report['cleanup']['status'] === 'pass' && !in_array('fail',$report['group_status'],true) && !array_filter($report['results'],static function (array $r): bool { return $r['status'] !== 'pass'; });
+  ms_diagnostics_report_write($report);
+  return $report;
+}
+
 function ms_diagnostics_run(): array {
+  if (ms_engine() === 'sqlite') return ms_sqlite_diagnostics_run();
   $groups = [
     'Typed editing and autosave',
     'Pagination, filters, sort and presets',
@@ -5076,7 +5356,7 @@ function register_sql_result_export(string $statement): string {
     array_shift($exports);
   }
   $token = bin2hex(random_bytes(24));
-  $exports[$token] = ['database' => selected_db(), 'statement' => $statement, 'created' => time()];
+  $exports[$token] = ['database' => selected_db(), 'statement' => $statement, 'created' => time(), 'server_key' => ms_server_config_key()];
   $_SESSION['ms_sql_exports'] = $exports;
   return $token;
 }
@@ -5177,7 +5457,7 @@ function execute_sql(MSDatabase $db, string $sql, bool $showAll = false, int $di
     throw new RuntimeException('No executable SQL statement found.');
   }
   foreach ($statements as $statement) {
-    $exportable = $db->engine !== 'sqlite' && sql_exportable_statement($statement);
+    $exportable = $db->engine === 'sqlite' ? ms_sqlite_exportable_statement($statement) : sql_exportable_statement($statement);
     $exportToken = '';
     $result = $db->query($statement);
     if ($result === false) {
@@ -5262,7 +5542,7 @@ function explain_sql(MSDatabase $db, string $sql, int $displayLimit = MS_SQL_ROW
       $preview = is_string($preview) ? substr($preview, 0, 160) : '';
       throw new RuntimeException('EXPLAIN supports SELECT, UPDATE, DELETE, INSERT, REPLACE and WITH statements. Unsupported statement: ' . $preview);
     }
-    $explainStatements[] = 'EXPLAIN ' . $statement;
+    $explainStatements[] = ($db->engine === 'sqlite' ? 'EXPLAIN QUERY PLAN ' : 'EXPLAIN ') . $statement;
   }
   return execute_sql($db, implode(";\n", $explainStatements), true, $displayLimit);
 }
@@ -5452,7 +5732,6 @@ function ms_export_hidden_fields(array $query, string $prefix = ''): void {
 
 /** Native GET controls: ZIP works without browser-side file generation. */
 function ms_render_result_export_controls(array $query, bool $selectPage = false): void {
-  if (ms_engine() === 'sqlite') return;
   static $counter = 0;
   $id = 'ms-result-zip-' . (++$counter);
   unset($query['format'], $query['zip'], $query['export_scope']);
@@ -5499,6 +5778,9 @@ function sql_result_export_entry(string $token): array {
   }
   $statement = (string)($entry['statement'] ?? '');
   $database = (string)($entry['database'] ?? '');
+  if (ms_engine() === 'sqlite' && (($entry['server_key'] ?? '') !== ms_server_config_key() || $database !== selected_db() || !ms_sqlite_exportable_statement($statement))) {
+    throw new RuntimeException('This query-result export belongs to another SQLite file or cannot be exported. Run the query again.');
+  }
   if ($database === '' || !sql_exportable_statement($statement)) {
     throw new RuntimeException('This query result cannot be exported.');
   }
@@ -5510,6 +5792,10 @@ function stream_sql_result_export(MSDatabase $db, array $entry, string $format, 
   if (!$db->select_db((string)$entry['database'])) throw new RuntimeException($db->error);
   $filename = $filenamePrefix . '-' . gmdate('Ymd-His') . '.' . $format;
   ms_download_export($filename, $format, $zip, static function ($out) use ($db, $entry, $format): void {
+    if ($db->engine === 'sqlite') {
+      ms_sqlite_export_result($db, (string)$entry['statement'], $format, $out, $entry['columns'] ?? null);
+      return;
+    }
     $result = $db->query((string)$entry['statement'], (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
     if (!ms_is_result($result)) {
       throw new RuntimeException($db->error ?: 'The statement did not return a result set.');
@@ -5558,6 +5844,10 @@ function dump_database(MSDatabase $db, array $tables, bool $structure, bool $dat
   if ($ownsStream) $out = @fopen('php://output', 'wb');
   if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
   try {
+    if ($db->engine === 'sqlite') {
+      ms_sqlite_dump($db, $tables, $structure, $data, $drop, $out);
+      return;
+    }
     $database = selected_db();
     ms_export_write($out, "-- MySQL Studio export\n-- Database: " . str_replace(["\r", "\n"], ' ', $database) . "\n-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n\n");
     ms_export_write($out, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n\n");
@@ -5633,6 +5923,10 @@ function csv_export(MSDatabase $db, string $table, string $delimiter = ',', $out
   if (!is_resource($out)) throw new RuntimeException('Cannot open the export stream.');
   $result = null;
   try {
+    if ($db->engine === 'sqlite') {
+      ms_sqlite_export_result($db, 'SELECT * FROM ' . qi($table), $delimiter === "\t" ? 'tsv' : 'csv', $out, null, false);
+      return;
+    }
     $result = $db->query('SELECT * FROM ' . qi($table), (defined('MYSQLI_USE_RESULT') ? MYSQLI_USE_RESULT : 1));
     if (!ms_is_result($result)) throw new RuntimeException($db->error);
     $headers = array_map(static function ($field): string { return (string)$field->name; }, $result->fetch_fields());
@@ -5682,29 +5976,30 @@ function ms_import_unique_headers(array $headers): array {
   return $result;
 }
 
-function ms_import_detect_delimiter(string $line): string {
+function ms_import_detect_delimiter(string $line, string $escape = '\\'): string {
   $candidates = [',' => 0, ';' => 0, "\t" => 0, '|' => 0];
   // Preserve the importer's legacy backslash escaping explicitly on PHP 8.4+.
-  foreach ($candidates as $delimiter => $unused) $candidates[$delimiter] = count(str_getcsv($line, $delimiter, '"', '\\'));
+  foreach ($candidates as $delimiter => $unused) $candidates[$delimiter] = count(str_getcsv($line, $delimiter, '"', $escape));
   arsort($candidates);
   $delimiter = (string)array_key_first($candidates);
   return (int)($candidates[$delimiter] ?? 0) > 1 ? $delimiter : ',';
 }
 
 function ms_import_parse_csv_file(string $path, string $delimiterChoice): array {
+  $escape = ms_engine() === 'sqlite' ? '' : '\\';
   $handle = @fopen($path, 'rb');
   if ($handle === false) throw new RuntimeException('Cannot open the uploaded CSV file.');
   $firstLine = fgets($handle);
   if ($firstLine === false) { fclose($handle); throw new RuntimeException('The uploaded file is empty.'); }
   $delimiters = ['comma' => ',', 'semicolon' => ';', 'tab' => "\t", 'pipe' => '|'];
-  $delimiter = $delimiters[$delimiterChoice] ?? ms_import_detect_delimiter($firstLine);
+  $delimiter = $delimiters[$delimiterChoice] ?? ms_import_detect_delimiter($firstLine, $escape);
   rewind($handle);
-  $headers = fgetcsv($handle, 0, $delimiter, '"', '\\');
+  $headers = fgetcsv($handle, 0, $delimiter, '"', $escape);
   if (!is_array($headers) || !$headers) { fclose($handle); throw new RuntimeException('The CSV header row could not be read.'); }
   if (count($headers) > 200) { fclose($handle); throw new RuntimeException('Import files can contain at most 200 columns.'); }
   $headers = ms_import_unique_headers($headers);
   $rows = [];
-  while (($row = fgetcsv($handle, 0, $delimiter, '"', '\\')) !== false) {
+  while (($row = fgetcsv($handle, 0, $delimiter, '"', $escape)) !== false) {
     if (count($rows) >= 50000) { fclose($handle); throw new RuntimeException('Import files can contain at most 50,000 data rows.'); }
     $row = array_values($row);
     if (count($row) < count($headers)) $row = array_pad($row, count($headers), '');
@@ -5719,7 +6014,7 @@ function ms_import_parse_csv_file(string $path, string $delimiterChoice): array 
 function ms_import_parse_json_file(string $path): array {
   $raw = @file_get_contents($path);
   if (!is_string($raw) || trim($raw) === '') throw new RuntimeException('The uploaded JSON file is empty.');
-  $data = json_decode($raw, true);
+  $data = json_decode($raw, true, 512, JSON_BIGINT_AS_STRING);
   if (json_last_error() !== JSON_ERROR_NONE || !is_array($data) || !$data) throw new RuntimeException('JSON must contain a non-empty array of objects or arrays.');
   if (count($data) > 50000) throw new RuntimeException('Import files can contain at most 50,000 data rows.');
   $first = reset($data);
@@ -5766,7 +6061,7 @@ function ms_import_create_preview(string $uploadPath, string $sourceName, string
   $json = json_encode(['headers' => $headers, 'rows' => $rows], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
   if (!is_string($json) || @file_put_contents($path, $json, LOCK_EX) === false) throw new RuntimeException('Unable to create the temporary import preview.');
   if (!isset($_SESSION['ms_imports']) || !is_array($_SESSION['ms_imports'])) $_SESSION['ms_imports'] = [];
-  $_SESSION['ms_imports'][$token] = ['path' => $path, 'database' => selected_db(), 'created' => time(), 'source_name' => substr($sourceName, 0, 255), 'row_count' => count($rows), 'headers' => $headers, 'delimiter' => $delimiter];
+  $_SESSION['ms_imports'][$token] = ['path' => $path, 'database' => selected_db(), 'server_key' => ms_server_config_key(), 'created' => time(), 'source_name' => substr($sourceName, 0, 255), 'row_count' => count($rows), 'headers' => $headers, 'delimiter' => $delimiter];
   return $token;
 }
 
@@ -5775,6 +6070,7 @@ function ms_import_entry(string $token): array {
   if (preg_match('/^[a-f0-9]{32}$/', $token) !== 1) throw new RuntimeException('Invalid or expired import preview.');
   $entry = $_SESSION['ms_imports'][$token] ?? null;
   if (!is_array($entry) || (string)($entry['database'] ?? '') !== selected_db() || !is_file((string)($entry['path'] ?? ''))) throw new RuntimeException('Invalid or expired import preview.');
+  if (ms_engine() === 'sqlite' && ($entry['server_key'] ?? '') !== ms_server_config_key()) throw new RuntimeException('This import preview belongs to another SQLite file. Upload it again.');
   return $entry;
 }
 
@@ -5810,6 +6106,7 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
     $target = (string)($mappingInput[$sourceIndex] ?? '');
     if ($target === '') continue;
     if (!isset($columnMap[$target])) throw new RuntimeException('Mapped target column not found: ' . $target);
+    if ($db->engine === 'sqlite' && stripos($columnMap[$target]['EXTRA'], 'GENERATED') !== false) throw new RuntimeException('Generated columns cannot be imported: ' . $target);
     if (isset($usedTargets[$target])) throw new RuntimeException('A target column can be mapped only once: ' . $target);
     $usedTargets[$target] = true;
     $mapping[$sourceIndex] = $target;
@@ -5821,9 +6118,11 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
   if ($mode === 'update' && ($keyColumn === '' || !isset($usedTargets[$keyColumn]))) throw new RuntimeException('Update mode requires a mapped match-key column.');
   $emptyAsNull = p('empty_as_null') === '1';
   $success = 0; $errors = [];
-  $db->begin_transaction();
+  if ($db->engine === 'sqlite') $db->sqlite()->beginTransaction();
+  else $db->begin_transaction();
   try {
     foreach ($data['rows'] as $rowIndex => $row) {
+      if ($db->engine === 'sqlite') $db->run('SAVEPOINT ms_import_row');
       try {
         if (!is_array($row)) throw new RuntimeException('Source row is not an array.');
         $values = [];
@@ -5832,6 +6131,12 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
           $text = ms_import_cell_text($raw);
           $isNull = $raw === null || ($emptyAsNull && $text === '');
           $values[$target] = $isNull ? null : ms_normalize_column_literal($columnMap[$target], $text);
+        }
+        if ($db->engine === 'sqlite') {
+          ms_sqlite_import_row($db, $table, $values, $mode, $keyColumn);
+          $db->run('RELEASE ms_import_row');
+          $success++;
+          continue;
         }
         if ($mode === 'update') {
           $sets = [];
@@ -5852,12 +6157,21 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
         if (!$db->query($sql)) throw new RuntimeException($db->error);
         $success++;
       } catch (Throwable $rowError) {
+        if ($db->engine === 'sqlite') {
+          // RAISE(FAIL) may have already changed other rows through a trigger.
+          // A lost transaction (e.g. RAISE(ROLLBACK)) is fatal, not partial success.
+          if (!$db->sqlite()->inTransaction()) throw $rowError;
+          $db->run('ROLLBACK TO ms_import_row');
+          $db->run('RELEASE ms_import_row');
+        }
         $errors[] = ['row' => $rowIndex + 2, 'values' => $row, 'error' => $rowError->getMessage()];
       }
     }
-    $db->commit();
+    if ($db->engine === 'sqlite') $db->sqlite()->commit();
+    else $db->commit();
   } catch (Throwable $fatal) {
-    $db->rollback();
+    if ($db->engine === 'sqlite') ms_sqlite_rollback_managed($db);
+    else $db->rollback();
     throw $fatal;
   }
   $errorToken = '';
@@ -5866,16 +6180,17 @@ function ms_import_execute_rows(MSDatabase $db, string $token): array {
     $errorPath = ms_update_runtime_file('import-errors-' . $errorToken . '.csv');
     $out = @fopen($errorPath, 'wb');
     if ($out !== false) {
+      $escape = $db->engine === 'sqlite' ? '' : '\\';
       fwrite($out, "\xEF\xBB\xBF");
-      fputcsv($out, array_merge(['source_row'], $data['headers'], ['error']), ',', '"', '\\');
+      fputcsv($out, array_merge(['source_row'], $data['headers'], ['error']), ',', '"', $escape);
       foreach ($errors as $error) {
         $row = array_map('ms_import_cell_text', is_array($error['values']) ? $error['values'] : []);
         if (count($row) < count($data['headers'])) $row = array_pad($row, count($data['headers']), '');
-        fputcsv($out, array_merge([(string)$error['row']], array_slice($row, 0, count($data['headers'])), [(string)$error['error']]), ',', '"', '\\');
+        fputcsv($out, array_merge([(string)$error['row']], array_slice($row, 0, count($data['headers'])), [(string)$error['error']]), ',', '"', $escape);
       }
       fclose($out);
       if (!isset($_SESSION['ms_import_errors']) || !is_array($_SESSION['ms_import_errors'])) $_SESSION['ms_import_errors'] = [];
-      $_SESSION['ms_import_errors'][$errorToken] = ['path' => $errorPath, 'created' => time(), 'filename' => $table . '-rejected-' . gmdate('Ymd-His') . '.csv'];
+      $_SESSION['ms_import_errors'][$errorToken] = ['path' => $errorPath, 'created' => time(), 'server_key' => ms_server_config_key(), 'filename' => $table . '-rejected-' . gmdate('Ymd-His') . '.csv'];
     }
   }
   @unlink((string)$entry['path']);
@@ -6003,7 +6318,7 @@ try {
     }
     ms_profile_config_ensure();
     $db = connect_db(false);
-    if ($db->engine === 'sqlite' && g('download') !== '' && !in_array(g('download'), ['blob','table_structure_sql'], true)) throw new RuntimeException('SQLite export is not yet available.');
+    if ($db->engine === 'sqlite' && g('download') !== '' && !in_array(g('download'), ['blob','table_structure_sql','export','select_result','sql_result','import_errors'], true)) throw new RuntimeException('This SQLite download is not available.');
 
     if (g('ajax') === 'profile_config') {
       header('Content-Type: application/json; charset=UTF-8');
@@ -6383,8 +6698,10 @@ try {
       if (!in_array($scope, ['all', 'page'], true)) throw new RuntimeException('Choose a valid export row range.');
       $columns = table_columns($db, $table);
       // Rebuild trusted SQL with the active filters, aggregation and ordering.
-      [$sql] = build_select_query($db, $table, $columns, null, null, $scope === 'all');
+      [$sql, , , , , $aggregated] = build_select_query($db, $table, $columns, null, null, $scope === 'all');
       $entry = ['database' => selected_db(), 'statement' => $sql];
+      // Identity helpers belong to the editor, not to exported user data.
+      if ($db->engine === 'sqlite' && !$aggregated) $entry['columns'] = array_column($columns, 'COLUMN_NAME');
       stream_sql_result_export($db, $entry, g('format', 'csv'), g('zip') === '1', $table . '-result');
       exit;
     }
@@ -6394,6 +6711,7 @@ try {
       $token = g('token');
       $entry = preg_match('/^[a-f0-9]{32}$/', $token) === 1 ? ($_SESSION['ms_import_errors'][$token] ?? null) : null;
       if (!is_array($entry) || !is_file((string)($entry['path'] ?? ''))) throw new RuntimeException('Rejected-row report not found or expired.');
+      if ($db->engine === 'sqlite' && ($entry['server_key'] ?? '') !== ms_server_config_key()) throw new RuntimeException('This rejected-row report belongs to another SQLite file.');
       download_headers((string)($entry['filename'] ?? 'import-rejected.csv'), 'text/csv; charset=UTF-8');
       readfile((string)$entry['path']);
       exit;
@@ -6784,6 +7102,17 @@ try {
         $_SESSION['ms_last_sql'] = $generatedSql;
         $_SESSION['ms_last_sql_params'] = [];
         go(['page' => 'sql'], 'Generated query opened in the SQL editor.');
+      }
+
+      if ($action === 'sqlite_restore') {
+        if ($db->engine !== 'sqlite' || p('restore_confirm') !== '1') throw new RuntimeException('Confirm that the SQL file may replace data in the current SQLite database.');
+        $file = $_FILES['restore_file'] ?? [];
+        if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || !is_uploaded_file((string)($file['tmp_name'] ?? ''))) throw new RuntimeException('Choose a SQLite SQL dump to restore.');
+        if ((int)$file['size'] < 1 || (int)$file['size'] > 20 * 1024 * 1024) throw new RuntimeException('SQLite restore files must be between 1 byte and 20 MB.');
+        $sql = file_get_contents((string)$file['tmp_name']);
+        if ($sql === false) throw new RuntimeException('Cannot read the SQL dump.');
+        $count = ms_sqlite_restore($db, $sql);
+        go(['page'=>'import'], 'SQLite restore committed successfully (' . $count . ' statements).');
       }
 
       if ($action === 'import_preview') {
@@ -10245,6 +10574,7 @@ function page_select(MSDatabase $db): void {
     $actions.='<button class="btn btn-secondary" type="button" data-ms-save-widths="'.h($table).'"'.($prettyEdit&&$viewMode==='table'?'':' hidden').'><i class="fa-solid fa-arrows-left-right-to-line me-1"></i>Save Widths</button> ';
   }
   $actions.='<a class="btn btn-secondary" href="?page=structure&amp;table='.urlencode($table).'">Structure</a> ';
+  if($db->engine==='sqlite')$actions.='<a class="btn btn-secondary" href="'.h(url(['explain'=>'1'])).'#ms-grid-explain"><i class="fa-solid fa-magnifying-glass-chart me-1"></i>Explain query plan</a> ';
   if($showAll){$actions.='<a class="btn btn-secondary" href="'.h(url(['show_all'=>null,'p'=>null,'limit'=>null])).'"><i class="fa-solid fa-layer-group me-1"></i>Use pagination</a> ';}else{$actions.='<a class="btn btn-secondary" data-confirm="Show all '.number_format($total).' rows? Large results can use substantial browser and server memory." href="'.h(url(['show_all'=>'1','p'=>null])).'"><i class="fa-solid fa-list me-1"></i>Show all rows</a> ';}
   if($editable)$actions.='<a class="btn btn-primary" href="?page=row&amp;mode=insert&amp;table='.urlencode($table).'&amp;return_to='.urlencode($returnToken).'"><i class="fa-solid fa-plus me-1"></i>Insert row</a>';
   $allRowsTotal=$total;
@@ -10258,6 +10588,10 @@ function page_select(MSDatabase $db): void {
   $rowCountLabel=$partialRows?($aggregated?'displayed result rows':'displayed rows').' of '.number_format($allRowsTotal).' total table rows':'total table rows';
   $countPill='<span class="badge rounded-pill text-bg-secondary ms-select-row-count" data-ms-row-count-pill data-ms-total-rows="'.h((string)$allRowsTotal).'" data-ms-count-partial="'.($where||$aggregated?'1':'0').'" data-ms-result-unit="'.($aggregated?'result rows':'rows').'" aria-label="'.h(number_format($shownRows).' '.$rowCountLabel).'">'.h($rowCount).'</span>';
   title_bar($tableDisplayName,'',$actions,$tableIconButton,$countPill.$prettyToggle,true);
+  if ($db->engine === 'sqlite' && g('explain') === '1') {
+    [$plans, $planTime] = explain_sql($db, $sql);
+    ?><section id="ms-grid-explain" class="card mb-3 no-print" aria-label="SQLite query plan"><div class="card-header d-flex justify-content-between"><strong>EXPLAIN QUERY PLAN</strong><a href="<?= h(url(['explain'=>null])) ?>" class="btn btn-sm btn-outline-secondary">Close plan</a></div><div class="card-body"><p class="small text-body-secondary">Exact grid query, with the current filters and sort. <?= $showAll ? 'All matching rows; pagination is disabled.' : 'Current page, including LIMIT and OFFSET.' ?> SQLite plans describe access paths; they do not execute the statement. Detail wording varies by SQLite version.</p><pre class="code text-wrap" data-ms-explain-sql><?= h($sql) ?></pre><?php render_sql_results($plans, $planTime); ?></div></section><?php
+  }
   ?>
   <section class="card mb-3 no-print<?= $selectToolsAfter?' ms-select-panel-deferred':'' ?>" aria-label="Saved views" data-ms-select-panel data-ms-view-presets data-ms-table="<?= h($table) ?>" data-ms-preset-seed="<?= h($presetSeedJson) ?>">
     <div class="card-body">
@@ -11102,7 +11436,7 @@ function page_select(MSDatabase $db): void {
   </script>
   <div class="card mb-3 no-print<?= $selectToolsAfter?' ms-select-panel-deferred':'' ?>" data-ms-select-panel><div class="card-body py-2">
     <?php
-      $exportQuery = array_intersect_key($returnQuery, array_flip(['global_search', 'filter_col', 'filter_op', 'filter_val', 'filter_val_to', 'filter_unit', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all']));
+      $exportQuery = array_intersect_key($returnQuery, array_flip(['global_search', 'filter_col', 'filter_op', 'filter_val', 'filter_val_to', 'filter_unit', 'aggregate', 'aggregate_column', 'group_column', 'order_col', 'order_dir', 'limit', 'p', 'show_all', 'duplicate_group']));
       $exportQuery['limit'] = $limit;
       $exportQuery['p'] = $page;
       $exportQuery['show_all'] = $showAll ? '1' : '0';
@@ -11169,7 +11503,7 @@ function page_select(MSDatabase $db): void {
       });
     })();
     </script>
-    <div class="form-text">Runs the query again on MySQL, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
+    <div class="form-text">Runs the query again on <?= $db->engine === 'sqlite' ? 'SQLite' : 'MySQL' ?>, preserving filters, sorting and aggregation. Downloads contain raw database values, not display formatting. All matching rows ignores pagination.</div>
   </div></div>
   <?php if(!$showAll){render_select_pagination($page,$pages,'top');} ?>
   <?php
@@ -12940,7 +13274,7 @@ function page_row(MSDatabase $db): void {
 }
 
 
-function page_sql(MSDatabase $db, ?array $results, float $time): void {
+function page_sql(MSDatabase $db, ?array $results, float $time, bool $sqlExplainMode = false): void {
   $sqlDefaultRows = ms_profile_setting_int('sqlRows', MS_SQL_ROWS_DEFAULT, 1, 100000);
   $tableRows = ms_table_list($db);
   $columnRows = ms_all_columns($db);
@@ -13009,7 +13343,7 @@ function page_sql(MSDatabase $db, ?array $results, float $time): void {
   })();
   </script>
   <?php
-  if (!empty($sqlExplainMode)) echo '<div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>EXPLAIN shows the optimizer plan and does not execute the submitted DML statement.</div>';
+  if (!empty($sqlExplainMode)) echo '<div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>' . ($db->engine === 'sqlite' ? 'EXPLAIN QUERY PLAN' : 'EXPLAIN') . ' shows the optimizer plan and does not execute the submitted DML statement.</div>';
   if ($results !== null) render_sql_results($results, $time);
   ?>
   <section class="card mt-3"><div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><div><strong><i class="fa-solid fa-clock-rotate-left me-2"></i>Query history</strong><span class="text-body-secondary ms-2"><?= count($history) ?> item(s)</span></div><?php if ($history) { ?><form method="post" class="m-0"><input type="hidden" name="action" value="query_history_clear"><input type="hidden" name="history_id" value=""><?= csrf_field() ?><button class="btn btn-outline-danger btn-sm" data-confirm="Clear all non-favourite query history entries?"><i class="fa-solid fa-broom me-1"></i>Clear non-favourites</button></form><?php } ?></div><div class="card-body p-0">
@@ -13023,8 +13357,9 @@ function page_sql(MSDatabase $db, ?array $results, float $time): void {
 
 function page_export(MSDatabase $db): void {
   $tables=ms_table_list($db);title_bar('Export',selected_db());
+  if ($db->engine === 'sqlite') echo '<div class="alert alert-info">SQLite SQL exports preserve storage classes, generated-column definitions, indexes, triggers and views. Restore with <a href="?page=import">Import → Restore SQLite SQL</a>. Query-result SQL creates a standalone <code>query_result</code> table. CSV/TSV and spreadsheets are for interchange: they cannot distinguish NULL from an empty string or preserve every binary/numeric value. ZIP requires PHP ZipArchive. Include all referenced tables for a complete backup; virtual-table SQL dumps are not supported.</div>';
   $databaseJson=json_encode(selected_db(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)?:'"database"';
-  ?><div class="card"><div class="card-body"><form method="get" id="msExportForm" autocomplete="off"><input type="hidden" name="page" value="export"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input type="hidden" name="structure" value="0"><input class="form-check-input" type="checkbox" name="structure" value="1" checked> Structure, views, routines, triggers and events</label><label><input type="hidden" name="data" value="0"><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input type="hidden" name="drop" value="0"><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><div class="form-check form-switch ms-ios-switch m-0 me-2" title="Compress the SQL, CSV or TSV file on the server"><input class="form-check-input" type="checkbox" role="switch" id="msExportZip" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="msExportZip">Zip</label></div><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
+  ?><div class="card"><div class="card-body"><form method="get" id="msExportForm" autocomplete="off"><input type="hidden" name="page" value="export"><input type="hidden" name="download" value="export"><div class="row g-3"><div class="col-md-4"><label class="form-label">Format</label><select class="form-select" name="format" id="msExportFormat"><option value="sql">SQL</option><option value="csv">CSV (one table only)</option><option value="tsv">TSV (one table only)</option><option value="xls">XLS (browser-side, multiple sheets)</option></select></div><div class="col-md-8"><label class="form-label">Objects</label><select class="form-select" name="tables[]" id="msExportTables" multiple size="12"><?php foreach($tables as $t){?><option value="<?= h($t['TABLE_NAME']) ?>" selected><?= h($t['TABLE_NAME'].' · '.$t['TABLE_TYPE']) ?></option><?php }?></select><div class="form-text">Leave all selected to export the database. CSV/TSV downloads and clipboard actions require exactly one selection. XLS can export multiple selected objects as separate worksheets.</div></div><div class="col-12 d-flex flex-wrap gap-4"><label><input type="hidden" name="structure" value="0"><input class="form-check-input" type="checkbox" name="structure" value="1" checked> <?= $db->engine === 'sqlite' ? 'Structure, indexes, views and triggers' : 'Structure, views, routines, triggers and events' ?></label><label><input type="hidden" name="data" value="0"><input class="form-check-input" type="checkbox" name="data" value="1" checked> Data</label><label><input type="hidden" name="drop" value="0"><input class="form-check-input" type="checkbox" name="drop" value="1" checked> Add DROP statements</label></div><div class="col-12 d-flex flex-wrap align-items-center gap-2"><div class="form-check form-switch ms-ios-switch m-0 me-2" title="Compress the SQL, CSV or TSV file on the server"><input class="form-check-input" type="checkbox" role="switch" id="msExportZip" name="zip" value="1" autocomplete="off"><label class="form-check-label" for="msExportZip">Zip</label></div><button class="btn btn-primary" id="msExportDownload" type="submit"><i class="fa-solid fa-download me-1"></i><span>Download export</span></button><button class="btn btn-outline-secondary" id="msCopyCsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>CSV to clipboard</button><button class="btn btn-outline-secondary" id="msCopyTsv" type="button"><i class="fa-solid fa-clipboard me-1"></i>TSV to clipboard</button><span class="small text-body-secondary" id="msExportStatus" role="status" aria-live="polite"></span></div></div></form></div></div>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
   <script>
   (()=>{
@@ -13191,9 +13526,10 @@ function page_export(MSDatabase $db): void {
 
 function page_import(MSDatabase $db): void {
   ms_import_cleanup();
-  $tables = array_values(array_map('strval', array_column(db_all($db, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"), 'TABLE_NAME')));
+  $tables = array_values(array_map('strval', array_column(array_filter(ms_table_list($db), static function (array $t): bool { return $t['TABLE_TYPE'] === 'BASE TABLE'; }), 'TABLE_NAME')));
   $tableColumns = [];
-  foreach (db_all($db, 'SELECT TABLE_NAME,COLUMN_NAME,COLUMN_KEY,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION') as $column) {
+  foreach (ms_all_columns($db) as $column) {
+    if ($db->engine === 'sqlite' && stripos($column['EXTRA'], 'GENERATED') !== false) continue;
     $table = (string)$column['TABLE_NAME'];
     if (!isset($tableColumns[$table])) $tableColumns[$table] = [];
     $tableColumns[$table][] = ['name' => (string)$column['COLUMN_NAME'], 'key' => (string)$column['COLUMN_KEY'], 'extra' => (string)$column['EXTRA']];
@@ -13202,6 +13538,9 @@ function page_import(MSDatabase $db): void {
   $summary = isset($_SESSION['ms_import_summary']) && is_array($_SESSION['ms_import_summary']) ? $_SESSION['ms_import_summary'] : null;
   unset($_SESSION['ms_import_summary']);
   title_bar('Import data', selected_db());
+  if ($db->engine === 'sqlite') {
+    ?><section class="card mb-3"><div class="card-header"><strong>Restore SQLite SQL</strong></div><div class="card-body"><p>Restore a SQLite SQL dump into <strong><?= h(basename($db->path)) ?></strong>. Schema and data statements run in one transaction; an error or foreign-key violation rolls everything back. Back up first. DROP/DELETE statements can replace existing data. Maximum 20 MB / 100,000 statements; no PRAGMAs or transaction commands. Unzip compressed exports before uploading.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="action" value="sqlite_restore"><?= csrf_field() ?><label class="form-label" for="msRestoreFile">SQLite SQL dump</label><input class="form-control mb-3" id="msRestoreFile" type="file" name="restore_file" accept=".sql,text/plain,application/sql" required><div class="form-check mb-3"><input class="form-check-input" type="checkbox" id="msRestoreConfirm" name="restore_confirm" value="1" required><label class="form-check-label" for="msRestoreConfirm">I understand this may replace data in the current SQLite database.</label></div><button class="btn btn-outline-danger" data-confirm="Restore into the current SQLite database? Existing data may be replaced. Make a backup first.">Restore SQL</button></form></div></section><?php
+  }
   if ($summary) {
     ?><div class="alert alert-<?= (int)$summary['errors']>0?'warning':'success' ?>"><strong><?= h((string)$summary['success']) ?> successful row(s)</strong> · <?= h((string)$summary['errors']) ?> rejected.<?php if(!empty($summary['error_token'])){?> <a class="alert-link" href="?download=import_errors&amp;token=<?= h((string)$summary['error_token']) ?>"><i class="fa-solid fa-download me-1"></i>Download rejected rows with errors</a><?php } ?></div><?php
   }
@@ -13252,7 +13591,7 @@ function page_import(MSDatabase $db): void {
       <div class="row g-3 mb-3"><div class="col-lg-4"><label class="form-label" for="msImportTable">Target table</label><select class="form-select" id="msImportTable" name="import_table" required><?php foreach($tables as $table){?><option value="<?= h($table) ?>"<?= $table===$defaultTable?' selected':'' ?>><?= h($table) ?></option><?php }?></select></div><div class="col-lg-4"><label class="form-label" for="msImportMode">Operation</label><select class="form-select" id="msImportMode" name="import_mode"><option value="insert">Insert every row</option><option value="update">Update by match key</option><option value="upsert">Insert or update duplicate key</option></select></div><div class="col-lg-4"><label class="form-label" for="msImportKey">Update match key</label><select class="form-select" id="msImportKey" name="import_key" disabled><option value="">Choose mapped column…</option></select></div></div>
       <div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" role="switch" id="msEmptyAsNull" name="empty_as_null" value="1"><label class="form-check-label" for="msEmptyAsNull">Convert empty strings to NULL</label></div>
       <div class="table-responsive mb-3"><table class="table table-sm align-middle"><thead><tr><th>Source field</th><th>Target column</th></tr></thead><tbody><?php foreach($sourceHeaders as $header){?><tr><td class="code"><?= h($header) ?></td><td><select class="form-select form-select-sm" name="mapping[]" data-ms-import-map data-source="<?= h($header) ?>"><option value="">Do not import</option></select></td></tr><?php }?></tbody></table></div>
-      <div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i>Update mode modifies the first row matching the chosen key. Upsert mode uses the table’s PRIMARY/UNIQUE indexes through <code>ON DUPLICATE KEY UPDATE</code>. Invalid rows do not stop valid rows and are downloadable afterward.</div>
+      <div class="alert alert-info"><i class="fa-solid fa-circle-info me-2"></i><?php if ($db->engine === 'sqlite') { ?>SQLite update requires exactly one matching row and a non-NULL key. Upsert requires all declared PRIMARY KEY columns, non-NULL, and uses <code>ON CONFLICT DO UPDATE</code>. Omitted columns retain defaults/current values; generated columns cannot be mapped. A failed row and its trigger effects are rolled back. CSV values are text; use SQL for lossless binary/type backups.<?php } else { ?>Update mode modifies the first row matching the chosen key. Upsert mode uses the table’s PRIMARY/UNIQUE indexes through <code>ON DUPLICATE KEY UPDATE</code>.<?php } ?> Invalid rows do not stop valid rows and are downloadable afterward; a transaction-level failure rolls back the entire import.</div>
       <button class="btn btn-primary" data-confirm="Import <?= h(number_format((int)$entry['row_count'])) ?> row(s) into the selected table?"><i class="fa-solid fa-file-import me-1"></i>Run import</button>
     </form>
     <hr><h3 class="h6">Source preview · first <?= min(10,count($data['rows'])) ?> rows</h3><div class="table-responsive"><table class="table table-sm table-striped"><thead><tr><?php foreach($sourceHeaders as $header){?><th><?= h($header) ?></th><?php }?></tr></thead><tbody><?php foreach(array_slice($data['rows'],0,10) as $row){?><tr><?php foreach($sourceHeaders as $index=>$header){?><td><?= render_value(ms_import_cell_text($row[$index]??null),160) ?></td><?php }?></tr><?php }?></tbody></table></div>
@@ -13548,7 +13887,7 @@ function page_diagnostics(): void {
     <div><strong>v<?= h(MS_VERSION) ?> release gate: <?= $gateOpen ? 'PASS' : 'BLOCKED' ?></strong><div class="small"><?= $gateOpen ? 'Every blocking group passed on this server and the disposable database was cleaned up.' : 'Run the current diagnostics and resolve every blocking failure before release.' ?></div></div>
     <?php if($report){ ?><div class="small text-nowrap"><?= $passed ?> passed · <?= $failed ?> failed/blocked</div><?php } ?>
   </div>
-  <div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i>The runner opens a second connection, creates a uniquely named disposable database, and drops it in a <code>finally</code> cleanup. It never selects or writes to the database you are browsing. The login needs <code>CREATE</code> and <code>DROP DATABASE</code> privileges.</div>
+  <div class="alert alert-info"><i class="fa-solid fa-shield-halved me-2"></i><?php if (ms_engine() === 'sqlite') { ?>The runner creates a randomly named private directory and disposable SQLite file inside <code>MS_SQLITE_ROOT</code>. It tests editing, query plans, import/export and safety there, then closes and removes the file and sidecars in a <code>finally</code> cleanup (also retried at shutdown). It never opens or writes to the database you are browsing. The PHP process needs directory creation permission in the private SQLite root.<?php } else { ?>The runner opens a second connection, creates a uniquely named disposable database, and drops it in a <code>finally</code> cleanup. It never selects or writes to the database you are browsing. The login needs <code>CREATE</code> and <code>DROP DATABASE</code> privileges.<?php } ?></div>
   <?php if(!$report){ ?><div class="card mb-3"><div class="card-body text-body-secondary">No diagnostics report exists for this server. Run the suite to establish the release gate.</div></div><?php } else { ?>
     <div class="row g-3 mb-3">
       <div class="col-md-3"><div class="card h-100"><div class="card-body"><div class="small text-body-secondary">Report version</div><div class="fw-semibold">v<?= h((string)($report['version'] ?? '')) ?></div></div></div></div>
@@ -13768,7 +14107,7 @@ try {
     case 'select': page_select($db); break;
     case 'clone_rows': page_clone_rows($db); break;
     case 'row': page_row($db); break;
-    case 'sql': page_sql($db, isset($sqlResults) ? $sqlResults : null, isset($sqlTime) ? (float)$sqlTime : 0.0); break;
+    case 'sql': page_sql($db, isset($sqlResults) ? $sqlResults : null, isset($sqlTime) ? (float)$sqlTime : 0.0, !empty($sqlExplainMode)); break;
     case 'query_builder': page_query_builder($db); break;
     case 'import': page_import($db); break;
     case 'export': page_export($db); break;
