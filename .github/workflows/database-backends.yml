@@ -44,12 +44,14 @@ jobs:
           php -l tests/deprecations.php
           php -l tests/php_compatibility.php
           php -l tests/sqlite_tools.php
+          php -l tests/sqlite_create_table.php
       - name: PHP compatibility and CSV regressions
         run: php tests/php_compatibility.php
       - name: SQLite regressions
         run: |
           php tests/database_backends.php sqlite
           php tests/sqlite_tools.php
+          php tests/sqlite_create_table.php
       - name: MySQL or MariaDB regressions and existing diagnostics
         env:
           MS_TEST_HOST: 127.0.0.1

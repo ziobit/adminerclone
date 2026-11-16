@@ -1,4 +1,4 @@
-# SQLite backend (v1.21.0)
+# SQLite backend (v1.22.0)
 
 `index.php` remains the only production application file. MySQL and MariaDB continue to use `mysqli`, including their existing administration tools. SQLite uses PHP's `PDO_SQLite` extension; **PDO MySQL is not used**. The SQLite adapter buffers query results, like the existing buffered MySQL path.
 
@@ -50,6 +50,19 @@ Foreign-key enforcement is enabled on every SQLite connection; the busy timeout 
 
 The SQL editor intentionally refuses ATTACH/DETACH, VACUUM INTO, extension/filesystem functions and PRAGMAs outside a small read-only allowlist. This boundary also covers prepared statements and EXPLAIN-prefixed PRAGMAs on PHP 7.4, where SQLite's authorizer API is unavailable. Only the selected file is accessible through the editor.
 
+## Guided table creation (v1.22.0)
+
+Open **Database → Create table** to define a new ordinary SQLite table. The application remains a single `index.php`; the MySQL/MariaDB creation form and `mysqli` path are unchanged.
+
+1. Enter a table name and optionally enable STRICT (SQLite 3.37+) or WITHOUT ROWID.
+2. Add up to 50 columns using INTEGER, TEXT, REAL, BLOB, NUMERIC or ANY. Column cards have touch-sized add, remove and up/down controls. Primary-key columns form a composite key in their displayed order and are explicitly NOT NULL. A single INTEGER primary key generates IDs without requiring AUTOINCREMENT; the optional AUTOINCREMENT flag prevents reuse and cannot be combined with composite keys or WITHOUT ROWID.
+3. Choose no default, NULL, literal text (including an empty string), a number, a current UTC date/time keyword, or an advanced SQL expression. Enable NOT NULL and UNIQUE, or expand the additional constraints for CHECK, BINARY/NOCASE/RTRIM collation and a single-column foreign key. Parent choices include single-column primary keys and table-declared UNIQUE columns, plus self references. Foreign keys offer NO ACTION, RESTRICT, CASCADE, SET NULL and SET DEFAULT; values still need to satisfy the parent constraint when those actions run.
+4. Select **Preview SQL**. The server builds and validates the statement with SQLite `EXPLAIN` without executing DDL. The table has not been created at this point. Review the SQL and destination filename, tick the explicit execution confirmation, then select **Confirm and create table**. The new Structure page opens after success.
+
+The confirmation uses a single-use, session-held definition scoped to the canonical SQLite file, with a 15-minute expiry and at most five pending previews. It ignores posted SQL, revalidates before execution, requires CSRF and confirmation, and never uses DROP, ALTER or IF NOT EXISTS. Existing objects are not replaced. Editing the form hides the old confirmation and requires a new preview. Missing end-of-form markers reject truncated requests instead of silently creating fewer columns. Invalid definitions retain form values for correction.
+
+This first wizard is **creation only**. Existing-table rebuilds/migrations, custom declared types, generated columns, composite UNIQUE/foreign-key constraints, custom conflict clauses and standalone indexes remain SQL-editor operations. SQLite's native runtime rules still apply: for example, STRICT excludes NUMERIC and NOCASE folds ASCII only. Ordinary tables use SQLite's normal affinity rules.
+
 ## Import, export and restore
 
 Use **SQL** for backups that must retain SQLite storage classes. The encoder runs inside SQLite so 64-bit integers do not pass through PHP floating-point conversion. NULL, empty TEXT, embedded NULs, BLOBs and REAL values are encoded separately. Database dumps preserve generated-column definitions (not generated values), indexes, views, triggers, accessible implicit rowids and AUTOINCREMENT high-water marks. Triggers are created after data loading. A read transaction gives each export a consistent snapshot; rows stream through PDO instead of the buffered display adapter.
@@ -70,7 +83,8 @@ This is the first usable SQLite backend, not full feature parity.
 
 | Area | SQLite behavior in this release |
 | --- | --- |
-| Visual create/alter table and index/constraint editors | Hidden; use native SQLite DDL in SQL command. No automatic table-rebuild migration tool. |
+| Visual table creation | Guided column cards, constraints, SQL preview and explicit confirmation (see above). |
+| Visual alter table and standalone index/constraint editors | Use native SQLite DDL in SQL command. No automatic table-rebuild migration tool. |
 | Virtual-table SQL backups and external dump dialects | Native ordinary-table dumps/restores are supported; virtual-table SQL backups and arbitrary external PRAGMA/transaction wrappers remain unsupported. |
 | Visual query builder and schema diagram | Hidden; table filters/aggregates and SQL command remain available. |
 | Dedicated view/trigger editors | Hidden; definitions are inspected in Structure and can be managed using SQL. |
@@ -89,6 +103,7 @@ Very large SQL results are buffered before the display cap is applied, matching 
 php -l index.php
 php tests/database_backends.php sqlite
 php tests/sqlite_tools.php
+php tests/sqlite_create_table.php
 python3 tests/http_sqlite.py
 
 # Dedicated disposable test server: requires CREATE/DROP DATABASE privileges.
@@ -98,7 +113,7 @@ MS_TEST_HOST=127.0.0.1 MS_TEST_PORT=3306 MS_TEST_USER=root \
 
 The MySQL runner creates and removes a randomly named `ms_backend_test_*` database and runs the existing embedded diagnostic suite, which creates its own randomly named disposable database. It never selects a user database. The SQLite runner uses a private temporary directory; the HTTP runner copies the single production file into a temporary web root and tests login, browsing, CRUD, SQL, CSRF and unsupported-route guards.
 
-The GitHub Actions matrix runs PHP 7.4, 8.3, 8.4 and 8.5 against MySQL 8.0 and MariaDB 10.11, plus SQLite and the HTTP flow on every job. The tools suite covers storage-class/64-bit round trips, schema objects, generated fields, FK-safe atomic restore, per-row trigger rollback, transaction-level import failure, token isolation and disposable diagnostics. HTTP tests cover the format × ZIP × filter × scope export matrix, mapped imports, rejected-row downloads, restore confirmation/rollback and grid/SQL-editor Explain. Runtime deprecations fail the CLI regression runs; the HTTP flow checks for PHP diagnostics with `E_ALL` enabled. See [PHP compatibility](PHP_COMPATIBILITY.md) for the v1.20.1 changes and additional checks.
+The GitHub Actions matrix runs PHP 7.4, 8.3, 8.4 and 8.5 against MySQL 8.0 and MariaDB 10.11, plus SQLite and the HTTP flow on every job. The tools suite covers storage-class/64-bit round trips, schema objects, generated fields, FK-safe atomic restore, per-row trigger rollback, transaction-level import failure, token isolation and disposable diagnostics. HTTP tests cover the format × ZIP × filter × scope export matrix, mapped imports, rejected-row downloads, restore confirmation/rollback and grid/SQL-editor Explain. The creation suite covers preview isolation, typed defaults, identifier escaping, ordered/composite keys, constraints, STRICT version gates, invalid expressions and single-use file-scoped confirmations. HTTP checks cover form rendering, CSRF, truncated/nested input, preview/confirmation, retained input, escaping, column order and blocked legacy MySQL DDL routes. Runtime deprecations fail the CLI regression runs; the HTTP flow checks for PHP diagnostics with `E_ALL` enabled. See [PHP compatibility](PHP_COMPATIBILITY.md) for the v1.20.1 changes and additional checks.
 
 ### Locally verified runtime matrix (20 October 2026)
 
