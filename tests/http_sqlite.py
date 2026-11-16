@@ -122,6 +122,58 @@ with tempfile.TemporaryDirectory(prefix='ms-http-') as temporary:
     for page in ['database','sql','settings','global_search','diagnostics','import','export','structure&table=items','select&table=items','select&table=items&view_mode=cards','row&table=items&mode=insert']:
       status, html = request('?page=' + page)
       check(status == 200 and 'Operation failed' not in html and 'Warning:' not in html and 'Fatal error' not in html, 'Render page ' + page)
+    # Guided DDL uses the same private fixture and never runs on a user database.
+    status, html = request('?page=database')
+    check('href="?page=create_table"' in html, 'SQLite database exposes Create table')
+    status, html = request('?page=create_table')
+    check(status == 200 and 'msSqliteCreateForm' in html and 'name="engine"' not in html, 'SQLite wizard renders without MySQL engine fields')
+    def table_exists(name):
+      with sqlite3.connect(fixture) as connection:
+        return connection.execute('SELECT 1 FROM sqlite_master WHERE name=?', (name,)).fetchone() is not None
+    wizard = {'action':'sqlite_create_preview','csrf':csrf,'name':'guided_http','definition_complete':'1',
+              'columns[9][name]':'label','columns[9][type]':'TEXT','columns[9][unique]':'1',
+              'columns[9][default_kind]':'text','columns[9][default_value]':"O'Brien <script>alert(1)</script>",
+              'columns[2][name]':'id','columns[2][type]':'INTEGER','columns[2][primary]':'1'}
+    status, html = request('?page=create_table', dict(wizard, csrf='invalid'))
+    check(status == 403 and not table_exists('guided_http'), 'DDL preview requires CSRF')
+    truncated = dict(wizard)
+    del truncated['definition_complete']
+    status, html = request('?page=create_table', truncated)
+    check('definition was truncated' in html and not table_exists('guided_http'), 'Truncated form cannot generate a partial definition')
+    status, html = request('?page=create_table', dict(wizard, name='items'))
+    check('already exists' in html and len(rows()) == 3, 'Existing tables cannot be replaced by the wizard')
+    invalid = dict(wizard, **{'columns[2][type]':'TEXT); DROP TABLE items; --'})
+    status, html = request('?page=create_table', invalid)
+    check('Choose a supported type' in html and 'value="guided_http"' in html and len(rows()) == 3, 'Validation preserves form input and refuses injected types')
+    nested = dict(wizard)
+    del nested['columns[2][name]']
+    nested['columns[2][name][bad]'] = 'id'
+    status, html = request('?page=create_table', nested)
+    check('Invalid or oversized' in html and not table_exists('guided_http'), 'Malformed nested input fails without PHP diagnostics')
+    status, html = request('?page=create_table', wizard)
+    check(status == 200 and '3. Review and confirm' in html and not table_exists('guided_http'), 'Preview renders generated SQL without executing it')
+    check('&lt;script&gt;alert(1)&lt;/script&gt;' in html and '<script>alert(1)</script>' not in html, 'Defaults are escaped in the form and SQL preview')
+    preview_token = re.search(r'name="preview_token" value="([a-f0-9]+)"', html).group(1)
+    execute = {'action':'sqlite_create_execute','csrf':csrf,'preview_token':preview_token}
+    status, html = request('?page=create_table', execute)
+    check('Confirm the SQL preview' in html and not table_exists('guided_http'), 'Execution requires explicit server-side confirmation')
+    status, html = request('?page=create_table', dict(execute, create_confirm='1', csrf='invalid'))
+    check(status == 403 and not table_exists('guided_http'), 'DDL execution requires CSRF')
+    status, html = request('?page=create_table', dict(execute, create_confirm='1', preview_token='forged'))
+    check('preview is missing' in html and not table_exists('guided_http'), 'Execution without an issued preview is rejected')
+    status, html = request('?page=create_table', dict(execute, create_confirm='1', sql='DROP TABLE items', name='tampered'))
+    check(status == 200 and 'SQLite table created.' in html and 'Structure: guided_http' in html and len(rows()) == 3, 'Confirmed execution uses server-side SQL and redirects to structure')
+    with sqlite3.connect(fixture) as connection:
+      cols = connection.execute('PRAGMA table_info(guided_http)').fetchall()
+      check([c[1] for c in cols] == ['label','id'], 'Server preserves reordered sparse column indexes')
+      connection.execute('INSERT INTO guided_http DEFAULT VALUES')
+      check(connection.execute('SELECT label,id FROM guided_http').fetchone() == ("O'Brien <script>alert(1)</script>", 1), 'Created table has the reviewed defaults and INTEGER primary key')
+      connection.execute('DROP TABLE guided_http')
+    status, html = request('?page=create_table', dict(execute, create_confirm='1'))
+    check('preview is missing' in html and not table_exists('guided_http'), 'Replaying a consumed preview cannot recreate the table')
+    for action in ['create_table','alter_table','add_column','drop_table']:
+      status, html = request('?page=create_table', {'action':action,'csrf':csrf,'name':'items','confirm_name':'items'})
+      check('not yet available for SQLite' in html and len(rows()) == 3, 'MySQL DDL action stays guarded: ' + action)
     status, html = request('?page=settings', {'action':'save_profile_settings','csrf':csrf,'selectRows':'50','sqlRows':'1000'})
     check(status == 200 and 'Settings saved for profile' in html, 'SQLite preserves the existing settings save action')
     status, html = request('?page=select&table=items&filter_col[]=qty&filter_op[]=%3D&filter_val[]=7&order_col[]=id&order_dir[]=DESC&limit=1&p=2')

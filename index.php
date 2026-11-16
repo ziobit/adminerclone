@@ -11,7 +11,7 @@
 declare(strict_types=1);
 
 const MS_APP_NAME = 'MySQL Studio';
-const MS_VERSION = '1.21.0';
+const MS_VERSION = '1.22.0';
 const MS_ROWS_PER_PAGE = 50;
 const MS_SQL_ROWS_DEFAULT = 1000;
 const MS_MAX_CELL_BYTES = 100000;
@@ -2786,7 +2786,204 @@ function ms_sqlite_delete_rows(MSDatabase $db, string $table, array $identities)
   } catch (Throwable $e) { $db->rollback(); throw $e; }
 }
 
+/** Read a bounded scalar: malformed nested POST values must never become SQL. */
+function ms_sqlite_create_value(array $input, string $key, string $default = ''): string {
+  $value = $input[$key] ?? $default;
+  if (!is_scalar($value) || strlen((string)$value) > 4096 || strpos((string)$value, "\0") !== false) throw new RuntimeException('Invalid or oversized table-definition field: ' . $key . '.');
+  return (string)$value;
+}
+
+function ms_sqlite_create_identifier(string $name): string {
+  if (trim($name) === '' || strlen($name) > 255 || preg_match('/[\x00-\x1f\x7f]/', $name)) throw new RuntimeException('Names must contain 1–255 bytes and no control characters.');
+  return '"' . str_replace('"', '""', $name) . '"';
+}
+
+/** Keep advanced expressions inside their parentheses, with no SQL tail/comments. */
+function ms_sqlite_create_expression(string $expression): string {
+  $expression = trim($expression);
+  $tokens = ms_sqlite_tokens($expression);
+  if (!$tokens) throw new RuntimeException('Enter a non-empty SQL expression.');
+  $depth = 0; $end = 0;
+  foreach ($tokens as $token) {
+    if (trim(substr($expression, $end, $token['start'] - $end)) !== '') throw new RuntimeException('SQL comments are not allowed in definition expressions.');
+    $end = $token['end'];
+    if (in_array($token['text'], [';', '?', ':', '@', '$'], true)) throw new RuntimeException('Expressions cannot contain statements or parameters.');
+    if ($token['text'] === '(') $depth++;
+    if ($token['text'] === ')' && --$depth < 0) throw new RuntimeException('Unbalanced expression parentheses.');
+  }
+  if ($depth !== 0 || trim(substr($expression, $end)) !== '') throw new RuntimeException('Unbalanced expression or trailing SQL comment.');
+  ms_sqlite_assert_sql('SELECT (' . $expression . ')');
+  return $expression;
+}
+
+/** Pure definition builder; it never creates or changes a database object. */
+function ms_sqlite_create_definition(array $input, string $sqliteVersion): array {
+  $name = trim(ms_sqlite_create_value($input, 'name'));
+  $quotedName = ms_sqlite_create_identifier($name);
+  if (stripos($name, 'sqlite_') === 0) throw new RuntimeException('Table names beginning with sqlite_ are reserved.');
+  $strict = ms_sqlite_create_value($input, 'strict') === '1';
+  $withoutRowid = ms_sqlite_create_value($input, 'without_rowid') === '1';
+  if ($strict && version_compare($sqliteVersion, '3.37.0', '<')) throw new RuntimeException('STRICT tables require SQLite 3.37.0 or later.');
+  if ($withoutRowid && version_compare($sqliteVersion, '3.8.2', '<')) throw new RuntimeException('WITHOUT ROWID requires SQLite 3.8.2 or later.');
+  $columns = $input['columns'] ?? [];
+  if (!is_array($columns) || !$columns || count($columns) > 50) throw new RuntimeException('Define between 1 and 50 columns.');
+  $spec = ['name'=>$name, 'strict'=>$strict ? '1' : '', 'without_rowid'=>$withoutRowid ? '1' : '', 'columns'=>[]];
+  $primary = []; $seen = []; $autoCount = 0;
+  foreach ($columns as $column) {
+    if (!is_array($column)) throw new RuntimeException('Invalid column definition.');
+    $c = [];
+    foreach (['name','type','not_null','primary','unique','auto_increment','default_kind','default_value','collation','check','ref_table','ref_column','on_delete','on_update'] as $key) {
+      $c[$key] = ms_sqlite_create_value($column, $key);
+    }
+    $c['name'] = trim($c['name']);
+    ms_sqlite_create_identifier($c['name']);
+    $key = strtolower($c['name']);
+    if (isset($seen[$key])) throw new RuntimeException('Duplicate column name: ' . $c['name'] . '.');
+    $seen[$key] = true;
+    $c['type'] = strtoupper($c['type']);
+    if (!in_array($c['type'], ['INTEGER','REAL','TEXT','BLOB','NUMERIC','ANY'], true) || ($strict && $c['type'] === 'NUMERIC')) throw new RuntimeException('Choose a supported type for ' . $c['name'] . ($strict ? ' (NUMERIC is not supported in STRICT tables).' : '.'));
+    foreach (['not_null','primary','unique','auto_increment'] as $flag) $c[$flag] = $c[$flag] === '1' ? '1' : '';
+    if ($c['primary']) { $primary[] = $c['name']; $c['not_null'] = '1'; }
+    if ($c['auto_increment']) $autoCount++;
+    $spec['columns'][] = $c;
+  }
+  if ($withoutRowid && !$primary) throw new RuntimeException('WITHOUT ROWID requires a primary key.');
+  if ($autoCount && ($autoCount !== 1 || count($primary) !== 1 || $withoutRowid)) throw new RuntimeException('AUTOINCREMENT requires one INTEGER primary key in a rowid table.');
+  $definitions = [];
+  foreach ($spec['columns'] as &$c) {
+    $definition = ms_sqlite_create_identifier($c['name']) . ' ' . $c['type'];
+    if ($c['auto_increment']) {
+      if (!$c['primary'] || $c['type'] !== 'INTEGER') throw new RuntimeException('AUTOINCREMENT requires one INTEGER primary key in a rowid table.');
+      $definition .= ' PRIMARY KEY AUTOINCREMENT';
+    }
+    if ($c['not_null']) $definition .= ' NOT NULL';
+    if ($c['unique']) $definition .= ' UNIQUE';
+    $c['collation'] = strtoupper($c['collation']);
+    if (!in_array($c['collation'], ['', 'BINARY','NOCASE','RTRIM'], true)) throw new RuntimeException('Unsupported collation.');
+    if ($c['collation'] !== '') $definition .= ' COLLATE ' . $c['collation'];
+    $kind = $c['default_kind'] === '' ? 'none' : $c['default_kind'];
+    $c['default_kind'] = $kind;
+    $value = $c['default_value'];
+    if ($kind === 'null') {
+      if ($c['not_null']) throw new RuntimeException('DEFAULT NULL conflicts with NOT NULL for ' . $c['name'] . '.');
+      $definition .= ' DEFAULT NULL';
+    } elseif ($kind === 'text') {
+      $definition .= " DEFAULT '" . str_replace("'", "''", $value) . "'";
+    } elseif ($kind === 'number') {
+      $value = trim($value);
+      if (!preg_match('/\A[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\z/', $value)) throw new RuntimeException('Enter a valid numeric default for ' . $c['name'] . '.');
+      $definition .= ' DEFAULT ' . $value;
+    } elseif (in_array($kind, ['CURRENT_TIME','CURRENT_DATE','CURRENT_TIMESTAMP'], true)) {
+      $definition .= ' DEFAULT ' . $kind;
+    } elseif ($kind === 'expression') {
+      $definition .= ' DEFAULT (' . ms_sqlite_create_expression($value) . ')';
+    } elseif ($kind !== 'none') throw new RuntimeException('Unsupported default kind.');
+    if (trim($c['check']) !== '') $definition .= ' CHECK (' . ms_sqlite_create_expression($c['check']) . ')';
+    $c['ref_table'] = trim($c['ref_table']); $c['ref_column'] = trim($c['ref_column']);
+    foreach (['on_delete','on_update'] as $action) {
+      $c[$action] = $c[$action] === '' ? 'NO ACTION' : strtoupper($c[$action]);
+      if (!in_array($c[$action], ['NO ACTION','RESTRICT','CASCADE','SET NULL','SET DEFAULT'], true)) throw new RuntimeException('Unsupported foreign-key action.');
+    }
+    if ($c['ref_table'] !== '' || $c['ref_column'] !== '') {
+      $definition .= ' REFERENCES ' . ms_sqlite_create_identifier($c['ref_table']) . ' (' . ms_sqlite_create_identifier($c['ref_column']) . ')';
+      if ($c['not_null'] && in_array('SET NULL', [$c['on_delete'],$c['on_update']], true)) throw new RuntimeException('SET NULL cannot be used on NOT NULL column ' . $c['name'] . '.');
+      $definition .= ' ON DELETE ' . $c['on_delete'] . ' ON UPDATE ' . $c['on_update'];
+    } elseif ($c['on_delete'] !== 'NO ACTION' || $c['on_update'] !== 'NO ACTION') throw new RuntimeException('Choose a referenced table and column before setting foreign-key actions.');
+    $definitions[] = $definition;
+  }
+  unset($c);
+  if ($primary && !$autoCount) $definitions[] = 'PRIMARY KEY (' . implode(', ', array_map('ms_sqlite_create_identifier', $primary)) . ')';
+  $options = [];
+  if ($withoutRowid) $options[] = 'WITHOUT ROWID';
+  if ($strict) $options[] = 'STRICT';
+  $sql = 'CREATE TABLE ' . $quotedName . " (\n  " . implode(",\n  ", $definitions) . "\n)" . ($options ? ' ' . implode(', ', $options) : '') . ';';
+  ms_sqlite_assert_sql($sql);
+  return ['spec'=>$spec, 'sql'=>$sql];
+}
+
+/** Reference targets whose single-column uniqueness is declared by the table. */
+function ms_sqlite_create_reference_targets(MSDatabase $db): array {
+  $targets = [];
+  foreach (ms_table_list($db) as $table) {
+    if ($table['TABLE_TYPE'] !== 'BASE TABLE') continue;
+    $name = $table['TABLE_NAME'];
+    $columns = table_columns($db, $name);
+    $keys = array_values(array_filter($columns, static function (array $c): bool { return (int)$c['SQLITE_PK_POSITION'] > 0; }));
+    $eligible = count($keys) === 1 ? [$keys[0]['COLUMN_NAME']] : [];
+    foreach (db_all($db, 'PRAGMA index_list(' . qs($db, $name) . ')') as $index) {
+      // Explicit indexes may override the column's collation, invalidating an FK.
+      if (!(int)$index['unique'] || (int)$index['partial'] || ($index['origin'] ?? '') !== 'u') continue;
+      $parts = db_all($db, 'PRAGMA index_info(' . qs($db, $index['name']) . ')');
+      if (count($parts) === 1 && $parts[0]['name'] !== null) $eligible[] = $parts[0]['name'];
+    }
+    if ($eligible) $targets[$name] = array_values(array_unique($eligible));
+  }
+  return $targets;
+}
+
+function ms_sqlite_create_validate(MSDatabase $db, array $input): array {
+  if ($db->engine !== 'sqlite') throw new RuntimeException('This wizard is only for SQLite.');
+  $definition = ms_sqlite_create_definition($input, $db->server_info);
+  $spec = $definition['spec']; $targets = null;
+  foreach ($spec['columns'] as $column) {
+    if ($column['default_kind'] === 'expression') $db->run('EXPLAIN SELECT (' . ms_sqlite_create_expression($column['default_value']) . ')');
+    if ($column['ref_table'] === '') continue;
+    $eligible = [];
+    if (strcasecmp($column['ref_table'], $spec['name']) === 0) {
+      $primaryCount = count(array_filter($spec['columns'], static function (array $c): bool { return $c['primary'] === '1'; }));
+      foreach ($spec['columns'] as $parent) if ($parent['unique'] || ($primaryCount === 1 && $parent['primary'])) $eligible[] = $parent['name'];
+    } else {
+      if ($targets === null) $targets = ms_sqlite_create_reference_targets($db);
+      foreach ($targets as $table => $names) if (strcasecmp((string)$table, $column['ref_table']) === 0) $eligible = $names;
+    }
+    if (!in_array(strtolower($column['ref_column']), array_map('strtolower', $eligible), true)) throw new RuntimeException('Reference ' . $column['ref_table'] . '.' . $column['ref_column'] . ' must be a single-column PRIMARY KEY or table-declared UNIQUE column.');
+  }
+  // Compile only: validate against the installed SQLite parser without executing DDL.
+  $db->run('EXPLAIN ' . $definition['sql']);
+  return $definition;
+}
+
+function ms_sqlite_create_preview(MSDatabase $db, array $input): array {
+  $definition = ms_sqlite_create_validate($db, $input);
+  $previews = $_SESSION['ms_sqlite_create_previews'] ?? [];
+  foreach ($previews as $token => $preview) if ((int)$preview['expires'] < time()) unset($previews[$token]);
+  while (count($previews) >= 5) array_shift($previews);
+  $token = bin2hex(random_bytes(24));
+  $definition += ['token'=>$token, 'path'=>$db->path, 'expires'=>time() + 900];
+  $previews[$token] = $definition;
+  $_SESSION['ms_sqlite_create_previews'] = $previews;
+  return $definition;
+}
+
+function ms_sqlite_create_pending(MSDatabase $db, string $token): array {
+  $preview = $_SESSION['ms_sqlite_create_previews'][$token] ?? null;
+  if ($db->engine !== 'sqlite' || !is_array($preview) || $preview['path'] !== $db->path || (int)$preview['expires'] < time()) throw new RuntimeException('This table preview is missing, expired or belongs to another database. Generate a new SQL preview.');
+  return $preview;
+}
+
+function ms_sqlite_create_execute(MSDatabase $db, string $token, bool $confirmed): string {
+  $preview = ms_sqlite_create_pending($db, $token);
+  if (!$confirmed) throw new RuntimeException('Confirm the SQL preview before creating the table.');
+  $definition = ms_sqlite_create_validate($db, $preview['spec']);
+  if (!hash_equals($preview['sql'], $definition['sql'])) throw new RuntimeException('The table definition changed. Generate a new SQL preview.');
+  // Single use, bound to the session and canonical file. Never trust posted SQL.
+  $db->run($definition['sql']);
+  unset($_SESSION['ms_sqlite_create_previews'][$token]);
+  return $definition['spec']['name'];
+}
+
 function ms_sqlite_dispatch_action(MSDatabase $db, string $action): void {
+  if ($action === 'sqlite_create_preview') {
+    if (p('definition_complete') !== '1') throw new RuntimeException('The table definition was truncated. Reload and use fewer columns.');
+    $GLOBALS['msSqliteCreatePreview'] = ms_sqlite_create_preview($db, $_POST);
+    return;
+  }
+  if ($action === 'sqlite_create_execute') {
+    $preview = ms_sqlite_create_pending($db, p('preview_token'));
+    $GLOBALS['msSqliteCreatePreview'] = $preview;
+    $name = ms_sqlite_create_execute($db, p('preview_token'), p('create_confirm') === '1');
+    go(['page'=>'structure', 'table'=>$name], 'SQLite table created.');
+  }
   if (in_array($action, ['save_row','delete_row','delete_rows','bulk_update'], true)) {
     $table = g('table');
     $return = ms_decode_navigation(p('return_to'));
@@ -2835,8 +3032,8 @@ function ms_sqlite_dispatch_action(MSDatabase $db, string $action): void {
 
 function ms_sqlite_page_database(MSDatabase $db): void {
   $tables = ms_table_list($db);
-  title_bar('SQLite: ' . basename($db->path), count($tables) . ' object(s) · SQLite ' . $db->server_info, '<a class="btn btn-primary" href="?page=sql">SQL command</a>');
-  ?><div class="alert alert-info">Create tables, indexes, views and triggers using SQLite SQL. This first backend supports browsing, filtering and row editing; advanced MySQL tools are hidden.</div><div class="card"><div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Name</th><th>Type</th><th></th></tr></thead><tbody><?php foreach ($tables as $table) { ?><tr><td><a href="?page=select&amp;table=<?= urlencode($table['TABLE_NAME']) ?>"><?= h($table['TABLE_NAME']) ?></a></td><td><?= h($table['TABLE_TYPE']) ?></td><td class="text-end"><a class="btn btn-secondary btn-sm" href="?page=structure&amp;table=<?= urlencode($table['TABLE_NAME']) ?>">Structure</a></td></tr><?php } ?></tbody></table></div></div><?php
+  title_bar('SQLite: ' . basename($db->path), count($tables) . ' object(s) · SQLite ' . $db->server_info, '<div class="d-flex flex-wrap gap-2"><a class="btn btn-secondary" href="?page=sql">SQL command</a><a class="btn btn-primary" href="?page=create_table"><i class="fa-solid fa-plus me-1"></i>Create table</a></div>');
+  ?><div class="alert alert-info">Use Create table for a guided definition and SQL preview. Changes to existing structures, indexes, views and triggers remain available through SQL.</div><div class="card"><div class="table-responsive"><table class="table table-hover mb-0"><thead><tr><th>Name</th><th>Type</th><th></th></tr></thead><tbody><?php foreach ($tables as $table) { ?><tr><td><a href="?page=select&amp;table=<?= urlencode($table['TABLE_NAME']) ?>"><?= h($table['TABLE_NAME']) ?></a></td><td><?= h($table['TABLE_TYPE']) ?></td><td class="text-end"><a class="btn btn-secondary btn-sm" href="?page=structure&amp;table=<?= urlencode($table['TABLE_NAME']) ?>">Structure</a></td></tr><?php } ?></tbody></table></div></div><?php
 }
 
 function ms_sqlite_page_structure(MSDatabase $db): void {
@@ -3398,11 +3595,11 @@ function ms_sqlite_import_row(MSDatabase $db, string $table, array $values, stri
 }
 
 function ms_sqlite_page_supported(string $page): bool {
-  return in_array($page, ['databases','database','structure','select','row','sql','settings','global_search','diagnostics','import','export'], true);
+  return in_array($page, ['databases','database','create_table','structure','select','row','sql','settings','global_search','diagnostics','import','export'], true);
 }
 
 function ms_sqlite_action_supported(string $action): bool {
-  if (in_array($action, ['run_diagnostics','import_preview','import_execute','sqlite_restore'], true)) return true;
+  if (in_array($action, ['run_diagnostics','import_preview','import_execute','sqlite_restore','sqlite_create_preview','sqlite_create_execute'], true)) return true;
   return in_array($action, ['select_db','save_row','delete_row','delete_rows','bulk_update','run_sql','switch_profile','create_profile','rename_profile','delete_profile','reset_profile','save_settings','save_profile_settings','kick_session','kick_presence_session','save_view_preset','open_problem_queue','query_history_toggle','query_history_delete','query_history_clear','run_global_search','save_global_search','delete_global_search','open_generated_sql','column_view_hide','column_view_show','column_view_show_all','column_view_hide_primary','column_view_image_remove','column_view_soft_fk_remove','column_view_save','column_view_clear','column_view_label','column_view_presentation'], true) || strpos($action, 'column_view_') === 0;
 }
 
@@ -9501,7 +9698,143 @@ function page_database(MSDatabase $db): void {
   <div class="card danger-zone"><div class="card-body"><h2 class="h5 text-danger">Drop database</h2><p>This permanently removes every object and row in <strong><?= h(selected_db()) ?></strong>.</p><form method="post" class="row g-2 align-items-end"><input type="hidden" name="action" value="drop_database"><?= csrf_field() ?><div class="col-md-6"><label class="form-label">Type the database name to confirm</label><input class="form-control" name="confirm_name" required></div><div class="col-auto"><button class="btn btn-danger" data-confirm="Permanently drop this database?">Drop database</button></div></form></div></div><?php
 }
 
+function ms_sqlite_create_column_fields(array $row, string $index, array $targets): void {
+  $value = static function (string $key, string $fallback = '') use ($row): string { return isset($row[$key]) && is_scalar($row[$key]) ? (string)$row[$key] : $fallback; };
+  $id = 'ms-sqlite-col-' . $index . '-';
+  $name = 'columns[' . $index . ']';
+  ?><section class="card mb-3" data-sqlite-column>
+    <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2"><strong data-column-title>Column</strong><div class="d-flex gap-1">
+      <button class="btn btn-outline-secondary" type="button" data-column-up aria-label="Move column up" title="Move up"><i class="fa-solid fa-arrow-up"></i></button>
+      <button class="btn btn-outline-secondary" type="button" data-column-down aria-label="Move column down" title="Move down"><i class="fa-solid fa-arrow-down"></i></button>
+      <button class="btn btn-outline-danger" type="button" data-column-remove aria-label="Remove column" title="Remove column"><i class="fa-solid fa-trash"></i></button>
+    </div></div><div class="card-body"><div class="row g-3">
+      <div class="col-sm-6 col-lg-4"><label class="form-label" for="<?= h($id) ?>name">Column name</label><input class="form-control" id="<?= h($id) ?>name" name="<?= h($name) ?>[name]" value="<?= h($value('name')) ?>" data-field="name" maxlength="255" required></div>
+      <div class="col-sm-6 col-lg-2"><label class="form-label" for="<?= h($id) ?>type">Type</label><select class="form-select" id="<?= h($id) ?>type" name="<?= h($name) ?>[type]" data-field="type"><?php foreach (['INTEGER','TEXT','REAL','BLOB','NUMERIC','ANY'] as $type) { ?><option<?= $value('type','TEXT') === $type ? ' selected' : '' ?>><?= h($type) ?></option><?php } ?></select></div>
+      <div class="col-sm-6 col-lg-3"><label class="form-label" for="<?= h($id) ?>default_kind">Default</label><select class="form-select" id="<?= h($id) ?>default_kind" name="<?= h($name) ?>[default_kind]" data-field="default_kind"><?php foreach (['none'=>'No default','null'=>'NULL','text'=>'Text (including empty)','number'=>'Number','CURRENT_TIMESTAMP'=>'Current timestamp (UTC)','CURRENT_DATE'=>'Current date (UTC)','CURRENT_TIME'=>'Current time (UTC)','expression'=>'SQL expression'] as $key=>$label) { ?><option value="<?= h($key) ?>"<?= $value('default_kind','none') === $key ? ' selected' : '' ?>><?= h($label) ?></option><?php } ?></select></div>
+      <div class="col-sm-6 col-lg-3"><label class="form-label" for="<?= h($id) ?>default_value">Default value</label><input class="form-control" id="<?= h($id) ?>default_value" name="<?= h($name) ?>[default_value]" value="<?= h($value('default_value')) ?>" data-field="default_value" maxlength="4096"></div>
+      <div class="col-12 d-flex flex-wrap gap-3"><?php foreach (['primary'=>'Primary key','not_null'=>'NOT NULL','unique'=>'UNIQUE','auto_increment'=>'AUTOINCREMENT'] as $key=>$label) { ?><label class="d-flex align-items-center gap-2 py-2"><input class="form-check-input mt-0" type="checkbox" name="<?= h($name) ?>[<?= h($key) ?>]" value="1" data-field="<?= h($key) ?>"<?= $value($key) === '1' ? ' checked' : '' ?>><?= h($label) ?></label><?php } ?></div>
+    </div><details class="mt-2"<?= $value('check') !== '' || $value('ref_table') !== '' || $value('collation') !== '' ? ' open' : '' ?>><summary class="py-2 text-primary">More constraints: CHECK, collation, foreign key</summary><div class="row g-3 mt-0">
+      <div class="col-sm-4"><label class="form-label" for="<?= h($id) ?>collation">Collation</label><select class="form-select" id="<?= h($id) ?>collation" name="<?= h($name) ?>[collation]"><?php foreach ([''=>'Default (BINARY)','BINARY'=>'BINARY','NOCASE'=>'NOCASE (ASCII)','RTRIM'=>'RTRIM'] as $key=>$label) { ?><option value="<?= h($key) ?>"<?= $value('collation') === $key ? ' selected' : '' ?>><?= h($label) ?></option><?php } ?></select></div>
+      <div class="col-sm-8"><label class="form-label" for="<?= h($id) ?>check">CHECK expression (optional)</label><input class="form-control code" id="<?= h($id) ?>check" name="<?= h($name) ?>[check]" value="<?= h($value('check')) ?>" placeholder="e.g. amount &gt;= 0" maxlength="4096"></div>
+      <div class="col-sm-6"><label class="form-label" for="<?= h($id) ?>ref_table">Referenced table</label><select class="form-select" id="<?= h($id) ?>ref_table" name="<?= h($name) ?>[ref_table]" data-field="ref_table"><option value="">No foreign key</option><?php $names = array_keys($targets); if ($value('ref_table') !== '' && !in_array($value('ref_table'),$names,true)) $names[] = $value('ref_table'); foreach ($names as $table) { ?><option value="<?= h($table) ?>"<?= $value('ref_table') === (string)$table ? ' selected' : '' ?>><?= h($table) ?></option><?php } ?></select></div>
+      <div class="col-sm-6"><label class="form-label" for="<?= h($id) ?>ref_column">Referenced column</label><select class="form-select" id="<?= h($id) ?>ref_column" name="<?= h($name) ?>[ref_column]" data-field="ref_column"><option value="">Choose a column</option><?php $names = $targets[$value('ref_table')] ?? []; if ($value('ref_column') !== '' && !in_array($value('ref_column'),$names,true)) $names[] = $value('ref_column'); foreach ($names as $column) { ?><option value="<?= h($column) ?>"<?= $value('ref_column') === $column ? ' selected' : '' ?>><?= h($column) ?></option><?php } ?></select></div>
+      <?php foreach (['on_delete'=>'On delete','on_update'=>'On update'] as $key=>$label) { ?><div class="col-sm-6"><label class="form-label" for="<?= h($id . $key) ?>"><?= h($label) ?></label><select class="form-select" id="<?= h($id . $key) ?>" name="<?= h($name) ?>[<?= h($key) ?>]"><?php foreach (['NO ACTION','RESTRICT','CASCADE','SET NULL','SET DEFAULT'] as $action) { ?><option<?= $value($key,'NO ACTION') === $action ? ' selected' : '' ?>><?= h($action) ?></option><?php } ?></select></div><?php } ?>
+      <div class="col-12 form-text">Foreign keys reference one PRIMARY KEY or table-declared UNIQUE column. Composite foreign keys and additional index definitions can be created with SQL.</div>
+    </div></details></div>
+  </section><?php
+}
+
+function ms_sqlite_page_create_table(MSDatabase $db): void {
+  $preview = $GLOBALS['msSqliteCreatePreview'] ?? null;
+  $spec = $preview['spec'] ?? (p('action') === 'sqlite_create_preview' ? $_POST : ['columns'=>[['name'=>'id','type'=>'INTEGER','primary'=>'1','not_null'=>'1']]]);
+  $scalar = static function (string $key) use ($spec): string { return isset($spec[$key]) && is_scalar($spec[$key]) ? (string)$spec[$key] : ''; };
+  $rows = isset($spec['columns']) && is_array($spec['columns']) ? array_slice(array_values(array_filter($spec['columns'],'is_array')),0,50) : [];
+  if (!$rows) $rows = [['type'=>'TEXT']];
+  $targets = ms_sqlite_create_reference_targets($db);
+  title_bar('Create SQLite table', basename($db->path) . ' · Define columns, review SQL, then confirm.', '<a class="btn btn-secondary" href="?page=database">Back to database</a>');
+  ?><style>#msSqliteCreateForm .btn,#msSqliteCreateConfirm .btn{min-height:44px}#msSqliteCreatePreview pre{white-space:pre-wrap;overflow-wrap:anywhere}#msSqliteCreateForm summary{cursor:pointer}</style>
+  <form method="post" action="?page=create_table" id="msSqliteCreateForm">
+    <input type="hidden" name="action" value="sqlite_create_preview"><?= csrf_field() ?>
+    <section class="card mb-3"><div class="card-header"><h2 class="h5 mb-0">1. Table</h2></div><div class="card-body"><label class="form-label" for="msSqliteTableName">Table name</label><input class="form-control" id="msSqliteTableName" name="name" value="<?= h($scalar('name')) ?>" maxlength="255" required autofocus>
+      <div class="d-flex flex-wrap gap-4 mt-3"><label class="py-2"><input class="form-check-input" type="checkbox" name="strict" value="1"<?= $scalar('strict') === '1' ? ' checked' : '' ?><?= version_compare($db->server_info,'3.37.0','<') ? ' disabled' : '' ?>> STRICT <span class="small text-body-secondary">(SQLite 3.37+)</span></label><label class="py-2"><input class="form-check-input" type="checkbox" name="without_rowid" value="1"<?= $scalar('without_rowid') === '1' ? ' checked' : '' ?>> WITHOUT ROWID</label></div>
+      <div class="form-text">STRICT enforces storage types and excludes NUMERIC. WITHOUT ROWID requires a primary key and excludes AUTOINCREMENT.</div>
+    </div></section>
+    <h2 class="h5 mb-2">2. Columns and constraints</h2><p class="text-body-secondary small">Primary-key columns are always NOT NULL in this wizard. Select several for a composite key in column order. INTEGER PRIMARY KEY already generates IDs; AUTOINCREMENT also prevents reuse of deleted IDs.</p>
+    <div id="msSqliteCreateColumns"><?php foreach ($rows as $i=>$row) ms_sqlite_create_column_fields($row,(string)$i,$targets); ?></div>
+    <div class="d-flex flex-wrap gap-2 mb-3"><button class="btn btn-secondary" type="button" id="msSqliteAddColumn"><i class="fa-solid fa-plus me-1"></i>Add column</button><button class="btn btn-primary" type="submit"><i class="fa-solid fa-code me-1"></i>Preview SQL</button></div>
+    <div class="small text-body-secondary mb-3" role="status" id="msSqliteColumnStatus"></div>
+    <input type="hidden" name="definition_complete" value="1">
+  </form>
+  <template id="msSqliteColumnTemplate"><?php ms_sqlite_create_column_fields(['type'=>'TEXT'],'__INDEX__',$targets); ?></template>
+  <?php if ($preview !== null) { ?><section class="card border-primary mt-4" id="msSqliteCreatePreview"><div class="card-header"><h2 class="h5 mb-0">3. Review and confirm</h2></div><div class="card-body"><p>Ready to create <strong><?= h($preview['spec']['name']) ?></strong> in <strong><?= h(basename($db->path)) ?></strong>. No table has been created yet.</p><pre class="code bg-body-tertiary rounded p-3" tabindex="0"><?= h($preview['sql']) ?></pre>
+    <form method="post" action="?page=create_table" id="msSqliteCreateConfirm"><input type="hidden" name="action" value="sqlite_create_execute"><input type="hidden" name="preview_token" value="<?= h($preview['token']) ?>"><?= csrf_field() ?><label class="d-flex align-items-start gap-2 py-3"><input class="form-check-input" type="checkbox" name="create_confirm" value="1" required><span>I confirm execution of this CREATE TABLE statement in <?= h(basename($db->path)) ?>.</span></label><button class="btn btn-primary" type="submit">Confirm and create table</button></form>
+    <p class="small text-body-secondary mt-3 mb-0">Preview expires after 15 minutes. Editing the definition requires a new preview.</p>
+  </div></section><?php } ?>
+  <script>
+  (() => {
+    'use strict';
+    const form = document.getElementById('msSqliteCreateForm');
+    const container = document.getElementById('msSqliteCreateColumns');
+    const template = document.getElementById('msSqliteColumnTemplate');
+    const add = document.getElementById('msSqliteAddColumn');
+    const tableName = document.getElementById('msSqliteTableName');
+    const preview = document.getElementById('msSqliteCreatePreview');
+    const targets = JSON.parse(<?= json_encode(json_encode((object)$targets, JSON_INVALID_UTF8_SUBSTITUTE), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>);
+    const cards = () => Array.from(container.querySelectorAll('[data-sqlite-column]'));
+    const field = (card, name) => card.querySelector('[data-field="' + name + '"]');
+    let nextIndex = cards().length;
+    const invalidate = () => {
+      if (!preview) return;
+      preview.hidden = true;
+      preview.querySelectorAll('input,button').forEach(el => { el.disabled = true; });
+      document.getElementById('msSqliteColumnStatus').textContent = 'Definition changed. Generate a new SQL preview before creating the table.';
+    };
+    const options = (select, names, placeholder, keepUnknown = false) => {
+      const previous = select.value;
+      select.replaceChildren(new Option(placeholder, ''));
+      if (keepUnknown && previous && !names.includes(previous)) names.push(previous);
+      names.forEach(name => select.add(new Option(name, name)));
+      select.value = names.includes(previous) ? previous : '';
+    };
+    const updateReferences = () => {
+      const list = cards();
+      const ownName = tableName.value.trim();
+      const primary = list.filter(card => field(card, 'primary').checked);
+      const ownKeys = list.filter(card => field(card, 'unique').checked || (primary.length === 1 && field(card, 'primary').checked)).map(card => field(card, 'name').value.trim()).filter(Boolean);
+      list.forEach(card => {
+        const table = field(card, 'ref_table');
+        options(table, [...new Set([...Object.keys(targets), ...(ownName ? [ownName] : [])])], 'No foreign key', true);
+        const names = table.value === ownName ? ownKeys : (Object.prototype.hasOwnProperty.call(targets, table.value) ? targets[table.value] : []);
+        options(field(card, 'ref_column'), names.slice(), 'Choose a column', true);
+        field(card, 'ref_column').disabled = table.value === '';
+        ['on_delete','on_update'].forEach(name => { card.querySelector('[name$="[' + name + ']"]').disabled = table.value === ''; });
+      });
+    };
+    const refresh = () => {
+      const list = cards();
+      list.forEach((card, index) => {
+        card.querySelector('[data-column-title]').textContent = 'Column ' + (index + 1);
+        card.querySelector('[data-column-up]').disabled = index === 0;
+        card.querySelector('[data-column-down]').disabled = index === list.length - 1;
+        card.querySelector('[data-column-remove]').disabled = list.length === 1;
+        card.querySelectorAll('[name]').forEach(el => { el.name = el.name.replace(/^columns\[\d+\]/, 'columns[' + index + ']'); });
+        field(card, 'default_value').disabled = !['text','number','expression'].includes(field(card, 'default_kind').value);
+        if (field(card, 'primary').checked) field(card, 'not_null').checked = true;
+      });
+      add.disabled = list.length >= 50;
+      updateReferences();
+    };
+    container.addEventListener('click', event => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      const card = button.closest('[data-sqlite-column]');
+      if (button.hasAttribute('data-column-up') && card.previousElementSibling) container.insertBefore(card, card.previousElementSibling);
+      else if (button.hasAttribute('data-column-down') && card.nextElementSibling) container.insertBefore(card.nextElementSibling, card);
+      else if (button.hasAttribute('data-column-remove') && cards().length > 1) card.remove();
+      else return;
+      invalidate(); refresh();
+    });
+    add.addEventListener('click', () => {
+      if (cards().length >= 50) return;
+      const holder = document.createElement('div');
+      holder.innerHTML = template.innerHTML.replace(/__INDEX__/g, String(nextIndex++));
+      const card = holder.firstElementChild;
+      container.appendChild(card); invalidate(); refresh(); field(card, 'name').focus();
+    });
+    container.addEventListener('change', event => {
+      if (event.target.matches('[data-field="ref_table"]')) field(event.target.closest('[data-sqlite-column]'), 'ref_column').value = '';
+    });
+    form.addEventListener('input', () => { invalidate(); refresh(); });
+    form.addEventListener('change', () => { invalidate(); refresh(); });
+    form.addEventListener('submit', () => { refresh(); });
+    refresh();
+    if (preview) preview.scrollIntoView({block:'start'});
+  })();
+  </script><?php
+}
+
 function page_create_table(MSDatabase $db): void {
+  if ($db->engine === 'sqlite') { ms_sqlite_page_create_table($db); return; }
   title_bar('Create table', selected_db());
 
   $isRetry = p('action') === 'create_table';
